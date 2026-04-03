@@ -230,8 +230,8 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	action := classifyAction(r.Method, r.URL.Path)
 
-	// DEBUG 日志：记录每次请求
-	p.logger.Debug("authz_request",
+	// INFO 日志：记录每次请求（所有操作均记录）
+	p.logger.Info("authz_request",
 		append(logIdentityFields(identity),
 			zap.String("action", action),
 			zap.String("http_method", r.Method),
@@ -289,6 +289,13 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// ── 响应后处理（过滤列表、记录归属）─────────────────────
 	p.postprocessResponse(w, resp, identity, action, r.URL.RequestURI())
+
+	// INFO 日志：所有授权通过的操作均记录
+	p.logger.Info("authz_allowed",
+		append(logIdentityFields(identity),
+			zap.String("action", action),
+			zap.String("http_uri", r.URL.RequestURI()),
+		)...)
 }
 
 // checkOwnershipPreRequest 请求前的资源归属检查
@@ -296,18 +303,12 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Request,
 	id *CallerIdentity, action string) bool {
 
-	switch action {
-	case ActionStop, ActionRemoveContainer, ActionExec, ActionInspect, ActionLogs, ActionStartContainer:
-		// 容器操作：验证归属
-		containerID := extractContainerID(r.URL.Path)
-		if containerID == "" {
-			break
-		}
+	// ── 通用容器归属检查（覆盖所有 /containers/{id}/... 操作）────────────
+	// 只要路径中有容器 ID（且不是 /containers/json 列表接口），就验证归属
+	containerID := extractContainerID(r.URL.Path)
+	if containerID != "" && containerID != "json" {
 		owner, found := p.db.GetContainerOwner(containerID)
-		if !found {
-			break // 不在 DB 中（可能是存量容器），放行并记录警告
-		}
-		if owner.UID != id.RealUID {
+		if found && owner.UID != id.RealUID {
 			p.logger.Warn("authz_denied_ownership",
 				append(logIdentityFields(id),
 					append(logOwnerFields("owner", owner),
@@ -322,13 +323,36 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 				http.StatusForbidden)
 			return false
 		}
+	}
 
-	case ActionCreateContainer:
-		// 验证镜像使用权限（通过请求体中的 Image 字段）
+	// ── docker commit：容器 ID 在 query 参数中 ───────────────────────────
+	if action == ActionCommit {
+		qContainerID := r.URL.Query().Get("container")
+		if qContainerID != "" {
+			owner, found := p.db.GetContainerOwner(qContainerID)
+			if found && owner.UID != id.RealUID {
+				p.logger.Warn("authz_denied_ownership",
+					append(logIdentityFields(id),
+						append(logOwnerFields("owner", owner),
+							zap.String("reason", "not_your_container"),
+							zap.String("container_id", qContainerID),
+							zap.String("action", action),
+						)...)...)
+				http.Error(w,
+					fmt.Sprintf("container '%s' belongs to '%s'(uid=%d), not '%s'(uid=%d)",
+						truncID(qContainerID), owner.Username, owner.UID,
+						id.RealUsername, id.RealUID),
+					http.StatusForbidden)
+				return false
+			}
+		}
+	}
+
+	// ── 创建容器：验证镜像使用权限 ──────────────────────────────────────
+	if action == ActionCreateContainer {
 		imageRef := extractImageRefFromBody(r)
 		if imageRef != "" {
 			if !p.db.CanUseImage(id.RealUID, imageRef) {
-				// 尝试通过镜像名查找 ID
 				p.logger.Warn("authz_denied_image_access",
 					append(logIdentityFields(id),
 						zap.String("reason", "image_not_permitted"),
@@ -341,9 +365,30 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 				return false
 			}
 		}
+	}
 
+	// ── 镜像 inspect：验证查看权限 ──────────────────────────────────────
+	if action == ActionInspect {
+		if imageID := extractImageID(r.URL.Path); imageID != "" {
+			if !p.db.CanUseImage(id.RealUID, imageID) {
+				p.logger.Warn("authz_denied_image_access",
+					append(logIdentityFields(id),
+						zap.String("reason", "image_not_permitted"),
+						zap.String("image_id", imageID),
+						zap.String("action", action),
+					)...)
+				http.Error(w,
+					fmt.Sprintf("user '%s'(uid=%d) not permitted to inspect image '%s'",
+						id.RealUsername, id.RealUID, truncID(imageID)),
+					http.StatusForbidden)
+				return false
+			}
+		}
+	}
+
+	// ── 镜像删除/推送/标记：验证归属 ────────────────────────────────────
+	switch action {
 	case ActionRemoveImage, ActionPush, ActionTag:
-		// 镜像操作：验证归属
 		imageID := extractImageID(r.URL.Path)
 		if imageID == "" {
 			break
@@ -509,22 +554,29 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 		_, _ = io.Copy(w, resp.Body)
 
 	case ActionPull:
-		// 流式转发 pull 输出，结束后提取镜像 ID
+		// 流式转发 pull 输出；manifest digest ≠ 本地镜像 ID，不能直接用
 		copyHeaders(w, resp.Header)
 		w.WriteHeader(resp.StatusCode)
-		imageID := streamAndCaptureImageID(w, resp, "pull")
-		if imageID != "" && resp.StatusCode == http.StatusOK {
-			if err := p.db.SetImageOwner(imageID, id, false, "pull"); err != nil {
-				p.logger.Error("save_image_owner_failed",
-					zap.String("image_id", imageID),
-					zap.String("real_username", id.RealUsername),
-					zap.Int("real_uid", id.RealUID),
-					zap.Error(err))
-			} else {
-				p.logger.Info("image_pulled",
-					append(logIdentityFields(id),
-						zap.String("image_id", truncID(imageID)),
-					)...)
+		streamAndCaptureImageID(w, resp, "pull")
+		if resp.StatusCode == http.StatusOK {
+			// pull 完成后通过 GET /images/{ref}/json 查询真实镜像内容 ID
+			imageRef := parseImageRefFromURI(requestURI)
+			if imageRef != "" {
+				if imageID := p.resolveImageIDByRef(imageRef); imageID != "" {
+					if err := p.db.SetImageOwner(imageID, id, false, "pull"); err != nil {
+						p.logger.Error("save_image_owner_failed",
+							zap.String("image_id", imageID),
+							zap.String("real_username", id.RealUsername),
+							zap.Int("real_uid", id.RealUID),
+							zap.Error(err))
+					} else {
+						p.logger.Info("image_pulled",
+							append(logIdentityFields(id),
+								zap.String("image_id", truncID(imageID)),
+								zap.String("image_ref", imageRef),
+							)...)
+					}
+				}
 			}
 		}
 
@@ -567,17 +619,6 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 		_, _ = io.Copy(w, resp.Body)
 	}
 
-	// INFO 日志：授权通过的关键操作
-	switch action {
-	case ActionCreateContainer, ActionStop, ActionRemoveContainer,
-		ActionBuild, ActionPull, ActionRemoveImage, ActionPush:
-		p.logger.Info("authz_allowed",
-			append(logIdentityFields(id),
-				zap.String("action", action),
-				zap.String("http_uri", requestURI),
-				zap.Int("response_status", resp.StatusCode),
-			)...)
-	}
 }
 
 // ── 辅助函数 ─────────────────────────────────────────────────
@@ -693,5 +734,55 @@ func truncID(id string) string {
 		return id[:12]
 	}
 	return id
+}
+
+// parseImageRefFromURI 从 docker pull 的请求 URI 中提取镜像引用
+// docker pull 对应 POST /images/create?fromImage=nginx&tag=latest
+func parseImageRefFromURI(requestURI string) string {
+	idx := strings.Index(requestURI, "?")
+	if idx < 0 {
+		return ""
+	}
+	params, err := url.ParseQuery(requestURI[idx+1:])
+	if err != nil {
+		return ""
+	}
+	fromImage := params.Get("fromImage")
+	if fromImage == "" {
+		return ""
+	}
+	if tag := params.Get("tag"); tag != "" && tag != "latest" {
+		return fromImage + ":" + tag
+	}
+	return fromImage
+}
+
+// resolveImageIDByRef 查询 dockerd 获取镜像的真实内容 ID（sha256:...）
+// pull 流中返回的 manifest digest ≠ 本地镜像 ID，需要额外查询
+func (p *ProxyServer) resolveImageIDByRef(imageRef string) string {
+	upstreamURL := &url.URL{
+		Scheme: "http",
+		Host:   "docker",
+		Path:   "/images/" + imageRef + "/json",
+	}
+	req, err := http.NewRequest("GET", upstreamURL.String(), nil)
+	if err != nil {
+		return ""
+	}
+	resp, err := p.transport.RoundTrip(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	var img struct {
+		ID string `json:"Id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&img); err != nil {
+		return ""
+	}
+	return img.ID
 }
 

@@ -35,13 +35,17 @@ deny_rules:
   - users: [alice]
     actions: [ps]
 
-# 示例：限制 intern 组的用户只能查看，不能 build/push/exec
-# deny_rules:
-#   - groups: [intern]
-#     actions: [build, push, exec, rm, rmi]
-#
-#   - users: [untrusted-user]
-#     actions: [build, push, exec, pull]
+  # 示例：禁止 bob 执行 build/push/exec
+  # - users: [bob]
+  #   actions: [build, push, exec]
+
+  # 示例：禁止 root 直接 run 容器（审计用，强制走普通账户）
+  # - users: [root]
+  #   actions: [run]
+
+  # 示例：限制 intern 组
+  # - groups: [intern]
+  #   actions: [build, push, exec, rm, rmi]
 
 # 操作分类映射（仅供参考，实际映射由程序内部硬编码实现）
 action_mapping:

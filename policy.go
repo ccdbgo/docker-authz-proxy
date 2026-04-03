@@ -37,6 +37,7 @@ type resolvedDenyRule struct {
 type Policy struct {
 	config            PolicyConfig
 	resolvedDenyRules []resolvedDenyRule
+	unresolvedNames   []string // 配置中找不到的用户名/组名（用于启动时警告）
 }
 
 func loadPolicy(path string) (*Policy, error) {
@@ -76,11 +77,19 @@ func (p *Policy) resolve() {
 		for _, u := range rule.Users {
 			if uid := lookupUID(u); uid >= 0 {
 				r.UIDs = append(r.UIDs, uid)
+			} else {
+				// 用户不存在于 /etc/passwd，记录未解析名称
+				p.unresolvedNames = append(p.unresolvedNames,
+					"user:"+u+" (not found in /etc/passwd)")
 			}
 		}
 		for _, g := range rule.Groups {
 			if gid := lookupGroupGID(g); gid >= 0 {
 				r.GIDs = append(r.GIDs, gid)
+			} else {
+				// 组不存在于 /etc/group，记录未解析名称
+				p.unresolvedNames = append(p.unresolvedNames,
+					"group:"+g+" (not found in /etc/group)")
 			}
 		}
 		// 只有当规则有实际的 UID 或 GID 时才添加
@@ -122,17 +131,18 @@ const (
 	ActionPS              = "ps"              // 列出容器
 	ActionCreateContainer = "create_container" // 创建容器
 	ActionStartContainer  = "start"           // 启动容器
-	ActionStop            = "stop"            // 停止/kill 容器
+	ActionStop            = "stop"            // 停止/kill/pause/unpause 容器
 	ActionRemoveContainer = "rm"              // 删除容器
-	ActionExec            = "exec"            // 在容器内执行命令
+	ActionExec            = "exec"            // 在容器内执行命令（含 attach）
 	ActionInspect         = "inspect"         // 查看容器/镜像详情
-	ActionLogs            = "logs"            // 查看容器日志
+	ActionLogs            = "logs"            // 查看容器日志/stats/top 等只读操作
 	ActionImages          = "images"          // 列出镜像
 	ActionPull            = "pull"            // 拉取镜像
 	ActionBuild           = "build"           // 构建镜像
 	ActionPush            = "push"            // 推送镜像
 	ActionRemoveImage     = "rmi"             // 删除镜像
 	ActionTag             = "tag"             // 标记镜像
+	ActionCommit          = "commit"          // 从容器提交镜像
 	ActionOther           = "other"           // 其他操作
 )
 
@@ -153,16 +163,30 @@ func classifyAction(method, uri string) string {
 	case method == "POST" && pathMatchesN(path, "/containers/", "/start"):
 		return ActionStartContainer
 	case method == "POST" && (pathMatchesN(path, "/containers/", "/stop") ||
-		pathMatchesN(path, "/containers/", "/kill")):
+		pathMatchesN(path, "/containers/", "/kill") ||
+		pathMatchesN(path, "/containers/", "/pause") ||
+		pathMatchesN(path, "/containers/", "/unpause")):
 		return ActionStop
 	case method == "DELETE" && pathHasPrefix(path, "/containers/"):
 		return ActionRemoveContainer
-	case method == "POST" && pathMatchesN(path, "/containers/", "/exec"):
+	case method == "POST" && (pathMatchesN(path, "/containers/", "/exec") ||
+		pathMatchesN(path, "/containers/", "/attach") ||
+		pathMatchesN(path, "/containers/", "/resize")):
 		return ActionExec
 	case method == "GET" && pathMatchesN(path, "/containers/", "/json"):
 		return ActionInspect
-	case method == "GET" && pathMatchesN(path, "/containers/", "/logs"):
+	case method == "GET" && (pathMatchesN(path, "/containers/", "/logs") ||
+		pathMatchesN(path, "/containers/", "/stats") ||
+		pathMatchesN(path, "/containers/", "/top") ||
+		pathMatchesN(path, "/containers/", "/changes") ||
+		pathMatchesN(path, "/containers/", "/export")):
 		return ActionLogs
+	case method == "POST" && (pathMatchesN(path, "/containers/", "/rename") ||
+		pathMatchesN(path, "/containers/", "/update") ||
+		pathMatchesN(path, "/containers/", "/wait")):
+		return ActionStop // 修改/等待容器状态，归属同 stop
+	case method == "POST" && pathMatches(path, "/commit"):
+		return ActionCommit
 
 	// 镜像操作
 	case method == "GET" && pathMatches(path, "/images/json"):
@@ -178,6 +202,8 @@ func classifyAction(method, uri string) string {
 		return ActionRemoveImage
 	case method == "GET" && pathMatchesN(path, "/images/", "/json"):
 		return ActionInspect
+	case method == "GET" && pathMatchesN(path, "/images/", "/history"):
+		return ActionInspect // history 需要镜像访问权
 	case method == "POST" && pathMatchesN(path, "/images/", "/tag"):
 		return ActionTag
 	}

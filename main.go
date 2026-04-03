@@ -4,6 +4,7 @@ import (
 	"flag"
 	"os"
 	"os/signal"
+	"sort"
 	"syscall"
 	"time"
 
@@ -60,24 +61,7 @@ func main() {
 			zap.Error(err))
 		policy = defaultAllowPolicy()
 	} else {
-		// 记录策略加载信息
-		logger.Info("policy loaded successfully",
-			zap.String("policy_file", *policyFile),
-			zap.Int("deny_rules_count", len(policy.config.DenyRules)),
-			zap.Int("resolved_rules_count", len(policy.resolvedDenyRules)))
-
-		// 调试：输出解析后的规则
-		for i, rule := range policy.resolvedDenyRules {
-			actions := []string{}
-			for action := range rule.Actions {
-				actions = append(actions, action)
-			}
-			logger.Debug("resolved_deny_rule",
-				zap.Int("rule_index", i),
-				zap.Ints("uids", rule.UIDs),
-				zap.Ints("gids", rule.GIDs),
-				zap.Strings("actions", actions))
-		}
+		logPolicyLoadResult(logger, *policyFile, policy)
 	}
 
 	// 创建并启动代理服务
@@ -127,8 +111,7 @@ func main() {
 					}
 
 					proxy.UpdatePolicy(newPolicy)
-					logger.Info("policy configuration reloaded successfully",
-						zap.String("policy_file", *policyFile))
+					logPolicyLoadResult(logger, *policyFile, newPolicy)
 				}
 			}
 		}()
@@ -157,8 +140,7 @@ func main() {
 			}
 
 			proxy.UpdatePolicy(newPolicy)
-			logger.Info("policy configuration reloaded successfully",
-				zap.String("policy_file", *policyFile))
+			logPolicyLoadResult(logger, *policyFile, newPolicy)
 
 		case syscall.SIGINT, syscall.SIGTERM:
 			// 终止信号
@@ -167,6 +149,36 @@ func main() {
 			logger.Info("docker-authz-proxy stopped")
 			return
 		}
+	}
+}
+
+// logPolicyLoadResult 统一记录策略加载/重载结果（INFO + 未解析名称 WARN）
+func logPolicyLoadResult(logger *zap.Logger, policyFile string, p *Policy) {
+	logger.Info("policy loaded successfully",
+		zap.String("policy_file", policyFile),
+		zap.Int("deny_rules_count", len(p.config.DenyRules)),
+		zap.Int("resolved_rules_count", len(p.resolvedDenyRules)))
+
+	// 输出每条已解析规则（INFO，方便排查策略是否生效）
+	for i, rule := range p.resolvedDenyRules {
+		actions := make([]string, 0, len(rule.Actions))
+		for action := range rule.Actions {
+			actions = append(actions, action)
+		}
+		sort.Strings(actions)
+		logger.Info("deny_rule_active",
+			zap.Int("rule_index", i),
+			zap.Ints("uids", rule.UIDs),
+			zap.Ints("gids", rule.GIDs),
+			zap.Strings("actions", actions))
+	}
+
+	// 输出未能解析的用户名/组名（WARN，策略部分不生效时的关键诊断信息）
+	for _, name := range p.unresolvedNames {
+		logger.Warn("deny_rule_unresolved_name",
+			zap.String("policy_file", policyFile),
+			zap.String("name", name),
+			zap.String("hint", "rule will NOT be enforced for this user/group"))
 	}
 }
 
