@@ -230,28 +230,44 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	action := classifyAction(r.Method, r.URL.Path)
 
-	// INFO 日志：记录每次请求（所有操作均记录）
-	p.logger.Info("authz_request",
-		append(logIdentityFields(identity),
-			zap.String("action", action),
-			zap.String("http_method", r.Method),
-			zap.String("http_uri", r.URL.RequestURI()),
-		)...)
-
 	// 获取当前策略（线程安全）
 	policy := p.getPolicy()
 
-	// ── 层次一：命令授权检查 ──────────────────────────────────
-	// 只对 /_ping 放行（Docker CLI 健康检查），/info 和 /version 仍受策略控制
-	// 这样可以区分：
-	//   - docker images → 先调用 /_ping（放行）→ 再调用 /images/json（策略检查）
-	//   - docker info   → 只调用 /info（策略检查，如果禁止则拦截）
-	isPing := (r.Method == "GET" || r.Method == "HEAD") &&
-		(r.URL.Path == "/_ping" || strings.HasSuffix(r.URL.Path, "/_ping"))
+	// ── 识别 Docker CLI 内部辅助调用 ────────────────────────────
+	//
+	// Docker CLI 在执行用户命令的过程中会自动调用 /info、/version、/_ping 等
+	// 辅助端点，这些是 CLI 的实现细节，不是用户主动执行的操作。
+	//
+	// 判断依据：将 CmdLine 解析出的 DockerCommand（用户实际执行的子命令）
+	// 与当前 API action 对比：
+	//   - 二者匹配        → 用户主动执行的目标操作，走策略检查
+	//   - 二者不匹配      → CLI 执行目标操作过程中的内部辅助调用，直接放行
+	//
+	// 示例：
+	//   docker run nginx
+	//     GET /info     → DockerCommand="run", action="info" → 不匹配 → 辅助调用，放行
+	//     GET /version  → DockerCommand="run", action="info" → 不匹配 → 辅助调用，放行
+	//     POST /containers/create → DockerCommand="run", action="run" → 匹配 → 策略检查
+	//
+	//   docker info（用户主动执行）
+	//     GET /info     → DockerCommand="info", action="info" → 匹配 → 策略检查
+	//
+	// 特殊情况：/_ping 始终放行（纯健康检查，不对应任何子命令）
+	isAuxiliary := isAuxiliaryCall(identity.DockerCommand, action, r.Method, r.URL.Path)
 
-	if !isPing && policy.IsDenied(identity, action) {
+	// 只记录用户实际执行的目标操作，过滤掉 CLI 内部辅助调用
+	if !isAuxiliary {
+		logAuthzRequest(p.logger, identity, action, r.Method, r.URL.RequestURI())
+	}
+
+	// ── 层次一：命令授权检查 ──────────────────────────────────
+	// 辅助调用直接放行，不受策略控制
+	if !isAuxiliary && policy.IsDenied(identity, action) {
 		p.logger.Warn("authz_denied_command",
 			append(logIdentityFields(identity),
+				zap.String("event_category", "authorization"),
+				zap.String("authz_result", "deny"),
+				zap.String("authz_phase", "command_check"),
 				zap.String("reason", "command_not_permitted"),
 				zap.String("action", action),
 				zap.String("http_method", r.Method),
@@ -281,6 +297,36 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ── 虚拟镜像删除：在转发前处理 ──────────────────────────────
+	if action == ActionRemoveImage {
+		imageID := extractImageID(r.URL.Path)
+		if imageID != "" {
+			shouldDelete, err := p.db.RemoveUserImageAccess(imageID, identity.RealUID)
+			if err != nil {
+				p.logger.Error("remove_image_access_failed",
+					zap.Error(err),
+					zap.String("real_username", identity.RealUsername),
+					zap.Int("real_uid", identity.RealUID),
+					zap.String("image_id", imageID),
+				)
+				http.Error(w, "internal error", http.StatusInternalServerError)
+				return
+			}
+
+			if !shouldDelete {
+				// 其他用户仍在使用该镜像，虚拟删除成功（不转发到 Docker）
+				p.logger.Info("virtual_image_delete",
+					append(logIdentityFields(identity),
+						zap.String("image_id", imageID),
+						zap.String("action", "removed_user_access"),
+					)...)
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			// shouldDelete=true：没有其他用户使用，继续转发到 Docker 真正删除
+		}
+	}
+
 	// ── 转发到上游 dockerd ───────────────────────────────────
 	resp, err := p.forward(modifiedReq)
 	if err != nil {
@@ -297,12 +343,10 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// ── 响应后处理（过滤列表、记录归属）─────────────────────
 	p.postprocessResponse(w, resp, identity, action, r.URL.RequestURI())
 
-	// INFO 日志：所有授权通过的操作均记录
-	p.logger.Info("authz_allowed",
-		append(logIdentityFields(identity),
-			zap.String("action", action),
-			zap.String("http_uri", r.URL.RequestURI()),
-		)...)
+	// INFO 日志：只记录用户实际执行的命令
+	if !isAuxiliary {
+		logAuthzAllowed(p.logger, identity, action, r.URL.RequestURI())
+	}
 }
 
 // checkOwnershipPreRequest 请求前的资源归属检查
@@ -394,36 +438,55 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 		}
 	}
 
-	// ── 镜像删除/推送/标记：验证归属 ────────────────────────────────────
+	// ── 镜像删除：虚拟隔离（允许多用户共享同一镜像）────────────────────
+	if action == ActionRemoveImage {
+		imageID := extractImageID(r.URL.Path)
+		if imageID != "" {
+			owner, isPublic, found := p.db.GetImageOwner(imageID)
+			if found {
+				if isPublic && id.RealUID != 0 {
+					// 公共镜像只有 root 可以删除
+					http.Error(w, "public images can only be removed by root", http.StatusForbidden)
+					return false
+				}
+				// 检查用户是否有权访问这个镜像
+				if !p.db.CanUseImage(id.RealUID, imageID) {
+					p.logger.Warn("authz_denied_ownership",
+						append(logIdentityFields(id),
+							append(logOwnerFields("owner", owner),
+								zap.String("reason", "not_your_image"),
+								zap.String("image_id", imageID),
+								zap.String("action", action),
+							)...)...)
+					http.Error(w,
+						fmt.Sprintf("image '%s' not accessible by '%s'(uid=%d)",
+							truncID(imageID), id.RealUsername, id.RealUID),
+						http.StatusForbidden)
+					return false
+				}
+			}
+		}
+	}
+
+	// ── 镜像推送/标记：检查访问权限（不要求必须是 owner）────────────────
+	// 虚拟隔离模式下，任何有访问权限的用户都可以 tag/push 镜像
 	switch action {
-	case ActionRemoveImage, ActionPush, ActionTag:
+	case ActionPush, ActionTag:
 		imageID := extractImageID(r.URL.Path)
 		if imageID == "" {
 			break
 		}
-		owner, isPublic, found := p.db.GetImageOwner(imageID)
-		if !found {
-			break // 不在 DB 中，放行
-		}
-		if isPublic {
-			// 公共镜像只有 root 可以删除
-			if action == ActionRemoveImage && id.RealUID != 0 {
-				http.Error(w, "public images can only be removed by root", http.StatusForbidden)
-				return false
-			}
-			break
-		}
-		if owner.UID != id.RealUID {
-			p.logger.Warn("authz_denied_ownership",
+		// 检查用户是否有访问权限（而不是检查 owner）
+		if !p.db.CanUseImage(id.RealUID, imageID) {
+			p.logger.Warn("authz_denied_image_access",
 				append(logIdentityFields(id),
-					append(logOwnerFields("owner", owner),
-						zap.String("reason", "not_your_image"),
-						zap.String("image_id", imageID),
-						zap.String("action", action),
-					)...)...)
+					zap.String("reason", "image_not_permitted"),
+					zap.String("image_id", imageID),
+					zap.String("action", action),
+				)...)
 			http.Error(w,
-				fmt.Sprintf("image '%s' belongs to '%s'(uid=%d)",
-					truncID(imageID), owner.Username, owner.UID),
+				fmt.Sprintf("user '%s'(uid=%d) not permitted to %s image '%s'",
+					id.RealUsername, id.RealUID, action, truncID(imageID)),
 				http.StatusForbidden)
 			return false
 		}
@@ -641,8 +704,17 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 			imageRef := parseImageRefFromURI(requestURI)
 			if imageRef != "" {
 				if imageID := p.resolveImageIDByRef(imageRef); imageID != "" {
+					// 先尝试设置 owner（如果是新镜像，第一个拉取的用户成为 owner）
 					if err := p.db.SetImageOwner(imageID, id, false, "pull"); err != nil {
 						p.logger.Error("save_image_owner_failed",
+							zap.String("image_id", imageID),
+							zap.String("real_username", id.RealUsername),
+							zap.Int("real_uid", id.RealUID),
+							zap.Error(err))
+					}
+					// 确保当前用户有访问权限（即使镜像已存在，也要添加到 image_access）
+					if err := p.db.EnsureImageAccess(imageID, id.RealUID); err != nil {
+						p.logger.Error("ensure_image_access_failed",
 							zap.String("image_id", imageID),
 							zap.String("real_username", id.RealUsername),
 							zap.Int("real_uid", id.RealUID),
@@ -664,8 +736,18 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 		w.WriteHeader(resp.StatusCode)
 		imageID := streamAndCaptureImageID(w, resp, "build")
 		if imageID != "" && resp.StatusCode == http.StatusOK {
+			// 先尝试设置 owner（如果是新镜像，构建者成为 owner）
 			if err := p.db.SetImageOwner(imageID, id, false, "build"); err != nil {
 				p.logger.Error("save_image_owner_failed",
+					zap.String("image_id", imageID),
+					zap.String("real_username", id.RealUsername),
+					zap.Int("real_uid", id.RealUID),
+					zap.Error(err))
+			}
+			// 确保构建者有访问权限（即使 image ID 已存在，也要添加到 image_access）
+			// 这处理了极少见的情况：构建结果的 image ID 恰好和已存在的镜像相同
+			if err := p.db.EnsureImageAccess(imageID, id.RealUID); err != nil {
+				p.logger.Error("ensure_image_access_failed",
 					zap.String("image_id", imageID),
 					zap.String("real_username", id.RealUsername),
 					zap.Int("real_uid", id.RealUID),
@@ -679,11 +761,16 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 		}
 
 	case ActionRemoveImage:
-		// 删除成功时清除归属记录
+		// 镜像删除成功后，从数据库中删除记录
+		// 注意：虚拟删除已在 ServeHTTP 中处理，这里只处理真正删除的情况
 		if resp.StatusCode == http.StatusOK {
 			imageID := extractImageID(requestURI)
 			if imageID != "" {
 				_ = p.db.DeleteImage(imageID)
+				p.logger.Info("image_deleted",
+					append(logIdentityFields(id),
+						zap.String("image_id", truncID(imageID)),
+					)...)
 			}
 		}
 		copyHeaders(w, resp.Header)
@@ -700,6 +787,87 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 }
 
 // ── 辅助函数 ─────────────────────────────────────────────────
+
+// isAuxiliaryCall 判断当前 API 请求是否为 Docker CLI 的内部辅助调用
+//
+// 原理：将用户实际执行的 docker 子命令（dockerCmd）与当前 API 对应的 action 对比。
+//   - dockerCmd == ""     → 无法解析子命令，保守放行（避免误拦）
+//   - /_ping              → 纯健康检查，始终放行
+//   - action 与 dockerCmd 对应的 action 匹配 → 用户目标操作，走策略检查
+//   - action 与 dockerCmd 不匹配           → CLI 内部辅助调用，直接放行
+//
+// 例：docker run nginx 执行时调用 GET /info
+//   dockerCmd="run", action="info" → 不匹配 → 辅助调用 → 放行
+//
+// 例：用户主动执行 docker info
+//   dockerCmd="info", action="info" → 匹配 → 走策略检查
+func isAuxiliaryCall(dockerCmd, action, method, path string) bool {
+	// /_ping 始终放行
+	if (method == "GET" || method == "HEAD") &&
+		(path == "/_ping" || strings.HasSuffix(path, "/_ping")) {
+		return true
+	}
+
+	// 无法解析子命令时放行（保守策略，避免误拦合法请求）
+	if dockerCmd == "" {
+		return false
+	}
+
+	// dockerCmd → 该子命令执行过程中属于"目标操作"的 action 集合
+	// 集合内的 action 走策略检查；不在集合内的是辅助调用，直接放行
+	// 注：policy.go 中 ActionStop 覆盖 kill/pause/unpause，ActionLogs 覆盖 stats/top，
+	//     ActionExec 覆盖 attach
+	cmdTargetActions := map[string][]string{
+		"run":     {ActionPull, ActionCreateContainer, ActionStartContainer, ActionRemoveContainer},
+		"create":  {ActionCreateContainer},
+		"start":   {ActionStartContainer},
+		"stop":    {ActionStop},
+		"restart": {ActionRestart},
+		"kill":    {ActionStop},
+		"rm":      {ActionRemoveContainer},
+		"exec":    {ActionExec},
+		"attach":  {ActionExec},
+		"logs":    {ActionLogs},
+		"stats":   {ActionLogs},
+		"top":     {ActionLogs},
+		"cp":      {ActionCp},
+		"commit":  {ActionCommit},
+		"ps":      {ActionPS},
+		"inspect": {ActionInspect},
+		"pause":   {ActionStop},
+		"unpause": {ActionStop},
+		"pull":    {ActionPull},
+		"push":    {ActionPush},
+		"build":   {ActionBuild},
+		"images":  {ActionImages},
+		"rmi":     {ActionRemoveImage},
+		"tag":     {ActionTag},
+		"save":    {ActionSave},
+		"load":    {ActionLoad},
+		"search":  {ActionSearch},
+		"info":    {ActionSystemInfo},
+		"version": {ActionSystemInfo},
+		"events":  {ActionSystemEvents},
+		"login":   {ActionSystemLogin},
+		"logout":  {ActionSystemLogin},
+		"df":      {ActionSystemDF},
+		"prune":   {ActionPrune},
+	}
+
+	targetActions, known := cmdTargetActions[dockerCmd]
+	if !known {
+		// 未知子命令，放行（保守策略，避免误拦）
+		return false
+	}
+
+	// 当前 action 在目标集合内 → 用户目标操作，不是辅助调用
+	for _, t := range targetActions {
+		if action == t {
+			return false // 不是辅助调用
+		}
+	}
+	return true // 不在目标集合内 → 辅助调用，放行
+}
 
 // systemUser 从 /etc/passwd 读取的用户信息
 type systemUser struct {

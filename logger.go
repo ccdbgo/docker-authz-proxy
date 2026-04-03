@@ -88,3 +88,85 @@ func logOwnerFields(prefix string, owner *OwnerInfo) []zap.Field {
 		zap.Int(prefix+"_gid", owner.GID),
 	}
 }
+
+// ── 授权日志辅助函数（统一标识，方便查找）────────────────────────
+
+// logAuthzRequest 记录授权请求（每次 API 调用）
+func logAuthzRequest(logger *zap.Logger, id *CallerIdentity, action, method, uri string) {
+	logger.Info("authz_request",
+		append(logIdentityFields(id),
+			zap.String("event_category", "AUTHORIZATION"),
+			zap.String("authz_phase", "request"),
+			zap.String("action", action),
+			zap.String("http_method", method),
+			zap.String("http_uri", uri),
+		)...)
+}
+
+// logAuthzAllowed 记录授权通过
+func logAuthzAllowed(logger *zap.Logger, id *CallerIdentity, action, uri string) {
+	logger.Info("authz_allowed",
+		append(logIdentityFields(id),
+			zap.String("event_category", "AUTHORIZATION"),
+			zap.String("authz_result", "ALLOW"),
+			zap.String("authz_phase", "final"),
+			zap.String("action", action),
+			zap.String("http_uri", uri),
+		)...)
+}
+
+// logAuthzDeniedCommand 记录命令授权被拒绝
+func logAuthzDeniedCommand(logger *zap.Logger, id *CallerIdentity, action, method, uri, reason string) {
+	logger.Warn("authz_denied_command",
+		append(logIdentityFields(id),
+			zap.String("event_category", "AUTHORIZATION"),
+			zap.String("authz_result", "DENY"),
+			zap.String("authz_phase", "command_check"),
+			zap.String("deny_reason", reason),
+			zap.String("action", action),
+			zap.String("http_method", method),
+			zap.String("http_uri", uri),
+		)...)
+}
+
+// logAuthzDeniedOwnership 记录资源归属检查被拒绝
+func logAuthzDeniedOwnership(logger *zap.Logger, id *CallerIdentity, owner *OwnerInfo,
+	resourceType, resourceID, action, reason string) {
+	logger.Warn("authz_denied_ownership",
+		append(logIdentityFields(id),
+			append(logOwnerFields("owner", owner),
+				zap.String("event_category", "AUTHORIZATION"),
+				zap.String("authz_result", "DENY"),
+				zap.String("authz_phase", "ownership_check"),
+				zap.String("deny_reason", reason),
+				zap.String("resource_type", resourceType),
+				zap.String("resource_id", resourceID),
+				zap.String("action", action),
+			)...)...)
+}
+
+// logAuthzDeniedImageAccess 记录镜像访问被拒绝
+func logAuthzDeniedImageAccess(logger *zap.Logger, id *CallerIdentity,
+	imageRef, action, reason string) {
+	logger.Warn("authz_denied_image_access",
+		append(logIdentityFields(id),
+			zap.String("event_category", "AUTHORIZATION"),
+			zap.String("authz_result", "DENY"),
+			zap.String("authz_phase", "image_access_check"),
+			zap.String("deny_reason", reason),
+			zap.String("image_ref", imageRef),
+			zap.String("action", action),
+		)...)
+}
+
+// logVirtualImageDelete 记录虚拟镜像删除
+func logVirtualImageDelete(logger *zap.Logger, id *CallerIdentity, imageID string, realDelete bool) {
+	logger.Info("virtual_image_delete",
+		append(logIdentityFields(id),
+			zap.String("event_category", "AUTHORIZATION"),
+			zap.String("authz_result", "ALLOW"),
+			zap.String("authz_phase", "virtual_delete"),
+			zap.String("image_id", imageID),
+			zap.Bool("real_delete", realDelete),
+		)...)
+}

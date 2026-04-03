@@ -199,6 +199,36 @@ func (o *OwnershipDB) MarkImagePublic(imageID string, isPublic bool) error {
 	return err
 }
 
+// RemoveUserImageAccess 移除用户对镜像的访问权限
+// 返回：是否应该真正删除镜像（当没有任何用户访问时）
+func (o *OwnershipDB) RemoveUserImageAccess(imageID string, uid int) (shouldDelete bool, err error) {
+	// 从 image_access 表中移除该用户的记录
+	_, err = o.db.Exec(`DELETE FROM image_access WHERE image_id = ? AND user_uid = ?`, imageID, uid)
+	if err != nil {
+		return false, err
+	}
+
+	// 检查是否还有其他用户访问这个镜像
+	var count int
+	err = o.db.QueryRow(`SELECT COUNT(*) FROM image_access WHERE image_id = ?`, imageID).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+
+	// 如果没有任何用户访问，应该删除镜像
+	return count == 0, nil
+}
+
+// EnsureImageAccess 确保用户对镜像有访问权限（幂等操作）
+// 用于 build/pull 等操作，即使镜像已存在也要确保当前用户有访问权
+func (o *OwnershipDB) EnsureImageAccess(imageID string, uid int) error {
+	_, err := o.db.Exec(
+		`INSERT OR IGNORE INTO image_access (image_id, user_uid) VALUES (?, ?)`,
+		imageID, uid,
+	)
+	return err
+}
+
 // DeleteImage 删除镜像归属记录（同步清理 image_access）
 func (o *OwnershipDB) DeleteImage(imageID string) error {
 	_, _ = o.db.Exec(`DELETE FROM image_access WHERE image_id = ?`, imageID)

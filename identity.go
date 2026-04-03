@@ -48,7 +48,44 @@ type CallerIdentity struct {
 	ProcessName string // 进程名（读 /proc/<pid>/comm）
 	CmdLine     string // 完整命令行（读 /proc/<pid>/cmdline）
 
+	// 用户主动执行的 docker 子命令（从 CmdLine 解析）
+	// 例：CmdLine="docker run nginx" → DockerCommand="run"
+	// 例：CmdLine="docker" → DockerCommand=""（bare docker 调用）
+	DockerCommand string
+
 	UserType UserType
+}
+
+// parseDockerCommand 从命令行中解析用户主动执行的 docker 子命令
+// 返回第一个非 flag 的参数（即子命令），找不到则返回空字符串
+func parseDockerCommand(cmdline string) string {
+	if cmdline == "" {
+		return ""
+	}
+	parts := strings.Fields(cmdline)
+	// 找到 docker 二进制后，扫描后续参数
+	// 跳过全局 flag（如 -H, --host, --tls* 等），取第一个非 flag 参数
+	dockerIdx := -1
+	for i, p := range parts {
+		base := p
+		if idx := strings.LastIndex(p, "/"); idx >= 0 {
+			base = p[idx+1:]
+		}
+		if base == "docker" {
+			dockerIdx = i
+			break
+		}
+	}
+	if dockerIdx < 0 || dockerIdx+1 >= len(parts) {
+		return ""
+	}
+	for _, arg := range parts[dockerIdx+1:] {
+		if strings.HasPrefix(arg, "-") {
+			continue // 跳过全局 flag
+		}
+		return arg // 第一个非 flag 参数即为子命令
+	}
+	return ""
 }
 
 // resolveCallerIdentity 从 Unix socket 连接解析调用方完整身份
@@ -122,6 +159,7 @@ func resolveCallerIdentity(conn net.Conn) (*CallerIdentity, error) {
 		PID:               pid,
 		ProcessName:       processName,
 		CmdLine:           cmdLine,
+		DockerCommand:     parseDockerCommand(cmdLine),
 		UserType:          userType,
 	}, nil
 }
