@@ -229,11 +229,13 @@ func classifyAction(method, uri string) string {
 		pathMatchesN(path, "/containers/", "/pause") ||
 		pathMatchesN(path, "/containers/", "/unpause")):
 		return ActionStop
-	// 改名/更新配置/等待（归类为状态变更）
+	// 改名/更新配置（归类为状态变更）
 	case method == "POST" && (pathMatchesN(path, "/containers/", "/rename") ||
-		pathMatchesN(path, "/containers/", "/update") ||
-		pathMatchesN(path, "/containers/", "/wait")):
+		pathMatchesN(path, "/containers/", "/update")):
 		return ActionStop
+	// 等待容器退出（长轮询，透明转发，不阻塞）
+	case method == "POST" && pathMatchesN(path, "/containers/", "/wait"):
+		return ActionOther
 	// 删除容器
 	case method == "DELETE" && pathHasPrefix(path, "/containers/"):
 		return ActionRemoveContainer

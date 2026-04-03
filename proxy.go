@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -157,6 +158,11 @@ func (p *ProxyServer) startUserListener(u systemUser) error {
 	srv := &http.Server{
 		Handler: p,
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			// DEBUG: 记录每个新连接
+			p.logger.Debug("new_connection",
+				zap.String("socket", sockPath),
+				zap.String("remote", c.RemoteAddr().String()),
+			)
 			// 在连接建立时解析调用方身份并注入 context
 			identity, err := resolveCallerIdentity(c)
 			if err != nil {
@@ -170,6 +176,12 @@ func (p *ProxyServer) startUserListener(u systemUser) error {
 					UserType:          UserTypeRegular,
 					EffectiveUsername: "unknown",
 				}
+			} else {
+				p.logger.Debug("identity_resolved",
+					zap.String("user", identity.RealUsername),
+					zap.Int("uid", identity.RealUID),
+					zap.String("cmdline", identity.CmdLine),
+				)
 			}
 			return context.WithValue(ctx, identityContextKey, identity)
 		},
@@ -224,9 +236,19 @@ func (p *ProxyServer) Stop() {
 
 // ServeHTTP 是每个请求的入口：授权 + 代理
 func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// DEBUG: 记录每个 HTTP 请求（最早阶段，用于排查请求是否到达）
+	p.logger.Debug("http_request_received",
+		zap.String("method", r.Method),
+		zap.String("uri", r.URL.RequestURI()),
+		zap.String("proto", r.Proto),
+		zap.String("upgrade", r.Header.Get("Upgrade")),
+		zap.String("connection", r.Header.Get("Connection")),
+	)
+
 	// 从 context 中获取调用方身份
 	identity, _ := r.Context().Value(identityContextKey).(*CallerIdentity)
 	if identity == nil || identity.RealUID < 0 {
+		p.logger.Error("identity_missing_or_invalid")
 		http.Error(w, "identity resolution failed", http.StatusInternalServerError)
 		return
 	}
@@ -234,9 +256,23 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// docker run -it / docker attach / docker exec -it 等需要双向流式连接（HTTP hijack）
 	// 检测到 Upgrade: tcp 请求头或 attach/exec 路径时，走专用隧道处理
 	if isHijackRequest(r) {
+		p.logger.Debug("hijack_detected",
+			zap.String("user", fmt.Sprintf("%s(uid=%d)", identity.RealUsername, identity.RealUID)),
+			zap.String("method", r.Method),
+			zap.String("path", r.URL.Path),
+			zap.String("upgrade", r.Header.Get("Upgrade")),
+			zap.String("connection", r.Header.Get("Connection")),
+		)
 		p.handleHijack(w, r, identity)
 		return
 	}
+	// DEBUG: 记录所有未被 hijack 检测到的请求（帮助排查 attach 是否漏检）
+	p.logger.Debug("non_hijack_request",
+		zap.String("method", r.Method),
+		zap.String("path", r.URL.Path),
+		zap.String("upgrade", r.Header.Get("Upgrade")),
+		zap.String("connection", r.Header.Get("Connection")),
+	)
 
 	action := classifyAction(r.Method, r.URL.Path)
 
@@ -697,7 +733,9 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 				}
 			}
 		}
+		// 关键修复：确保 Content-Length 正确
 		copyHeaders(w, resp.Header)
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(body)
 
@@ -870,6 +908,10 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 		// 其他请求：透明转发（含流式响应、exec 等）
 		copyHeaders(w, resp.Header)
 		w.WriteHeader(resp.StatusCode)
+		// 立即 flush 响应头，避免长轮询（如 /wait）阻塞客户端发后续请求
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
 		_, _ = io.Copy(w, resp.Body)
 	}
 
@@ -1141,10 +1183,36 @@ func (p *ProxyServer) resolveImageIDByRef(imageRef string) string {
 // 标准 http.Transport 不支持这种协议升级，必须直接操作底层连接。
 
 // isHijackRequest 判断请求是否需要 HTTP hijack（双向流）
-// docker 客户端对 attach/exec-start 发送 Upgrade: tcp 请求头
+//
+// Docker CLI 在以下两种情况下需要 hijack：
+//  1. attach：POST /containers/{id}/attach?stream=1&stdin=1
+//     请求头：Connection: Upgrade, Upgrade: tcp
+//  2. exec-start：POST /exec/{id}/start（body 中 Detach=false）
+//     请求头同上
+//
+// 检测方式：优先看 Upgrade 头，再看路径（兜底，防止头部格式不一致）
 func isHijackRequest(r *http.Request) bool {
-	return strings.EqualFold(r.Header.Get("Upgrade"), "tcp") ||
-		strings.EqualFold(r.Header.Get("Connection"), "upgrade")
+	// 检查 Upgrade: tcp（最可靠）
+	if strings.EqualFold(r.Header.Get("Upgrade"), "tcp") {
+		return true
+	}
+	// Connection 头可能是多值逗号分隔，需逐一检查
+	for _, v := range strings.Split(r.Header.Get("Connection"), ",") {
+		if strings.EqualFold(strings.TrimSpace(v), "upgrade") {
+			return true
+		}
+	}
+	// 路径兜底：attach 和 exec/start 路径一定需要 hijack（当 stdin=true 时）
+	path := stripAPIVersion(r.URL.Path)
+	if r.Method == "POST" {
+		if strings.HasSuffix(path, "/attach") {
+			return true
+		}
+		if strings.Contains(path, "/exec/") && strings.HasSuffix(path, "/start") {
+			return true
+		}
+	}
+	return false
 }
 
 // handleHijack 处理需要双向流的请求（attach/exec-start 等）
@@ -1181,6 +1249,7 @@ func (p *ProxyServer) handleHijack(w http.ResponseWriter, r *http.Request, id *C
 	}
 
 	// 1. 劫持客户端连接
+	p.logger.Debug("hijack_step1_start", zap.String("step", "hijack_client"))
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
 		p.logger.Error("hijack_not_supported")
@@ -1194,8 +1263,10 @@ func (p *ProxyServer) handleHijack(w http.ResponseWriter, r *http.Request, id *C
 		return
 	}
 	defer clientConn.Close()
+	p.logger.Debug("hijack_step1_done", zap.String("step", "client_hijacked"))
 
 	// 2. 直接连接上游 dockerd
+	p.logger.Debug("hijack_step2_start", zap.String("step", "dial_upstream"))
 	upstreamConn, err := net.DialTimeout("unix", p.upstreamSock, 5*time.Second)
 	if err != nil {
 		p.logger.Error("upstream_dial_failed", zap.Error(err))
@@ -1203,35 +1274,89 @@ func (p *ProxyServer) handleHijack(w http.ResponseWriter, r *http.Request, id *C
 		return
 	}
 	defer upstreamConn.Close()
+	p.logger.Debug("hijack_step2_done", zap.String("step", "upstream_connected"))
 
-	// 3. 手工重写并转发 HTTP 请求到上游
-	// 构造 request line + headers
-	fmt.Fprintf(upstreamConn, "%s %s HTTP/1.1\r\n", r.Method, r.URL.RequestURI())
-	fmt.Fprintf(upstreamConn, "Host: docker\r\n")
+	// 3. 手工重建 HTTP 请求并发给上游（直接写入，不使用缓冲）
+	p.logger.Debug("hijack_step3_start", zap.String("step", "forward_request"))
+	var reqBuilder strings.Builder
+	fmt.Fprintf(&reqBuilder, "%s %s HTTP/1.1\r\n", r.Method, r.URL.RequestURI())
+	fmt.Fprintf(&reqBuilder, "Host: docker\r\n")
 	for k, vals := range r.Header {
+		if strings.EqualFold(k, "Host") {
+			continue
+		}
 		for _, v := range vals {
-			fmt.Fprintf(upstreamConn, "%s: %s\r\n", k, v)
+			fmt.Fprintf(&reqBuilder, "%s: %s\r\n", k, v)
 		}
 	}
-	fmt.Fprintf(upstreamConn, "\r\n")
+	fmt.Fprintf(&reqBuilder, "\r\n")
 
-	// 如果客户端缓冲区有未读数据（已接收的请求体），先刷到上游
-	if clientBuf.Reader.Buffered() > 0 {
-		buffered, _ := clientBuf.Reader.Peek(clientBuf.Reader.Buffered())
-		upstreamConn.Write(buffered)
+	if _, err := upstreamConn.Write([]byte(reqBuilder.String())); err != nil {
+		p.logger.Error("write_request_failed", zap.Error(err))
+		fmt.Fprintf(clientConn, "HTTP/1.1 502 Bad Gateway\r\n\r\nwrite request failed: %s", err.Error())
+		return
 	}
 
+	if clientBuf.Reader.Buffered() > 0 {
+		n := clientBuf.Reader.Buffered()
+		buffered := make([]byte, n)
+		io.ReadFull(clientBuf.Reader, buffered)
+		upstreamConn.Write(buffered)
+	}
+	p.logger.Debug("hijack_step3_done", zap.String("step", "request_forwarded"))
+
+	// 3.5. 读取并立即转发上游的 101 响应（确保客户端收到后才启动双向复制）
+	p.logger.Debug("hijack_step3_5_start", zap.String("step", "forward_101_response"))
+	// 读取上游响应的第一行（HTTP/1.1 101 Switching Protocols）
+	upstreamReader := bufio.NewReader(upstreamConn)
+	statusLine, err := upstreamReader.ReadString('\n')
+	if err != nil {
+		p.logger.Error("read_upstream_status_failed", zap.Error(err))
+		fmt.Fprintf(clientConn, "HTTP/1.1 502 Bad Gateway\r\n\r\nread upstream status failed: %s", err.Error())
+		return
+	}
+	// 立即写给客户端
+	if _, err := clientConn.Write([]byte(statusLine)); err != nil {
+		p.logger.Error("write_status_to_client_failed", zap.Error(err))
+		return
+	}
+	p.logger.Debug("hijack_status_line_forwarded", zap.String("status", strings.TrimSpace(statusLine)))
+
+	// 读取并转发响应头（直到空行）
+	for {
+		line, err := upstreamReader.ReadString('\n')
+		if err != nil {
+			p.logger.Error("read_upstream_header_failed", zap.Error(err))
+			return
+		}
+		if _, err := clientConn.Write([]byte(line)); err != nil {
+			p.logger.Error("write_header_to_client_failed", zap.Error(err))
+			return
+		}
+		if line == "\r\n" || line == "\n" {
+			break // 空行表示响应头结束
+		}
+	}
+	p.logger.Debug("hijack_step3_5_done", zap.String("step", "101_response_forwarded"))
+
 	// 4. 双向 io.Copy（上游↔客户端）
+	p.logger.Debug("hijack_step4_start", zap.String("step", "start_bidirectional_copy"))
 	done := make(chan struct{}, 2)
 	go func() {
-		io.Copy(upstreamConn, clientConn) // 客户端 stdin → 上游
+		n, err := io.Copy(upstreamConn, clientConn)
+		p.logger.Debug("hijack_copy_client_to_upstream_done", zap.Int64("bytes", n), zap.Error(err))
+		upstreamConn.Close() // 通知另一方向退出
 		done <- struct{}{}
 	}()
 	go func() {
-		io.Copy(clientConn, upstreamConn) // 上游 stdout/stderr → 客户端
+		// 使用 upstreamReader 而非 upstreamConn，避免丢失响应头后的缓冲数据
+		n, err := io.Copy(clientConn, upstreamReader)
+		p.logger.Debug("hijack_copy_upstream_to_client_done", zap.Int64("bytes", n), zap.Error(err))
+		clientConn.Close() // 通知另一方向退出
 		done <- struct{}{}
 	}()
-	<-done // 任一方向结束即退出（另一个 goroutine 会在连接关闭后自然退出）
+	<-done
+	<-done // 等待两个方向都完成
 
 	p.logger.Debug("hijack_done",
 		zap.String("user", fmt.Sprintf("%s(uid=%d)", id.RealUsername, id.RealUID)),
