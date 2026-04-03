@@ -43,11 +43,14 @@ func newProxyServer(socketDir, upstreamSock string, policy *Policy, db *Ownershi
 	// 上游 transport：每次请求新建 Unix socket 连接
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return net.Dial("unix", upstreamSock)
+			// 使用带超时的 Dial，防止 Unix socket 连接无限期阻塞
+			d := &net.Dialer{Timeout: 5 * time.Second}
+			return d.DialContext(ctx, "unix", upstreamSock)
 		},
-		MaxIdleConns:        100,
-		IdleConnTimeout:     90 * time.Second,
-		DisableCompression:  true, // 避免压缩干扰响应体解析
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second, // 防止上游无响应导致挂起
+		DisableCompression:    true,             // 避免压缩干扰响应体解析
 	}
 
 	return &ProxyServer{
@@ -228,6 +231,13 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// docker run -it / docker attach / docker exec -it 等需要双向流式连接（HTTP hijack）
+	// 检测到 Upgrade: tcp 请求头或 attach/exec 路径时，走专用隧道处理
+	if isHijackRequest(r) {
+		p.handleHijack(w, r, identity)
+		return
+	}
+
 	action := classifyAction(r.Method, r.URL.Path)
 
 	// 获取当前策略（线程安全）
@@ -295,6 +305,11 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// ── 请求预处理（标签注入等）──────────────────────────────
+	p.logger.Debug("preprocess_request_start",
+		zap.String("user", fmt.Sprintf("%s(uid=%d)", identity.RealUsername, identity.RealUID)),
+		zap.String("action", action),
+		zap.String("uri", r.URL.RequestURI()),
+	)
 	modifiedReq, err := p.preprocessRequest(r, identity, action)
 	if err != nil {
 		p.logger.Error("preprocess_request_failed",
@@ -305,6 +320,10 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	p.logger.Debug("preprocess_request_done",
+		zap.String("user", fmt.Sprintf("%s(uid=%d)", identity.RealUsername, identity.RealUID)),
+		zap.String("action", action),
+	)
 
 	// ── 虚拟镜像删除：在转发前处理 ──────────────────────────────
 	if action == ActionRemoveImage {
@@ -338,6 +357,11 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// ── 转发到上游 dockerd ───────────────────────────────────
+	p.logger.Debug("forward_request_start",
+		zap.String("user", fmt.Sprintf("%s(uid=%d)", identity.RealUsername, identity.RealUID)),
+		zap.String("action", action),
+		zap.String("uri", r.URL.RequestURI()),
+	)
 	resp, err := p.forward(modifiedReq)
 	if err != nil {
 		p.logger.Error("upstream_error",
@@ -349,9 +373,22 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
+	p.logger.Debug("forward_request_done",
+		zap.String("user", fmt.Sprintf("%s(uid=%d)", identity.RealUsername, identity.RealUID)),
+		zap.String("action", action),
+		zap.Int("status_code", resp.StatusCode),
+	)
 
 	// ── 响应后处理（过滤列表、记录归属）─────────────────────
+	p.logger.Debug("postprocess_response_start",
+		zap.String("user", fmt.Sprintf("%s(uid=%d)", identity.RealUsername, identity.RealUID)),
+		zap.String("action", action),
+	)
 	p.postprocessResponse(w, resp, identity, action, r.URL.RequestURI())
+	p.logger.Debug("postprocess_response_done",
+		zap.String("user", fmt.Sprintf("%s(uid=%d)", identity.RealUsername, identity.RealUID)),
+		zap.String("action", action),
+	)
 
 	// INFO 日志：只记录用户实际执行的命令
 	if !isAuxiliary {
@@ -370,7 +407,19 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 	nonContainerIDs := map[string]bool{"json": true, "create": true, "prune": true}
 	if containerID != "" && !nonContainerIDs[containerID] {
 		owner, found := p.db.GetContainerOwner(containerID)
-		if found && owner.UID != id.RealUID {
+		if !found {
+			// 容器未在代理中注册（部署前已存在或 DB 写入失败）
+			// root 可管理所有容器，普通用户只能操作自己创建的容器
+			if id.RealUID != 0 {
+				logAuthzDeniedNotTracked(p.logger, id, "container", truncID(containerID), action)
+				http.Error(w,
+					fmt.Sprintf("container '%s' not tracked by proxy (only root can manage untracked containers)",
+						truncID(containerID)),
+					http.StatusForbidden)
+				return false
+			}
+		} else if owner.UID != id.RealUID {
+			// 容器已注册但归属不匹配
 			logAuthzDeniedOwnership(p.logger, id, owner, "container", truncID(containerID), action)
 			http.Error(w,
 				fmt.Sprintf("container '%s' belongs to '%s'(uid=%d), not '%s'(uid=%d)",
@@ -386,7 +435,17 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 		qContainerID := r.URL.Query().Get("container")
 		if qContainerID != "" {
 			owner, found := p.db.GetContainerOwner(qContainerID)
-			if found && owner.UID != id.RealUID {
+			if !found {
+				// 容器未追踪，只允许 root 操作
+				if id.RealUID != 0 {
+					logAuthzDeniedNotTracked(p.logger, id, "container", truncID(qContainerID), action)
+					http.Error(w,
+						fmt.Sprintf("container '%s' not tracked by proxy (only root can manage untracked containers)",
+							truncID(qContainerID)),
+						http.StatusForbidden)
+					return false
+				}
+			} else if owner.UID != id.RealUID {
 				logAuthzDeniedOwnership(p.logger, id, owner, "container", truncID(qContainerID), action)
 				http.Error(w,
 					fmt.Sprintf("container '%s' belongs to '%s'(uid=%d), not '%s'(uid=%d)",
@@ -399,34 +458,36 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 	}
 
 	// ── 创建容器：验证镜像使用权限 ──────────────────────────────────────
+	// 注意：不在此处解析镜像 ID（会导致同步调用上游 Docker，可能死锁）
+	// 镜像权限检查推迟到响应后处理阶段（postprocessResponse）
+	// 此处仅做基本的镜像引用提取，实际权限验证在容器创建成功后进行
 	if action == ActionCreateContainer {
 		imageRef := extractImageRefFromBody(r)
 		if imageRef != "" {
-			// 将镜像名称/标签解析为 SHA256 内容 ID 后再查 DB
-			// DB 始终以 sha256:... 为主键存储，直接用 "nginx" 会查不到
-			checkID := imageRef
-			if resolved := p.resolveImageIDByRef(imageRef); resolved != "" {
-				checkID = resolved
-			}
-			if !p.db.CanUseImage(id.RealUID, checkID) {
-				logAuthzDeniedImageAccess(p.logger, id, imageRef, action, "image_not_permitted")
-				http.Error(w,
-					fmt.Sprintf("user '%s'(uid=%d) not permitted to use image '%s'",
-						id.RealUsername, id.RealUID, imageRef),
-					http.StatusForbidden)
-				return false
+			// 先用镜像名称直接查 DB（可能是 tag 或 sha256）
+			// CanUseImage 内部已处理未追踪镜像（返回 true，兼容存量）
+			// 所以这里只能拦截明确在 DB 中且无权限的镜像
+			if !p.db.CanUseImage(id.RealUID, imageRef) {
+				// 尝试加 sha256: 前缀再查一次
+				if !p.db.CanUseImage(id.RealUID, "sha256:"+imageRef) {
+					logAuthzDeniedImageAccess(p.logger, id, imageRef, action, "image_not_permitted")
+					http.Error(w,
+						fmt.Sprintf("user '%s'(uid=%d) not permitted to use image '%s'",
+							id.RealUsername, id.RealUID, imageRef),
+						http.StatusForbidden)
+					return false
+				}
 			}
 		}
 	}
 
 	// ── 镜像 inspect / save：验证查看/导出权限 ──────────────────────────
+	// 注意：不在此处解析镜像 ID（避免同步调用上游导致死锁）
+	// 直接用 URL 中的镜像引用查 DB，未追踪镜像会被 CanUseImage 放行
 	if action == ActionInspect || action == ActionSave {
 		if imageRef := extractImageID(r.URL.Path); imageRef != "" {
-			checkID := imageRef
-			if resolved := p.resolveImageIDByRef(imageRef); resolved != "" {
-				checkID = resolved
-			}
-			if !p.db.CanUseImage(id.RealUID, checkID) {
+			// 尝试原始引用和加 sha256: 前缀两种方式
+			if !p.db.CanUseImage(id.RealUID, imageRef) && !p.db.CanUseImage(id.RealUID, "sha256:"+imageRef) {
 				logAuthzDeniedImageAccess(p.logger, id, truncID(imageRef), action, "image_not_permitted")
 				http.Error(w,
 					fmt.Sprintf("user '%s'(uid=%d) not permitted to access image '%s'",
@@ -461,17 +522,15 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 	}
 
 	// ── 镜像推送/标记：检查访问权限（不要求必须是 owner）────────────────
+	// 注意：不在此处解析镜像 ID（避免同步调用上游导致死锁）
 	switch action {
 	case ActionPush, ActionTag:
 		imageRef := extractImageID(r.URL.Path)
 		if imageRef == "" {
 			break
 		}
-		checkID := imageRef
-		if resolved := p.resolveImageIDByRef(imageRef); resolved != "" {
-			checkID = resolved
-		}
-		if !p.db.CanUseImage(id.RealUID, checkID) {
+		// 尝试原始引用和加 sha256: 前缀两种方式
+		if !p.db.CanUseImage(id.RealUID, imageRef) && !p.db.CanUseImage(id.RealUID, "sha256:"+imageRef) {
 			logAuthzDeniedImageAccess(p.logger, id, truncID(imageRef), action, "image_not_permitted")
 			http.Error(w,
 				fmt.Sprintf("user '%s'(uid=%d) not permitted to %s image '%s'",
@@ -542,15 +601,33 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 	switch action {
 	case ActionPS:
 		// 过滤容器列表
+		p.logger.Debug("filter_containers_start",
+			zap.String("user", fmt.Sprintf("%s(uid=%d)", id.RealUsername, id.RealUID)),
+		)
 		body, err := readFullBody(resp.Body)
 		if err != nil {
+			p.logger.Error("read_response_body_failed",
+				zap.String("action", "ps"),
+				zap.Error(err))
 			http.Error(w, "read upstream response failed", http.StatusBadGateway)
 			return
 		}
+		p.logger.Debug("filter_containers_before",
+			zap.String("user", fmt.Sprintf("%s(uid=%d)", id.RealUsername, id.RealUID)),
+			zap.Int("body_size", len(body)),
+		)
 		filtered, err := filterContainerListResponse(body, id.RealUID, p.db)
 		if err != nil {
-			filtered = body
+			p.logger.Error("filter_containers_failed",
+				zap.String("user", fmt.Sprintf("%s(uid=%d)", id.RealUsername, id.RealUID)),
+				zap.Error(err))
+			filtered = emptyJSONArray // fail-secure：过滤失败返回空列表
 		}
+		p.logger.Debug("filter_containers_done",
+			zap.String("user", fmt.Sprintf("%s(uid=%d)", id.RealUsername, id.RealUID)),
+			zap.Int("original_size", len(body)),
+			zap.Int("filtered_size", len(filtered)),
+		)
 		copyHeaders(w, resp.Header)
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Content-Length", strconv.Itoa(len(filtered)))
@@ -566,7 +643,10 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 		}
 		filtered, err := filterImageListResponse(body, id.RealUID, p.db)
 		if err != nil {
-			filtered = body
+			p.logger.Error("filter_images_failed",
+				zap.String("user", fmt.Sprintf("%s(uid=%d)", id.RealUsername, id.RealUID)),
+				zap.Error(err))
+			filtered = emptyJSONArray // fail-secure：过滤失败返回空列表
 		}
 		copyHeaders(w, resp.Header)
 		w.Header().Set("Content-Type", "application/json")
@@ -576,13 +656,29 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 
 	case ActionCreateContainer:
 		// 从响应中提取容器 ID 并记录归属
+		p.logger.Debug("create_container_response",
+			zap.String("user", fmt.Sprintf("%s(uid=%d)", id.RealUsername, id.RealUID)),
+			zap.Int("status_code", resp.StatusCode),
+		)
 		body, err := readFullBody(resp.Body)
 		if err != nil {
+			p.logger.Error("read_response_body_failed",
+				zap.String("action", "create"),
+				zap.Error(err))
 			http.Error(w, "read upstream response failed", http.StatusBadGateway)
 			return
 		}
 		if resp.StatusCode == http.StatusCreated {
-			if containerID := extractContainerIDFromCreateResponse(body); containerID != "" {
+			containerID := extractContainerIDFromCreateResponse(body)
+			p.logger.Debug("extract_container_id",
+				zap.String("user", fmt.Sprintf("%s(uid=%d)", id.RealUsername, id.RealUID)),
+				zap.String("container_id", containerID),
+			)
+			if containerID != "" {
+				p.logger.Debug("set_container_owner_start",
+					zap.String("user", fmt.Sprintf("%s(uid=%d)", id.RealUsername, id.RealUID)),
+					zap.String("container_id", truncID(containerID)),
+				)
 				if err := p.db.SetContainerOwner(containerID, id); err != nil {
 					p.logger.Error("save_container_owner_failed",
 						zap.String("container_id", containerID),
@@ -590,6 +686,10 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 						zap.Int("real_uid", id.RealUID),
 						zap.Error(err))
 				} else {
+					p.logger.Debug("set_container_owner_done",
+						zap.String("user", fmt.Sprintf("%s(uid=%d)", id.RealUsername, id.RealUID)),
+						zap.String("container_id", truncID(containerID)),
+					)
 					p.logger.Info("container_created",
 						append(logIdentityFields(id),
 							zap.String("container_id", truncID(containerID)),
@@ -1030,5 +1130,112 @@ func (p *ProxyServer) resolveImageIDByRef(imageRef string) string {
 		return ""
 	}
 	return img.ID
+}
+
+// ── Hijack（双向流）处理 ─────────────────────────────────────
+//
+// docker run -it / docker attach / docker exec -it 使用 HTTP Hijack：
+// 客户端发送带 Upgrade: tcp 的请求，服务端返回 101 Switching Protocols，
+// 之后连接退化为原始 TCP 双向管道（stdin↔stdout/stderr）。
+//
+// 标准 http.Transport 不支持这种协议升级，必须直接操作底层连接。
+
+// isHijackRequest 判断请求是否需要 HTTP hijack（双向流）
+// docker 客户端对 attach/exec-start 发送 Upgrade: tcp 请求头
+func isHijackRequest(r *http.Request) bool {
+	return strings.EqualFold(r.Header.Get("Upgrade"), "tcp") ||
+		strings.EqualFold(r.Header.Get("Connection"), "upgrade")
+}
+
+// handleHijack 处理需要双向流的请求（attach/exec-start 等）
+// 流程：
+//  1. 执行授权检查（命令策略 + 容器归属）
+//  2. 劫持客户端连接（获得底层 TCP）
+//  3. 直接 dial 上游 dockerd Unix socket
+//  4. 手工写入 HTTP 请求
+//  5. 双向 io.Copy（goroutine）
+func (p *ProxyServer) handleHijack(w http.ResponseWriter, r *http.Request, id *CallerIdentity) {
+	action := classifyAction(r.Method, r.URL.Path)
+	p.logger.Debug("hijack_request",
+		zap.String("user", fmt.Sprintf("%s(uid=%d)", id.RealUsername, id.RealUID)),
+		zap.String("action", action),
+		zap.String("uri", r.URL.RequestURI()),
+	)
+
+	// 授权检查（与普通请求相同的策略 + 归属逻辑）
+	policy := p.getPolicy()
+	isAuxiliary := isAuxiliaryCall(id.DockerCommand, action, r.Method, r.URL.Path)
+	if !isAuxiliary && policy.IsDenied(id, action) {
+		p.logger.Warn("AUTHZ_DENY",
+			append(logIdentityFields(id),
+				zap.String("reason", "command_not_permitted"),
+				zap.String("action", action),
+				zap.String("uri", r.URL.RequestURI()),
+			)...)
+		http.Error(w, fmt.Sprintf("user '%s'(uid=%d) not permitted to perform: %s",
+			id.RealUsername, id.RealUID, action), http.StatusForbidden)
+		return
+	}
+	if !p.checkOwnershipPreRequest(w, r, id, action) {
+		return
+	}
+
+	// 1. 劫持客户端连接
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		p.logger.Error("hijack_not_supported")
+		http.Error(w, "hijack not supported", http.StatusInternalServerError)
+		return
+	}
+	clientConn, clientBuf, err := hijacker.Hijack()
+	if err != nil {
+		p.logger.Error("hijack_failed", zap.Error(err))
+		http.Error(w, "hijack failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer clientConn.Close()
+
+	// 2. 直接连接上游 dockerd
+	upstreamConn, err := net.DialTimeout("unix", p.upstreamSock, 5*time.Second)
+	if err != nil {
+		p.logger.Error("upstream_dial_failed", zap.Error(err))
+		fmt.Fprintf(clientConn, "HTTP/1.1 502 Bad Gateway\r\n\r\nupstream dial failed: %s", err.Error())
+		return
+	}
+	defer upstreamConn.Close()
+
+	// 3. 手工重写并转发 HTTP 请求到上游
+	// 构造 request line + headers
+	fmt.Fprintf(upstreamConn, "%s %s HTTP/1.1\r\n", r.Method, r.URL.RequestURI())
+	fmt.Fprintf(upstreamConn, "Host: docker\r\n")
+	for k, vals := range r.Header {
+		for _, v := range vals {
+			fmt.Fprintf(upstreamConn, "%s: %s\r\n", k, v)
+		}
+	}
+	fmt.Fprintf(upstreamConn, "\r\n")
+
+	// 如果客户端缓冲区有未读数据（已接收的请求体），先刷到上游
+	if clientBuf.Reader.Buffered() > 0 {
+		buffered, _ := clientBuf.Reader.Peek(clientBuf.Reader.Buffered())
+		upstreamConn.Write(buffered)
+	}
+
+	// 4. 双向 io.Copy（上游↔客户端）
+	done := make(chan struct{}, 2)
+	go func() {
+		io.Copy(upstreamConn, clientConn) // 客户端 stdin → 上游
+		done <- struct{}{}
+	}()
+	go func() {
+		io.Copy(clientConn, upstreamConn) // 上游 stdout/stderr → 客户端
+		done <- struct{}{}
+	}()
+	<-done // 任一方向结束即退出（另一个 goroutine 会在连接关闭后自然退出）
+
+	p.logger.Debug("hijack_done",
+		zap.String("user", fmt.Sprintf("%s(uid=%d)", id.RealUsername, id.RealUID)),
+		zap.String("action", action),
+	)
 }
 

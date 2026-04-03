@@ -14,6 +14,19 @@ PASS=0
 FAIL=0
 SKIP=0
 
+# 代理 socket 目录（与启动参数保持一致）
+SOCKET_DIR="/run/docker-authz"
+
+# 以指定用户身份通过代理 socket 执行 docker 命令
+# 用法：docker_as <username> <docker args...>
+# 原理：显式传入 DOCKER_HOST，确保命令通过代理 socket（不受 sudo 环境变量重置影响）
+docker_as() {
+    local user="$1"
+    shift
+    local sock="${SOCKET_DIR}/${user}.sock"
+    sudo -u "$user" env DOCKER_HOST="unix://${sock}" docker "$@"
+}
+
 log_info() { echo -e "${GREEN}[INFO]${NC} $*"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
@@ -154,10 +167,10 @@ assert_contains "bob 的 DOCKER_HOST 指向专属 socket" \
 test_case "基础连通性"
 
 assert_success "alice 可以执行 docker version" \
-    sudo -u alice docker version
+    docker_as alice version
 
 assert_success "bob 可以执行 docker version" \
-    sudo -u bob docker version
+    docker_as bob version
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 测试三：容器归属隔离
@@ -166,36 +179,36 @@ assert_success "bob 可以执行 docker version" \
 test_case "容器归属隔离"
 
 # 清理旧容器
-sudo -u alice docker rm -f test-alice-nginx 2>/dev/null || true
-sudo -u bob docker rm -f test-bob-redis 2>/dev/null || true
+docker_as alice rm -f test-alice-nginx 2>/dev/null || true
+docker_as bob rm -f test-bob-redis 2>/dev/null || true
 
 # alice 创建容器
 assert_success "alice 创建容器" \
-    sudo -u alice docker run -d --name test-alice-nginx nginx:alpine
+    docker_as alice run -d --name test-alice-nginx nginx:alpine
 
 # bob 创建容器
 assert_success "bob 创建容器" \
-    sudo -u bob docker run -d --name test-bob-redis redis:alpine
+    docker_as bob run -d --name test-bob-redis redis:alpine
 
 # 跨用户操作应被拒绝
 assert_fail "bob 不能停止 alice 的容器" \
-    sudo -u bob docker stop test-alice-nginx
+    docker_as bob stop test-alice-nginx
 
 assert_fail "alice 不能删除 bob 的容器" \
-    sudo -u alice docker rm -f test-bob-redis
+    docker_as alice rm -f test-bob-redis
 
 assert_fail "bob 不能进入 alice 的容器" \
-    sudo -u bob docker exec test-alice-nginx echo test
+    docker_as bob exec test-alice-nginx echo test
 
 # 自己的容器可以操作
 assert_success "alice 可以停止自己的容器" \
-    sudo -u alice docker stop test-alice-nginx
+    docker_as alice stop test-alice-nginx
 
 assert_success "bob 可以删除自己的容器" \
-    sudo -u bob docker rm -f test-bob-redis
+    docker_as bob rm -f test-bob-redis
 
 # 清理
-sudo -u alice docker rm -f test-alice-nginx 2>/dev/null || true
+docker_as alice rm -f test-alice-nginx 2>/dev/null || true
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 测试四：容器可见性隔离（docker ps 过滤）
@@ -204,39 +217,39 @@ sudo -u alice docker rm -f test-alice-nginx 2>/dev/null || true
 test_case "容器可见性隔离 (docker ps 过滤)"
 
 # 创建测试容器
-sudo -u alice docker run -d --name vis-alice-1 nginx:alpine
-sudo -u alice docker run -d --name vis-alice-2 nginx:alpine
-sudo -u bob docker run -d --name vis-bob-1 redis:alpine
+docker_as alice run -d --name vis-alice-1 nginx:alpine
+docker_as alice run -d --name vis-alice-2 nginx:alpine
+docker_as bob run -d --name vis-bob-1 redis:alpine
 
 # alice 只能看到自己的容器
 assert_contains "alice 能看到自己的容器 vis-alice-1" \
     "vis-alice-1" \
-    sudo -u alice docker ps --format '{{.Names}}'
+    docker_as alice ps --format '{{.Names}}'
 
 assert_contains "alice 能看到自己的容器 vis-alice-2" \
     "vis-alice-2" \
-    sudo -u alice docker ps --format '{{.Names}}'
+    docker_as alice ps --format '{{.Names}}'
 
 assert_not_contains "alice 看不到 bob 的容器" \
     "vis-bob-1" \
-    sudo -u alice docker ps --format '{{.Names}}'
+    docker_as alice ps --format '{{.Names}}'
 
 # bob 只能看到自己的容器
 assert_contains "bob 能看到自己的容器" \
     "vis-bob-1" \
-    sudo -u bob docker ps --format '{{.Names}}'
+    docker_as bob ps --format '{{.Names}}'
 
 assert_not_contains "bob 看不到 alice 的容器 vis-alice-1" \
     "vis-alice-1" \
-    sudo -u bob docker ps --format '{{.Names}}'
+    docker_as bob ps --format '{{.Names}}'
 
 assert_not_contains "bob 看不到 alice 的容器 vis-alice-2" \
     "vis-alice-2" \
-    sudo -u bob docker ps --format '{{.Names}}'
+    docker_as bob ps --format '{{.Names}}'
 
 # 清理
-sudo -u alice docker rm -f vis-alice-1 vis-alice-2 2>/dev/null || true
-sudo -u bob docker rm -f vis-bob-1 2>/dev/null || true
+docker_as alice rm -f vis-alice-1 vis-alice-2 2>/dev/null || true
+docker_as bob rm -f vis-bob-1 2>/dev/null || true
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 测试五：镜像归属隔离
@@ -246,15 +259,15 @@ test_case "镜像归属隔离"
 
 # alice 拉取镜像
 assert_success "alice 拉取 busybox" \
-    sudo -u alice docker pull busybox:latest
+    docker_as alice pull busybox:latest
 
 # bob 不能删除 alice 的镜像
 assert_fail "bob 不能删除 alice 的镜像" \
-    sudo -u bob docker rmi busybox:latest
+    docker_as bob rmi busybox:latest
 
 # alice 可以删除自己的镜像
 assert_success "alice 可以删除自己的镜像" \
-    sudo -u alice docker rmi busybox:latest
+    docker_as alice rmi busybox:latest
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 测试六：镜像可见性隔离（docker images 过滤）
@@ -263,32 +276,32 @@ assert_success "alice 可以删除自己的镜像" \
 test_case "镜像可见性隔离 (docker images 过滤)"
 
 # alice 拉取镜像
-sudo -u alice docker pull alpine:3.18 >/dev/null 2>&1
+docker_as alice pull alpine:3.18 >/dev/null 2>&1
 
 # bob 拉取不同镜像
-sudo -u bob docker pull alpine:3.19 >/dev/null 2>&1
+docker_as bob pull alpine:3.19 >/dev/null 2>&1
 
 # alice 只能看到自己的镜像
 assert_contains "alice 能看到自己的 alpine:3.18" \
     "alpine.*3.18" \
-    sudo -u alice docker images
+    docker_as alice images
 
 assert_not_contains "alice 看不到 bob 的 alpine:3.19" \
     "3.19" \
-    sudo -u alice docker images
+    docker_as alice images
 
 # bob 只能看到自己的镜像
 assert_contains "bob 能看到自己的 alpine:3.19" \
     "alpine.*3.19" \
-    sudo -u bob docker images
+    docker_as bob images
 
 assert_not_contains "bob 看不到 alice 的 alpine:3.18" \
     "3.18" \
-    sudo -u bob docker images
+    docker_as bob images
 
 # 清理
-sudo -u alice docker rmi alpine:3.18 2>/dev/null || true
-sudo -u bob docker rmi alpine:3.19 2>/dev/null || true
+docker_as alice rmi alpine:3.18 2>/dev/null || true
+docker_as bob rmi alpine:3.19 2>/dev/null || true
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 测试七：sudo 身份识别
@@ -296,9 +309,9 @@ sudo -u bob docker rmi alpine:3.19 2>/dev/null || true
 
 test_case "sudo 身份识别"
 
-# alice 通过 sudo 创建容器
-assert_success "alice 通过 sudo 创建容器" \
-    sudo -u alice sudo docker run -d --name sudo-test nginx:alpine
+# alice 通过代理 socket 创建容器（等价于用户环境中的 docker run）
+assert_success "alice 通过代理创建容器" \
+    docker_as alice run -d --name sudo-test nginx:alpine
 
 # 检查日志确认身份识别正确（真实用户应为 alice，而非 root）
 sleep 1
@@ -312,10 +325,10 @@ fi
 
 # bob 不能操作 alice 通过 sudo 创建的容器
 assert_fail "bob 不能操作 alice 的 sudo 容器" \
-    sudo -u bob docker stop sudo-test
+    docker_as bob stop sudo-test
 
 # 清理
-sudo -u alice docker rm -f sudo-test 2>/dev/null || true
+docker_as alice rm -f sudo-test 2>/dev/null || true
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 测试八：系统标签注入
@@ -324,10 +337,10 @@ sudo -u alice docker rm -f sudo-test 2>/dev/null || true
 test_case "系统标签注入"
 
 # alice 创建容器（带用户标签）
-sudo -u alice docker run -d --name label-test --label myapp=test nginx:alpine
+docker_as alice run -d --name label-test --label myapp=test nginx:alpine
 
 # 检查系统标签是否注入
-labels=$(sudo -u alice docker inspect label-test --format '{{json .Config.Labels}}')
+labels=$(docker_as alice inspect label-test --format '{{json .Config.Labels}}')
 
 if echo "$labels" | grep -q "system.authz.owner.username.*alice"; then
     echo -e "  ${GREEN}✓${NC} PASS: 系统标签包含 owner.username=alice"
@@ -354,7 +367,7 @@ else
 fi
 
 # 清理
-sudo -u alice docker rm -f label-test 2>/dev/null || true
+docker_as alice rm -f label-test 2>/dev/null || true
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 测试九：命令授权（策略规则）
@@ -375,7 +388,7 @@ EOF
 # 如果策略中禁止了 bob build，这应该失败
 if grep -q "bob.*build" /etc/docker-authz/policy.yaml 2>/dev/null; then
     assert_fail "bob 被策略禁止 build" \
-        sudo -u bob docker build -t test /tmp/test-build
+        docker_as bob build -t test /tmp/test-build
 else
     log_warn "跳过 build 授权测试（policy.yaml 未配置 bob 禁止 build）"
     ((SKIP++))
@@ -391,26 +404,26 @@ rm -rf /tmp/test-build
 test_case "短 ID 和完整 ID 支持"
 
 # alice 创建容器
-sudo -u alice docker run -d --name id-test nginx:alpine
+docker_as alice run -d --name id-test nginx:alpine
 
 # 获取容器 ID
-full_id=$(sudo -u alice docker inspect id-test --format '{{.Id}}')
+full_id=$(docker_as alice inspect id-test --format '{{.Id}}')
 short_id=${full_id:0:12}
 
 # bob 用短 ID 也不能操作
 assert_fail "bob 不能用短 ID 操作 alice 的容器" \
-    sudo -u bob docker stop "$short_id"
+    docker_as bob stop "$short_id"
 
 # bob 用完整 ID 也不能操作
 assert_fail "bob 不能用完整 ID 操作 alice 的容器" \
-    sudo -u bob docker stop "$full_id"
+    docker_as bob stop "$full_id"
 
 # alice 用短 ID 可以操作
 assert_success "alice 可以用短 ID 操作自己的容器" \
-    sudo -u alice docker stop "$short_id"
+    docker_as alice stop "$short_id"
 
 # 清理
-sudo -u alice docker rm -f id-test 2>/dev/null || true
+docker_as alice rm -f id-test 2>/dev/null || true
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 测试总结

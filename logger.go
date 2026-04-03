@@ -3,10 +3,18 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
+
+// shortCallerEncoder 自定义 caller 编码器，只输出文件名和行号（不含模块路径）
+// 例如：proxy.go:358 而不是 docker-authz-proxy/proxy.go:358
+func shortCallerEncoder(caller zapcore.EntryCaller, enc zapcore.PrimitiveArrayEncoder) {
+	// 只保留文件名（去掉完整路径）
+	enc.AppendString(filepath.Base(caller.File) + ":" + fmt.Sprintf("%d", caller.Line))
+}
 
 func newLogger(level, format, filePath string) (*zap.Logger, error) {
 	var zapLevel zapcore.Level
@@ -22,9 +30,18 @@ func newLogger(level, format, filePath string) (*zap.Logger, error) {
 	}
 
 	encCfg := zap.NewProductionEncoderConfig()
-	encCfg.TimeKey = "time"
-	encCfg.EncodeTime = zapcore.ISO8601TimeEncoder
+	// 日志格式优化：
+	// - 不输出 time（systemd/journald 已有时间戳，避免重复）
+	// - 使用自定义 caller encoder（只显示文件名:行号，不含模块路径）
+	// - 输出顺序：level -> caller -> msg -> fields
+	encCfg.TimeKey = ""                                // 不输出时间（避免与 systemd 重复）
+	encCfg.LevelKey = "level"
+	encCfg.CallerKey = "caller"
+	encCfg.MessageKey = "msg"
+	encCfg.EncodeLevel = zapcore.CapitalLevelEncoder   // INFO / WARN / ERROR
+	encCfg.EncodeCaller = shortCallerEncoder           // proxy.go:358（自定义，去掉模块路径）
 	encCfg.LineEnding = zapcore.DefaultLineEnding
+	encCfg.FunctionKey = ""                            // 不输出函数名
 
 	var encoder zapcore.Encoder
 	if format == "text" {
@@ -44,18 +61,16 @@ func newLogger(level, format, filePath string) (*zap.Logger, error) {
 		cores = append(cores, zapcore.NewCore(encoder, zapcore.AddSync(f), zapLevel))
 	}
 
-	return zap.New(zapcore.NewTee(cores...)), nil
+	// zap.AddCaller() 启用 caller 字段；AddCallerSkip(0) 是默认值
+	return zap.New(zapcore.NewTee(cores...), zap.AddCaller()), nil
 }
 
 // ── 身份字段构建 ──────────────────────────────────────────────
 
 // logIdentityFields 完整身份字段，用于授权拒绝等需要完整上下文的场景
-// 格式：username(uid) / effective(uid) / type / pid / cmdline
 func logIdentityFields(id *CallerIdentity) []zap.Field {
 	return []zap.Field{
-		// 真实身份（资源归属检查依据）
 		zap.String("user", fmt.Sprintf("%s(uid=%d,gid=%d)", id.RealUsername, id.RealUID, id.RealGID)),
-		// sudo 时展示内核身份；普通用户与真实身份相同则省略
 		zap.String("effective", fmt.Sprintf("%s(uid=%d)", id.EffectiveUsername, id.EffectiveUID)),
 		zap.String("user_type", id.UserType.String()),
 		zap.Int("pid", id.PID),
@@ -63,8 +78,7 @@ func logIdentityFields(id *CallerIdentity) []zap.Field {
 	}
 }
 
-// logIdentityShort 精简身份字段，用于授权通过等高频场景（避免日志膨胀）
-// 格式：username(uid)
+// logIdentityShort 精简身份字段，用于授权通过等高频场景
 func logIdentityShort(id *CallerIdentity) []zap.Field {
 	return []zap.Field{
 		zap.String("user", fmt.Sprintf("%s(uid=%d)", id.RealUsername, id.RealUID)),
@@ -72,7 +86,7 @@ func logIdentityShort(id *CallerIdentity) []zap.Field {
 	}
 }
 
-// logOwnerFields 资源归属字段（顺序：username → uid → gid）
+// logOwnerFields 资源归属字段
 func logOwnerFields(prefix string, owner *OwnerInfo) []zap.Field {
 	return []zap.Field{
 		zap.String(prefix, fmt.Sprintf("%s(uid=%d,gid=%d)", owner.Username, owner.UID, owner.GID)),
@@ -80,21 +94,21 @@ func logOwnerFields(prefix string, owner *OwnerInfo) []zap.Field {
 }
 
 // ── 授权日志函数 ──────────────────────────────────────────────
-// 所有授权相关日志统一带 "AUTHZ" 前缀事件名，便于 grep 过滤
+// 每个函数都调用 WithOptions(zap.AddCallerSkip(1))，使 caller 字段
+// 指向调用处（proxy.go:NNN），而不是本文件内的包装函数。
 
-// logAuthzAllowed 授权通过（合并了 request+allowed，减少日志条数）
-// 只记录精简身份，高频无需完整上下文
+// logAuthzAllowed 授权通过（精简身份，高频场景）
 func logAuthzAllowed(logger *zap.Logger, id *CallerIdentity, action, uri string) {
-	logger.Info("AUTHZ_ALLOW",
+	logger.WithOptions(zap.AddCallerSkip(1)).Info("AUTHZ_ALLOW",
 		append(logIdentityShort(id),
 			zap.String("action", action),
 			zap.String("uri", uri),
 		)...)
 }
 
-// logAuthzDeniedCommand 命令策略拒绝（完整身份 + 原因）
+// logAuthzDeniedCommand 命令策略拒绝
 func logAuthzDeniedCommand(logger *zap.Logger, id *CallerIdentity, action, uri string) {
-	logger.Warn("AUTHZ_DENY",
+	logger.WithOptions(zap.AddCallerSkip(1)).Warn("AUTHZ_DENY",
 		append(logIdentityFields(id),
 			zap.String("reason", "command_not_permitted"),
 			zap.String("action", action),
@@ -102,10 +116,10 @@ func logAuthzDeniedCommand(logger *zap.Logger, id *CallerIdentity, action, uri s
 		)...)
 }
 
-// logAuthzDeniedOwnership 资源归属拒绝（完整身份 + 资源归属）
+// logAuthzDeniedOwnership 资源归属拒绝
 func logAuthzDeniedOwnership(logger *zap.Logger, id *CallerIdentity, owner *OwnerInfo,
 	resourceType, resourceID, action string) {
-	logger.Warn("AUTHZ_DENY",
+	logger.WithOptions(zap.AddCallerSkip(1)).Warn("AUTHZ_DENY",
 		append(logIdentityFields(id),
 			append(logOwnerFields("owner", owner),
 				zap.String("reason", "not_your_"+resourceType),
@@ -114,9 +128,20 @@ func logAuthzDeniedOwnership(logger *zap.Logger, id *CallerIdentity, owner *Owne
 			)...)...)
 }
 
-// logAuthzDeniedImageAccess 镜像访问拒绝（完整身份 + 镜像引用）
+// logAuthzDeniedNotTracked 容器/镜像未在代理中注册，拒绝非 root 用户访问
+func logAuthzDeniedNotTracked(logger *zap.Logger, id *CallerIdentity,
+	resourceType, resourceID, action string) {
+	logger.WithOptions(zap.AddCallerSkip(1)).Warn("AUTHZ_DENY",
+		append(logIdentityFields(id),
+			zap.String("reason", resourceType+"_not_tracked"),
+			zap.String(resourceType+"_id", resourceID),
+			zap.String("action", action),
+		)...)
+}
+
+// logAuthzDeniedImageAccess 镜像访问拒绝
 func logAuthzDeniedImageAccess(logger *zap.Logger, id *CallerIdentity, imageRef, action, reason string) {
-	logger.Warn("AUTHZ_DENY",
+	logger.WithOptions(zap.AddCallerSkip(1)).Warn("AUTHZ_DENY",
 		append(logIdentityFields(id),
 			zap.String("reason", reason),
 			zap.String("image", imageRef),
@@ -124,9 +149,9 @@ func logAuthzDeniedImageAccess(logger *zap.Logger, id *CallerIdentity, imageRef,
 		)...)
 }
 
-// logAuthzRequest 仅在 DEBUG 级别记录原始请求（生产环境通常关闭）
+// logAuthzRequest 仅在 DEBUG 级别记录原始请求
 func logAuthzRequest(logger *zap.Logger, id *CallerIdentity, action, method, uri string) {
-	logger.Debug("AUTHZ_REQUEST",
+	logger.WithOptions(zap.AddCallerSkip(1)).Debug("AUTHZ_REQUEST",
 		append(logIdentityShort(id),
 			zap.String("action", action),
 			zap.String("method", method),

@@ -9,22 +9,32 @@ import (
 	"strings"
 )
 
+// emptyJSONArray 空容器/镜像列表（fail-secure 时返回）
+var emptyJSONArray = []byte("[]")
+
 // filterContainerListResponse 过滤容器列表响应，只返回用户自己的容器
+// 安全原则：任何错误均 fail-secure（返回空列表），不暴露其他用户的容器
 func filterContainerListResponse(body []byte, realUID int, db *OwnershipDB) ([]byte, error) {
+	// root 可见所有容器（系统管理需要），直接透传
+	if realUID == 0 {
+		return body, nil
+	}
+
 	var containers []json.RawMessage
 	if err := json.Unmarshal(body, &containers); err != nil {
-		return body, nil // 解析失败原样返回
+		// 解析失败：fail-secure，返回空列表
+		return emptyJSONArray, err
 	}
 
 	// 获取该用户拥有的所有容器 ID
 	ownedIDs, err := db.GetContainerIDsByOwner(realUID)
 	if err != nil {
-		return body, nil
+		// DB 错误：fail-secure，返回空列表（而非全量暴露）
+		return emptyJSONArray, err
 	}
-	owned := make(map[string]bool, len(ownedIDs))
+	owned := make(map[string]bool, len(ownedIDs)*2)
 	for _, id := range ownedIDs {
 		owned[id] = true
-		// 同时支持短 ID 前缀匹配（Docker ps 返回完整 ID，但检索时可能用短 ID）
 		if len(id) >= 12 {
 			owned[id[:12]] = true
 		}
@@ -32,12 +42,12 @@ func filterContainerListResponse(body []byte, realUID int, db *OwnershipDB) ([]b
 
 	var filtered []json.RawMessage
 	for _, raw := range containers {
-		// 提取容器 ID 字段
 		var item struct {
-			ID     string `json:"Id"`
+			ID     string            `json:"Id"`
 			Labels map[string]string `json:"Labels"`
 		}
 		if err := json.Unmarshal(raw, &item); err != nil {
+			// 单条解析失败：跳过（fail-secure，不展示不可信数据）
 			continue
 		}
 
@@ -47,25 +57,26 @@ func filterContainerListResponse(body []byte, realUID int, db *OwnershipDB) ([]b
 			continue
 		}
 
-		// 兜底：读取容器 Labels 中的系统归属标签
+		// 兜底：读取容器 Labels 中的系统归属标签（DB 写入失败时的保底）
 		if item.Labels != nil {
 			uidStr := item.Labels[labelOwnerUID]
-			if uidStr != "" {
-				lastUID := getLastLabelValue(uidStr)
-				if lastUID == "" {
-					continue
+			if uidStr == "" {
+				continue
+			}
+			lastUID := getLastLabelValue(uidStr)
+			if lastUID == "" {
+				continue
+			}
+			uid := 0
+			for _, c := range lastUID {
+				if c < '0' || c > '9' {
+					uid = -1
+					break
 				}
-				uid := 0
-				for _, c := range lastUID {
-					if c < '0' || c > '9' {
-						uid = -1
-						break
-					}
-					uid = uid*10 + int(c-'0')
-				}
-				if uid == realUID {
-					filtered = append(filtered, raw)
-				}
+				uid = uid*10 + int(c-'0')
+			}
+			if uid >= 0 && uid == realUID {
+				filtered = append(filtered, raw)
 			}
 		}
 	}
@@ -77,26 +88,31 @@ func filterContainerListResponse(body []byte, realUID int, db *OwnershipDB) ([]b
 }
 
 // filterImageListResponse 过滤镜像列表响应，只返回用户自己的镜像和公共镜像
+// 安全原则：任何错误均 fail-secure（返回空列表），不暴露其他用户的镜像
 func filterImageListResponse(body []byte, realUID int, db *OwnershipDB) ([]byte, error) {
+	// root 可见所有镜像（系统管理需要），直接透传
+	if realUID == 0 {
+		return body, nil
+	}
+
 	var images []json.RawMessage
 	if err := json.Unmarshal(body, &images); err != nil {
-		return body, nil
+		// 解析失败：fail-secure，返回空列表
+		return emptyJSONArray, err
 	}
 
 	var filtered []json.RawMessage
 	for _, raw := range images {
 		var item struct {
-			ID     string            `json:"Id"`
-			Labels map[string]string `json:"Labels"`
+			ID string `json:"Id"`
 		}
 		if err := json.Unmarshal(raw, &item); err != nil {
 			continue
 		}
-
-		// 去掉 "sha256:" 前缀查询 DB
+		// 去掉 "sha256:" 前缀后查询 DB
 		imageID := strings.TrimPrefix(item.ID, "sha256:")
-
-		if db.CanUseImage(realUID, item.ID) || db.CanUseImage(realUID, imageID) {
+		// CanSeeImage：严格可见性检查，未追踪镜像不显示
+		if db.CanSeeImage(realUID, item.ID) || db.CanSeeImage(realUID, imageID) {
 			filtered = append(filtered, raw)
 		}
 	}

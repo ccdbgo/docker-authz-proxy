@@ -81,7 +81,10 @@ func (o *OwnershipDB) SetContainerOwner(id string, identity *CallerIdentity) err
 		identity.RealGID,
 		time.Now().UTC(),
 	)
-	return err
+	if err != nil {
+		return fmt.Errorf("db write failed: %w", err)
+	}
+	return nil
 }
 
 // GetContainerOwner 返回容器归属信息；第二个返回值表示是否找到
@@ -163,7 +166,8 @@ func (o *OwnershipDB) GetImageOwner(imageID string) (*OwnerInfo, bool, bool) {
 	return &info, isPublicInt != 0, true
 }
 
-// CanUseImage 判断用户是否有权使用某镜像（公共镜像、自己拉取的镜像）
+// CanUseImage 判断用户是否有权使用某镜像（运行/push/tag 等操作的权限检查）
+// 未追踪镜像（不在 DB）视为存量镜像，允许所有用户使用（兼容代理部署前已有的镜像）
 func (o *OwnershipDB) CanUseImage(realUID int, imageID string) bool {
 	// 检查镜像是否在 DB 中以及是否为公共镜像
 	var isPublic int
@@ -171,14 +175,35 @@ func (o *OwnershipDB) CanUseImage(realUID int, imageID string) bool {
 		`SELECT is_public FROM images WHERE image_id = ?`, imageID,
 	).Scan(&isPublic)
 	if err != nil {
-		// 不在 DB 中：视为未被代理管理的镜像（部署前已存在或直接写入）
-		// 允许所有用户访问，避免阻断存量镜像的正常使用
+		// 不在 DB 中：视为存量镜像，允许使用
 		return true
 	}
 	if isPublic != 0 {
 		return true
 	}
 	// 检查 image_access 表：任何拉取过该镜像的用户都有访问权
+	var count int
+	_ = o.db.QueryRow(
+		`SELECT COUNT(*) FROM image_access WHERE image_id = ? AND user_uid = ?`,
+		imageID, realUID,
+	).Scan(&count)
+	return count > 0
+}
+
+// CanSeeImage 判断用户是否能在列表中看到某镜像（docker images 的过滤依据）
+// 与 CanUseImage 的区别：未追踪镜像不可见（避免所有人看到系统全量镜像）
+func (o *OwnershipDB) CanSeeImage(realUID int, imageID string) bool {
+	var isPublic int
+	err := o.db.QueryRow(
+		`SELECT is_public FROM images WHERE image_id = ?`, imageID,
+	).Scan(&isPublic)
+	if err != nil {
+		// 不在 DB 中：不显示（严格隔离）
+		return false
+	}
+	if isPublic != 0 {
+		return true
+	}
 	var count int
 	_ = o.db.QueryRow(
 		`SELECT COUNT(*) FROM image_access WHERE image_id = ? AND user_uid = ?`,
