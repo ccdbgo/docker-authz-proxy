@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"os"
 	"os/signal"
 	"sort"
@@ -166,10 +167,30 @@ func logPolicyLoadResult(logger *zap.Logger, policyFile string, p *Policy) {
 			actions = append(actions, action)
 		}
 		sort.Strings(actions)
+
+		// 构建 "username(uid)" 格式的用户列表，方便直接查看
+		userEntries := make([]string, len(rule.UIDs))
+		for j, uid := range rule.UIDs {
+			if j < len(rule.Usernames) {
+				userEntries[j] = fmt.Sprintf("%s(uid=%d)", rule.Usernames[j], uid)
+			} else {
+				userEntries[j] = fmt.Sprintf("uid=%d", uid)
+			}
+		}
+		// 构建 "groupname(gid)" 格式的组列表
+		groupEntries := make([]string, len(rule.GIDs))
+		for j, gid := range rule.GIDs {
+			if j < len(rule.Groups) {
+				groupEntries[j] = fmt.Sprintf("%s(gid=%d)", rule.Groups[j], gid)
+			} else {
+				groupEntries[j] = fmt.Sprintf("gid=%d", gid)
+			}
+		}
+
 		logger.Info("deny_rule_active",
 			zap.Int("rule_index", i),
-			zap.Ints("uids", rule.UIDs),
-			zap.Ints("gids", rule.GIDs),
+			zap.Strings("users", userEntries),
+			zap.Strings("groups", groupEntries),
 			zap.Strings("actions", actions))
 	}
 

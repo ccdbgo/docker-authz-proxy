@@ -255,6 +255,16 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 特殊情况：/_ping 始终放行（纯健康检查，不对应任何子命令）
 	isAuxiliary := isAuxiliaryCall(identity.DockerCommand, action, r.Method, r.URL.Path)
 
+	// DEBUG：每个请求都记录，方便排查问题（生产环境用 --log-level=info 关闭）
+	p.logger.Debug("authz_trace",
+		zap.String("user", fmt.Sprintf("%s(uid=%d)", identity.RealUsername, identity.RealUID)),
+		zap.String("docker_cmd", identity.DockerCommand),
+		zap.String("action", action),
+		zap.String("method", r.Method),
+		zap.String("uri", r.URL.RequestURI()),
+		zap.Bool("is_auxiliary", isAuxiliary),
+	)
+
 	// 只记录用户实际执行的目标操作，过滤掉 CLI 内部辅助调用
 	if !isAuxiliary {
 		logAuthzRequest(p.logger, identity, action, r.Method, r.URL.RequestURI())
@@ -263,15 +273,14 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// ── 层次一：命令授权检查 ──────────────────────────────────
 	// 辅助调用直接放行，不受策略控制
 	if !isAuxiliary && policy.IsDenied(identity, action) {
-		p.logger.Warn("authz_denied_command",
+		// docker_cmd 和 is_auxiliary 帮助排查"为何某命令意外被拦截"
+		p.logger.Warn("AUTHZ_DENY",
 			append(logIdentityFields(identity),
-				zap.String("event_category", "authorization"),
-				zap.String("authz_result", "deny"),
-				zap.String("authz_phase", "command_check"),
 				zap.String("reason", "command_not_permitted"),
 				zap.String("action", action),
-				zap.String("http_method", r.Method),
-				zap.String("http_uri", r.URL.RequestURI()),
+				zap.String("docker_cmd", identity.DockerCommand),
+				zap.Bool("is_auxiliary", isAuxiliary),
+				zap.String("uri", r.URL.RequestURI()),
 			)...)
 		http.Error(w,
 			fmt.Sprintf("user '%s'(uid=%d) not permitted to perform: %s",
@@ -315,10 +324,11 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 			if !shouldDelete {
 				// 其他用户仍在使用该镜像，虚拟删除成功（不转发到 Docker）
-				p.logger.Info("virtual_image_delete",
-					append(logIdentityFields(identity),
+				p.logger.Info("AUTHZ_ALLOW",
+					append(logIdentityShort(identity),
+						zap.String("action", "rmi"),
 						zap.String("image_id", imageID),
-						zap.String("action", "removed_user_access"),
+						zap.String("note", "virtual_delete_only"),
 					)...)
 				w.WriteHeader(http.StatusNoContent)
 				return
@@ -361,13 +371,7 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 	if containerID != "" && !nonContainerIDs[containerID] {
 		owner, found := p.db.GetContainerOwner(containerID)
 		if found && owner.UID != id.RealUID {
-			p.logger.Warn("authz_denied_ownership",
-				append(logIdentityFields(id),
-					append(logOwnerFields("owner", owner),
-						zap.String("reason", "not_your_container"),
-						zap.String("container_id", containerID),
-						zap.String("action", action),
-					)...)...)
+			logAuthzDeniedOwnership(p.logger, id, owner, "container", truncID(containerID), action)
 			http.Error(w,
 				fmt.Sprintf("container '%s' belongs to '%s'(uid=%d), not '%s'(uid=%d)",
 					truncID(containerID), owner.Username, owner.UID,
@@ -383,13 +387,7 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 		if qContainerID != "" {
 			owner, found := p.db.GetContainerOwner(qContainerID)
 			if found && owner.UID != id.RealUID {
-				p.logger.Warn("authz_denied_ownership",
-					append(logIdentityFields(id),
-						append(logOwnerFields("owner", owner),
-							zap.String("reason", "not_your_container"),
-							zap.String("container_id", qContainerID),
-							zap.String("action", action),
-						)...)...)
+				logAuthzDeniedOwnership(p.logger, id, owner, "container", truncID(qContainerID), action)
 				http.Error(w,
 					fmt.Sprintf("container '%s' belongs to '%s'(uid=%d), not '%s'(uid=%d)",
 						truncID(qContainerID), owner.Username, owner.UID,
@@ -404,12 +402,14 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 	if action == ActionCreateContainer {
 		imageRef := extractImageRefFromBody(r)
 		if imageRef != "" {
-			if !p.db.CanUseImage(id.RealUID, imageRef) {
-				p.logger.Warn("authz_denied_image_access",
-					append(logIdentityFields(id),
-						zap.String("reason", "image_not_permitted"),
-						zap.String("image_ref", imageRef),
-					)...)
+			// 将镜像名称/标签解析为 SHA256 内容 ID 后再查 DB
+			// DB 始终以 sha256:... 为主键存储，直接用 "nginx" 会查不到
+			checkID := imageRef
+			if resolved := p.resolveImageIDByRef(imageRef); resolved != "" {
+				checkID = resolved
+			}
+			if !p.db.CanUseImage(id.RealUID, checkID) {
+				logAuthzDeniedImageAccess(p.logger, id, imageRef, action, "image_not_permitted")
 				http.Error(w,
 					fmt.Sprintf("user '%s'(uid=%d) not permitted to use image '%s'",
 						id.RealUsername, id.RealUID, imageRef),
@@ -421,17 +421,16 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 
 	// ── 镜像 inspect / save：验证查看/导出权限 ──────────────────────────
 	if action == ActionInspect || action == ActionSave {
-		if imageID := extractImageID(r.URL.Path); imageID != "" {
-			if !p.db.CanUseImage(id.RealUID, imageID) {
-				p.logger.Warn("authz_denied_image_access",
-					append(logIdentityFields(id),
-						zap.String("reason", "image_not_permitted"),
-						zap.String("image_id", imageID),
-						zap.String("action", action),
-					)...)
+		if imageRef := extractImageID(r.URL.Path); imageRef != "" {
+			checkID := imageRef
+			if resolved := p.resolveImageIDByRef(imageRef); resolved != "" {
+				checkID = resolved
+			}
+			if !p.db.CanUseImage(id.RealUID, checkID) {
+				logAuthzDeniedImageAccess(p.logger, id, truncID(imageRef), action, "image_not_permitted")
 				http.Error(w,
 					fmt.Sprintf("user '%s'(uid=%d) not permitted to access image '%s'",
-						id.RealUsername, id.RealUID, truncID(imageID)),
+						id.RealUsername, id.RealUID, truncID(imageRef)),
 					http.StatusForbidden)
 				return false
 			}
@@ -445,19 +444,12 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 			owner, isPublic, found := p.db.GetImageOwner(imageID)
 			if found {
 				if isPublic && id.RealUID != 0 {
-					// 公共镜像只有 root 可以删除
+					logAuthzDeniedImageAccess(p.logger, id, truncID(imageID), action, "public_image_delete_denied")
 					http.Error(w, "public images can only be removed by root", http.StatusForbidden)
 					return false
 				}
-				// 检查用户是否有权访问这个镜像
 				if !p.db.CanUseImage(id.RealUID, imageID) {
-					p.logger.Warn("authz_denied_ownership",
-						append(logIdentityFields(id),
-							append(logOwnerFields("owner", owner),
-								zap.String("reason", "not_your_image"),
-								zap.String("image_id", imageID),
-								zap.String("action", action),
-							)...)...)
+					logAuthzDeniedOwnership(p.logger, id, owner, "image", truncID(imageID), action)
 					http.Error(w,
 						fmt.Sprintf("image '%s' not accessible by '%s'(uid=%d)",
 							truncID(imageID), id.RealUsername, id.RealUID),
@@ -469,24 +461,21 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 	}
 
 	// ── 镜像推送/标记：检查访问权限（不要求必须是 owner）────────────────
-	// 虚拟隔离模式下，任何有访问权限的用户都可以 tag/push 镜像
 	switch action {
 	case ActionPush, ActionTag:
-		imageID := extractImageID(r.URL.Path)
-		if imageID == "" {
+		imageRef := extractImageID(r.URL.Path)
+		if imageRef == "" {
 			break
 		}
-		// 检查用户是否有访问权限（而不是检查 owner）
-		if !p.db.CanUseImage(id.RealUID, imageID) {
-			p.logger.Warn("authz_denied_image_access",
-				append(logIdentityFields(id),
-					zap.String("reason", "image_not_permitted"),
-					zap.String("image_id", imageID),
-					zap.String("action", action),
-				)...)
+		checkID := imageRef
+		if resolved := p.resolveImageIDByRef(imageRef); resolved != "" {
+			checkID = resolved
+		}
+		if !p.db.CanUseImage(id.RealUID, checkID) {
+			logAuthzDeniedImageAccess(p.logger, id, truncID(imageRef), action, "image_not_permitted")
 			http.Error(w,
 				fmt.Sprintf("user '%s'(uid=%d) not permitted to %s image '%s'",
-					id.RealUsername, id.RealUID, action, truncID(imageID)),
+					id.RealUsername, id.RealUID, action, truncID(imageRef)),
 				http.StatusForbidden)
 			return false
 		}
@@ -808,9 +797,14 @@ func isAuxiliaryCall(dockerCmd, action, method, path string) bool {
 		return true
 	}
 
-	// 无法解析子命令时放行（保守策略，避免误拦合法请求）
+	// 无法解析子命令（readProcCmdline 失败或进程非 docker）：
+	// /info 和 /version 始终是辅助调用，无论是否能解析出子命令都放行。
+	// 这样即使 cmdline 读取失败，docker run 等命令也不会因 /info 被意外拦截。
 	if dockerCmd == "" {
-		return false
+		if action == ActionSystemInfo {
+			return true // info/version 始终是辅助调用
+		}
+		return false // 其他 action：无法判断，走策略检查
 	}
 
 	// dockerCmd → 该子命令执行过程中属于"目标操作"的 action 集合
@@ -852,6 +846,12 @@ func isAuxiliaryCall(dockerCmd, action, method, path string) bool {
 		"logout":  {ActionSystemLogin},
 		"df":      {ActionSystemDF},
 		"prune":   {ActionPrune},
+	}
+
+	// info/version 只在用户主动执行 docker info/docker version 时才受策略控制；
+	// 其他任何子命令执行过程中调用的 /info、/version 都是辅助调用，无条件放行。
+	if action == ActionSystemInfo && dockerCmd != "info" && dockerCmd != "version" {
+		return true
 	}
 
 	targetActions, known := cmdTargetActions[dockerCmd]

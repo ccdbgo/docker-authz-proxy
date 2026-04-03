@@ -28,9 +28,11 @@ type ActionMapping map[string][]string
 
 // resolvedDenyRule 运行期内存表示（已将 username/group → uid/gid）
 type resolvedDenyRule struct {
-	UIDs    []int
-	GIDs    []int
-	Actions map[string]bool
+	UIDs      []int
+	GIDs      []int
+	Usernames []string // 与 UIDs 一一对应，供日志展示
+	Groups    []string // 与 GIDs 一一对应，供日志展示
+	Actions   map[string]bool
 }
 
 // Policy 运行期策略对象
@@ -77,6 +79,7 @@ func (p *Policy) resolve() {
 		for _, u := range rule.Users {
 			if uid := lookupUID(u); uid >= 0 {
 				r.UIDs = append(r.UIDs, uid)
+				r.Usernames = append(r.Usernames, u)
 			} else {
 				// 用户不存在于 /etc/passwd，记录未解析名称
 				p.unresolvedNames = append(p.unresolvedNames,
@@ -86,6 +89,7 @@ func (p *Policy) resolve() {
 		for _, g := range rule.Groups {
 			if gid := lookupGroupGID(g); gid >= 0 {
 				r.GIDs = append(r.GIDs, gid)
+				r.Groups = append(r.Groups, g)
 			} else {
 				// 组不存在于 /etc/group，记录未解析名称
 				p.unresolvedNames = append(p.unresolvedNames,

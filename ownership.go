@@ -171,9 +171,9 @@ func (o *OwnershipDB) CanUseImage(realUID int, imageID string) bool {
 		`SELECT is_public FROM images WHERE image_id = ?`, imageID,
 	).Scan(&isPublic)
 	if err != nil {
-		// 不在 DB 中：默认拒绝（严格隔离模式）
-		// 如果需要兼容存量镜像，管理员应将其标记为公共镜像
-		return false
+		// 不在 DB 中：视为未被代理管理的镜像（部署前已存在或直接写入）
+		// 允许所有用户访问，避免阻断存量镜像的正常使用
+		return true
 	}
 	if isPublic != 0 {
 		return true
