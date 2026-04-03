@@ -494,24 +494,46 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 	}
 
 	// ── 创建容器：验证镜像使用权限 ──────────────────────────────────────
-	// 注意：不在此处解析镜像 ID（会导致同步调用上游 Docker，可能死锁）
-	// 镜像权限检查推迟到响应后处理阶段（postprocessResponse）
-	// 此处仅做基本的镜像引用提取，实际权限验证在容器创建成功后进行
 	if action == ActionCreateContainer {
 		imageRef := extractImageRefFromBody(r)
 		if imageRef != "" {
-			// 先用镜像名称直接查 DB（可能是 tag 或 sha256）
-			// CanUseImage 内部已处理未追踪镜像（返回 true，兼容存量）
-			// 所以这里只能拦截明确在 DB 中且无权限的镜像
-			if !p.db.CanUseImage(id.RealUID, imageRef) {
-				// 尝试加 sha256: 前缀再查一次
-				if !p.db.CanUseImage(id.RealUID, "sha256:"+imageRef) {
-					logAuthzDeniedImageAccess(p.logger, id, imageRef, action, "image_not_permitted")
-					http.Error(w,
-						fmt.Sprintf("user '%s'(uid=%d) not permitted to use image '%s'",
-							id.RealUsername, id.RealUID, imageRef),
-						http.StatusForbidden)
-					return false
+			resolvedID := p.resolveImageIDByRef(imageRef)
+			if resolvedID == "" {
+				// 本地不存在该镜像，放行让 docker 自动 pull
+				// pull 完成后 postprocessResponse(ActionPull) 会记录归属
+			} else {
+				_, isPublic, found := p.db.GetImageOwner(resolvedID)
+				if !found {
+					// 镜像本地存在但不在 DB（存量镜像），只有 root 可用
+					// 普通用户视为"没有该镜像"，返回 404 触发 docker 自动 pull
+					// pull 完成后会记录归属
+					if id.RealUID != 0 {
+						p.logger.Info("image_not_tracked_trigger_pull",
+							append(logIdentityFields(id),
+								zap.String("image_ref", imageRef),
+							)...)
+						http.Error(w,
+							fmt.Sprintf("No such image: %s", imageRef),
+							http.StatusNotFound)
+						return false
+					}
+				} else if isPublic {
+					// public 镜像，所有用户可用，确保 image_access 有记录
+					_ = p.db.EnsureImageAccess(resolvedID, id.RealUID)
+				} else {
+					// 非 public 镜像，检查用户是否有访问权限
+					if !p.db.CanUseImage(id.RealUID, resolvedID) {
+						// 用户没有该镜像，视为"没有该镜像"，返回 404 触发 docker 自动 pull
+						p.logger.Info("image_not_accessible_trigger_pull",
+							append(logIdentityFields(id),
+								zap.String("image_ref", imageRef),
+								zap.String("image_id", truncID(resolvedID)),
+							)...)
+						http.Error(w,
+							fmt.Sprintf("No such image: %s", imageRef),
+							http.StatusNotFound)
+						return false
+					}
 				}
 			}
 		}

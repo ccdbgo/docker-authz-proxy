@@ -167,7 +167,7 @@ func (o *OwnershipDB) GetImageOwner(imageID string) (*OwnerInfo, bool, bool) {
 }
 
 // CanUseImage 判断用户是否有权使用某镜像（运行/push/tag 等操作的权限检查）
-// 未追踪镜像（不在 DB）视为存量镜像，允许所有用户使用（兼容代理部署前已有的镜像）
+// 未追踪镜像（不在 DB）：root 可用，普通用户不可用（与 CanSeeImage 保持一致）
 func (o *OwnershipDB) CanUseImage(realUID int, imageID string) bool {
 	// 检查镜像是否在 DB 中以及是否为公共镜像
 	var isPublic int
@@ -175,8 +175,8 @@ func (o *OwnershipDB) CanUseImage(realUID int, imageID string) bool {
 		`SELECT is_public FROM images WHERE image_id = ?`, imageID,
 	).Scan(&isPublic)
 	if err != nil {
-		// 不在 DB 中：视为存量镜像，允许使用
-		return true
+		// 不在 DB 中：root 可用，普通用户拒绝
+		return realUID == 0
 	}
 	if isPublic != 0 {
 		return true
