@@ -1,0 +1,61 @@
+# docker-authz-proxy 授权策略配置
+# 版本：1
+#
+# 设计原则：
+#   - 配置只需填写用户名/组名，后台启动时自动从 /etc/passwd、/etc/group 解析 uid/gid
+#   - 白名单模式（default_action: allow）：默认允许所有操作，通过 deny_rules 禁止特定操作
+#   - 所有用户（含 root）均受此策略约束，无豁免
+#
+# 操作名称说明：
+#   run             - docker run（别名：同时覆盖 create_container + start，推荐使用）
+#   ps              - docker ps（列出容器）
+#   create_container - docker run 创建阶段（POST /containers/create）
+#   start           - docker start / docker run 启动阶段
+#   stop            - docker stop / docker kill
+#   rm              - docker rm
+#   exec            - docker exec
+#   inspect         - docker inspect
+#   logs            - docker logs
+#   images          - docker images（列出镜像）
+#   pull            - docker pull
+#   build           - docker build
+#   push            - docker push
+#   rmi             - docker rmi
+#   tag             - docker tag
+#
+# 说明：禁止 docker run 推荐使用 run，它同时覆盖容器创建和启动两个 API 调用。
+#       也可以分别写 create_container 和 start 达到同样效果。
+
+version: 1
+default_action: allow
+
+# 禁止规则（优先于 default_action）
+# 注意：配置只填用户名/组名，后台自动解析为 uid/gid
+deny_rules:
+  - users: [alice]
+    actions: [ps]
+
+# 示例：限制 intern 组的用户只能查看，不能 build/push/exec
+# deny_rules:
+#   - groups: [intern]
+#     actions: [build, push, exec, rm, rmi]
+#
+#   - users: [untrusted-user]
+#     actions: [build, push, exec, pull]
+
+# 操作分类映射（仅供参考，实际映射由程序内部硬编码实现）
+action_mapping:
+  ps:              ["GET /containers/json"]
+  create_container: ["POST /containers/create"]
+  start:           ["POST /containers/{id}/start"]
+  stop:            ["POST /containers/{id}/stop", "POST /containers/{id}/kill"]
+  rm:              ["DELETE /containers/{id}"]
+  exec:            ["POST /containers/{id}/exec"]
+  inspect:         ["GET /containers/{id}/json", "GET /images/{id}/json"]
+  logs:            ["GET /containers/{id}/logs"]
+  images:          ["GET /images/json"]
+  pull:            ["POST /images/create"]
+  build:           ["POST /build"]
+  push:            ["POST /images/{name}/push"]
+  rmi:             ["DELETE /images/{id}"]
+  tag:             ["POST /images/{id}/tag"]
