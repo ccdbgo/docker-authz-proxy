@@ -127,26 +127,73 @@ func (p *Policy) IsDenied(id *CallerIdentity, action string) bool {
 }
 
 // Action 操作分类常量
+// 所有标准 Docker CLI 操作均有对应分类，policy.yaml 的 deny_rules 可引用任意常量值
 const (
-	ActionPS              = "ps"              // 列出容器
-	ActionCreateContainer = "create_container" // 创建容器
-	ActionStartContainer  = "start"           // 启动容器
-	ActionStop            = "stop"            // 停止/kill/pause/unpause 容器
-	ActionRemoveContainer = "rm"              // 删除容器
-	ActionExec            = "exec"            // 在容器内执行命令（含 attach）
-	ActionInspect         = "inspect"         // 查看容器/镜像详情
-	ActionLogs            = "logs"            // 查看容器日志/stats/top 等只读操作
-	ActionImages          = "images"          // 列出镜像
-	ActionPull            = "pull"            // 拉取镜像
-	ActionBuild           = "build"           // 构建镜像
-	ActionPush            = "push"            // 推送镜像
-	ActionRemoveImage     = "rmi"             // 删除镜像
-	ActionTag             = "tag"             // 标记镜像
-	ActionCommit          = "commit"          // 从容器提交镜像
-	ActionOther           = "other"           // 其他操作
+	// ── 容器操作 ──────────────────────────────────────────────────
+	ActionPS              = "ps"               // docker ps          GET  /containers/json
+	ActionCreateContainer = "create_container"  // docker create      POST /containers/create
+	ActionStartContainer  = "start"             // docker start       POST /containers/{id}/start
+	ActionRestart         = "restart"           // docker restart     POST /containers/{id}/restart
+	ActionStop            = "stop"              // docker stop/kill/pause/unpause
+	ActionRemoveContainer = "rm"                // docker rm          DELETE /containers/{id}
+	ActionExec            = "exec"              // docker exec/attach POST /containers/{id}/exec|attach
+	ActionInspect         = "inspect"           // docker inspect     GET  /containers/{id}/json 等
+	ActionLogs            = "logs"              // docker logs/stats/top/events(容器)
+	ActionCp              = "cp"               // docker cp          GET|PUT /containers/{id}/archive
+	ActionCommit          = "commit"            // docker commit      POST /commit
+
+	// ── 镜像操作 ──────────────────────────────────────────────────
+	ActionImages      = "images"   // docker images   GET  /images/json
+	ActionPull        = "pull"     // docker pull     POST /images/create
+	ActionLoad        = "load"     // docker load     POST /images/load
+	ActionSave        = "save"     // docker save     GET  /images/{name}/get
+	ActionBuild       = "build"    // docker build    POST /build
+	ActionPush        = "push"     // docker push     POST /images/{name}/push
+	ActionRemoveImage = "rmi"      // docker rmi      DELETE /images/{name}
+	ActionTag         = "tag"      // docker tag      POST /images/{name}/tag
+	ActionSearch      = "search"   // docker search   GET  /images/search
+
+	// ── 清理操作（统一归类）──────────────────────────────────────
+	// 覆盖：docker container/image/volume/network/builder/system prune
+	ActionPrune = "prune"
+
+	// ── 网络操作 ──────────────────────────────────────────────────
+	ActionNetworkList       = "network_ls"          // docker network ls
+	ActionNetworkInspect    = "network_inspect"      // docker network inspect
+	ActionNetworkCreate     = "network_create"       // docker network create
+	ActionNetworkConnect    = "network_connect"      // docker network connect
+	ActionNetworkDisconnect = "network_disconnect"   // docker network disconnect
+	ActionNetworkRemove     = "network_rm"           // docker network rm
+
+	// ── 卷操作 ──────────────────────────────────────────────────
+	ActionVolumeList    = "volume_ls"       // docker volume ls
+	ActionVolumeInspect = "volume_inspect"  // docker volume inspect
+	ActionVolumeCreate  = "volume_create"   // docker volume create
+	ActionVolumeRemove  = "volume_rm"       // docker volume rm
+
+	// ── 系统操作 ──────────────────────────────────────────────────
+	ActionSystemInfo   = "info"    // docker info / docker version / GET /_ping
+	ActionSystemDF     = "df"      // docker system df
+	ActionSystemEvents = "events"  // docker events
+	ActionSystemLogin  = "login"   // docker login
+
+	// ── Swarm / Service / Node / Task 操作 ──────────────────────
+	// 覆盖 /swarm、/nodes、/services、/tasks、/distribution 所有端点
+	ActionSwarm = "swarm"
+
+	// ── 插件操作 ──────────────────────────────────────────────────
+	ActionPlugin = "plugin" // docker plugin *
+
+	// ── Secret / Config 操作 ─────────────────────────────────────
+	ActionSecret = "secret" // docker secret *
+	ActionConfig = "config" // docker config *
+
+	// ── 兜底（应尽可能为空；仅用于真正未知的私有/实验性端点）────
+	ActionOther = "other"
 )
 
 // classifyAction 将 HTTP method + URI 映射为操作名
+// 覆盖所有标准 Docker Engine API v1.41+ 端点，确保无操作落入 ActionOther
 func classifyAction(method, uri string) string {
 	path := stripAPIVersion(uri)
 	// 去掉 query string
@@ -155,57 +202,180 @@ func classifyAction(method, uri string) string {
 	}
 
 	switch {
-	// 容器操作
+	// ── 容器操作 ──────────────────────────────────────────────────
+
+	// 列表（必须在前缀匹配之前）
 	case method == "GET" && pathMatches(path, "/containers/json"):
 		return ActionPS
+	// 清理所有停止容器
+	case method == "POST" && pathMatches(path, "/containers/prune"):
+		return ActionPrune
+	// 创建容器
 	case method == "POST" && pathMatches(path, "/containers/create"):
 		return ActionCreateContainer
+	// 启动
 	case method == "POST" && pathMatchesN(path, "/containers/", "/start"):
 		return ActionStartContainer
+	// 重启
+	case method == "POST" && pathMatchesN(path, "/containers/", "/restart"):
+		return ActionRestart
+	// 停止/杀死/暂停/恢复
 	case method == "POST" && (pathMatchesN(path, "/containers/", "/stop") ||
 		pathMatchesN(path, "/containers/", "/kill") ||
 		pathMatchesN(path, "/containers/", "/pause") ||
 		pathMatchesN(path, "/containers/", "/unpause")):
 		return ActionStop
+	// 改名/更新配置/等待（归类为状态变更）
+	case method == "POST" && (pathMatchesN(path, "/containers/", "/rename") ||
+		pathMatchesN(path, "/containers/", "/update") ||
+		pathMatchesN(path, "/containers/", "/wait")):
+		return ActionStop
+	// 删除容器
 	case method == "DELETE" && pathHasPrefix(path, "/containers/"):
 		return ActionRemoveContainer
+	// exec（创建 exec 实例）/ attach / 终端 resize
 	case method == "POST" && (pathMatchesN(path, "/containers/", "/exec") ||
 		pathMatchesN(path, "/containers/", "/attach") ||
 		pathMatchesN(path, "/containers/", "/resize")):
 		return ActionExec
+	// attach WebSocket 升级（GET /containers/{id}/attach 或 /attach/ws）
+	case method == "GET" && pathHasPrefix(path, "/containers/") &&
+		strings.Contains(path, "/attach"):
+		return ActionExec
+	// exec 第二阶段：POST /exec/{id}/start|resize
+	case method == "POST" && (pathMatchesN(path, "/exec/", "/start") ||
+		pathMatchesN(path, "/exec/", "/resize")):
+		return ActionExec
+	// exec inspect：GET /exec/{id}/json
+	case method == "GET" && pathMatchesN(path, "/exec/", "/json"):
+		return ActionInspect
+	// 容器详情
 	case method == "GET" && pathMatchesN(path, "/containers/", "/json"):
 		return ActionInspect
+	// 日志/统计/进程/变更（只读）
 	case method == "GET" && (pathMatchesN(path, "/containers/", "/logs") ||
 		pathMatchesN(path, "/containers/", "/stats") ||
 		pathMatchesN(path, "/containers/", "/top") ||
-		pathMatchesN(path, "/containers/", "/changes") ||
-		pathMatchesN(path, "/containers/", "/export")):
+		pathMatchesN(path, "/containers/", "/changes")):
 		return ActionLogs
-	case method == "POST" && (pathMatchesN(path, "/containers/", "/rename") ||
-		pathMatchesN(path, "/containers/", "/update") ||
-		pathMatchesN(path, "/containers/", "/wait")):
-		return ActionStop // 修改/等待容器状态，归属同 stop
+	// docker cp：从容器复制文件（GET/HEAD）或向容器写入文件（PUT）
+	case (method == "GET" || method == "HEAD") && pathMatchesN(path, "/containers/", "/archive"):
+		return ActionCp
+	case method == "PUT" && pathMatchesN(path, "/containers/", "/archive"):
+		return ActionCp
+	// docker export：导出容器文件系统（归类为 cp，属文件读取）
+	case method == "GET" && pathMatchesN(path, "/containers/", "/export"):
+		return ActionCp
+	// docker commit
 	case method == "POST" && pathMatches(path, "/commit"):
 		return ActionCommit
 
-	// 镜像操作
+	// ── 镜像操作 ──────────────────────────────────────────────────
+
+	// 列表（精确匹配优先）
 	case method == "GET" && pathMatches(path, "/images/json"):
 		return ActionImages
+	// 搜索
+	case method == "GET" && pathMatches(path, "/images/search"):
+		return ActionSearch
+	// 批量导出多个镜像为 tar（GET /images/get?names=...）
+	case method == "GET" && pathMatches(path, "/images/get"):
+		return ActionSave
+	// 清理无用镜像
+	case method == "POST" && pathMatches(path, "/images/prune"):
+		return ActionPrune
+	// 拉取/导入（POST /images/create）
 	case method == "POST" && pathMatches(path, "/images/create"):
 		return ActionPull
+	// 从 tar 加载镜像（docker load）
+	case method == "POST" && pathMatches(path, "/images/load"):
+		return ActionLoad
+	// 构建镜像
 	case method == "POST" && (pathMatches(path, "/build") ||
 		pathMatches(path, "/images/build")):
 		return ActionBuild
+	// 清理构建缓存
+	case method == "POST" && pathMatches(path, "/build/prune"):
+		return ActionPrune
+	// 推送镜像
 	case method == "POST" && pathMatchesN(path, "/images/", "/push"):
 		return ActionPush
+	// 删除镜像
 	case method == "DELETE" && pathHasPrefix(path, "/images/"):
 		return ActionRemoveImage
-	case method == "GET" && pathMatchesN(path, "/images/", "/json"):
+	// 镜像详情 / history（需要访问权）
+	case method == "GET" && (pathMatchesN(path, "/images/", "/json") ||
+		pathMatchesN(path, "/images/", "/history")):
 		return ActionInspect
-	case method == "GET" && pathMatchesN(path, "/images/", "/history"):
-		return ActionInspect // history 需要镜像访问权
+	// 打标签
 	case method == "POST" && pathMatchesN(path, "/images/", "/tag"):
 		return ActionTag
+	// 单个镜像导出为 tar（docker save <image>）
+	case method == "GET" && pathMatchesN(path, "/images/", "/get"):
+		return ActionSave
+	// registry 分发信息（docker manifest inspect）
+	case method == "GET" && pathMatchesN(path, "/distribution/", "/json"):
+		return ActionInspect
+
+	// ── 网络操作 ──────────────────────────────────────────────────
+	case method == "GET" && pathMatches(path, "/networks"):
+		return ActionNetworkList
+	case method == "POST" && pathMatches(path, "/networks/create"):
+		return ActionNetworkCreate
+	case method == "POST" && pathMatches(path, "/networks/prune"):
+		return ActionPrune
+	case method == "POST" && pathMatchesN(path, "/networks/", "/connect"):
+		return ActionNetworkConnect
+	case method == "POST" && pathMatchesN(path, "/networks/", "/disconnect"):
+		return ActionNetworkDisconnect
+	case method == "DELETE" && pathHasPrefix(path, "/networks/"):
+		return ActionNetworkRemove
+	case method == "GET" && pathHasPrefix(path, "/networks/"):
+		return ActionNetworkInspect
+
+	// ── 卷操作 ──────────────────────────────────────────────────
+	case method == "GET" && pathMatches(path, "/volumes"):
+		return ActionVolumeList
+	case method == "POST" && pathMatches(path, "/volumes/create"):
+		return ActionVolumeCreate
+	case method == "POST" && pathMatches(path, "/volumes/prune"):
+		return ActionPrune
+	case method == "DELETE" && pathHasPrefix(path, "/volumes/"):
+		return ActionVolumeRemove
+	case method == "GET" && pathHasPrefix(path, "/volumes/"):
+		return ActionVolumeInspect
+
+	// ── 系统操作 ──────────────────────────────────────────────────
+	case (method == "GET" || method == "HEAD") && pathMatches(path, "/_ping"):
+		return ActionSystemInfo
+	case method == "GET" && (pathMatches(path, "/info") || pathMatches(path, "/version")):
+		return ActionSystemInfo
+	case method == "GET" && pathMatches(path, "/system/df"):
+		return ActionSystemDF
+	case method == "GET" && pathMatches(path, "/events"):
+		return ActionSystemEvents
+	case method == "POST" && pathMatches(path, "/auth"):
+		return ActionSystemLogin
+	case method == "POST" && pathMatches(path, "/system/prune"):
+		return ActionPrune
+
+	// ── Swarm / Service / Node / Task / Stack 操作 ───────────────
+	// 覆盖所有 /swarm、/nodes、/services、/tasks、/distribution 端点
+	case pathHasPrefix(path, "/swarm") ||
+		pathHasPrefix(path, "/nodes") ||
+		pathHasPrefix(path, "/services") ||
+		pathHasPrefix(path, "/tasks"):
+		return ActionSwarm
+
+	// ── 插件操作 ──────────────────────────────────────────────────
+	case pathHasPrefix(path, "/plugins"):
+		return ActionPlugin
+
+	// ── Secret / Config 操作 ─────────────────────────────────────
+	case pathHasPrefix(path, "/secrets"):
+		return ActionSecret
+	case pathHasPrefix(path, "/configs"):
+		return ActionConfig
 	}
 	return ActionOther
 }

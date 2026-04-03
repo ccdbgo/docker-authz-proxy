@@ -88,10 +88,12 @@ else
 fi
 
 # 步骤 6: 安装 systemd service
-log_info "步骤 6/6: 安装 systemd 服务..."
+log_info "步骤 6/6: 安装并启动 systemd 服务..."
 cp deploy/docker-authz.service "$SERVICE_FILE"
 systemctl daemon-reload
 systemctl enable docker-authz
+systemctl start docker-authz
+log_info "服务已安装、启用并启动"
 
 # 配置用户环境变量
 log_info "配置用户环境变量..."
@@ -140,11 +142,8 @@ done < /etc/passwd
 
 echo ""
 log_info "========================================="
-log_info "部署完成！"
+log_info "部署完成！服务已自动启动"
 log_info "========================================="
-echo ""
-echo "启动服务："
-echo "  systemctl start docker-authz"
 echo ""
 echo "查看状态："
 echo "  systemctl status docker-authz"

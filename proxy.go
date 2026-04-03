@@ -242,7 +242,14 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	policy := p.getPolicy()
 
 	// ── 层次一：命令授权检查 ──────────────────────────────────
-	if policy.IsDenied(identity, action) {
+	// 只对 /_ping 放行（Docker CLI 健康检查），/info 和 /version 仍受策略控制
+	// 这样可以区分：
+	//   - docker images → 先调用 /_ping（放行）→ 再调用 /images/json（策略检查）
+	//   - docker info   → 只调用 /info（策略检查，如果禁止则拦截）
+	isPing := (r.Method == "GET" || r.Method == "HEAD") &&
+		(r.URL.Path == "/_ping" || strings.HasSuffix(r.URL.Path, "/_ping"))
+
+	if !isPing && policy.IsDenied(identity, action) {
 		p.logger.Warn("authz_denied_command",
 			append(logIdentityFields(identity),
 				zap.String("reason", "command_not_permitted"),
@@ -304,9 +311,10 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 	id *CallerIdentity, action string) bool {
 
 	// ── 通用容器归属检查（覆盖所有 /containers/{id}/... 操作）────────────
-	// 只要路径中有容器 ID（且不是 /containers/json 列表接口），就验证归属
+	// 只要路径中有容器 ID（且不是列表/创建/清理等非 ID 路径段），就验证归属
 	containerID := extractContainerID(r.URL.Path)
-	if containerID != "" && containerID != "json" {
+	nonContainerIDs := map[string]bool{"json": true, "create": true, "prune": true}
+	if containerID != "" && !nonContainerIDs[containerID] {
 		owner, found := p.db.GetContainerOwner(containerID)
 		if found && owner.UID != id.RealUID {
 			p.logger.Warn("authz_denied_ownership",
@@ -367,8 +375,8 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 		}
 	}
 
-	// ── 镜像 inspect：验证查看权限 ──────────────────────────────────────
-	if action == ActionInspect {
+	// ── 镜像 inspect / save：验证查看/导出权限 ──────────────────────────
+	if action == ActionInspect || action == ActionSave {
 		if imageID := extractImageID(r.URL.Path); imageID != "" {
 			if !p.db.CanUseImage(id.RealUID, imageID) {
 				p.logger.Warn("authz_denied_image_access",
@@ -378,7 +386,7 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 						zap.String("action", action),
 					)...)
 				http.Error(w,
-					fmt.Sprintf("user '%s'(uid=%d) not permitted to inspect image '%s'",
+					fmt.Sprintf("user '%s'(uid=%d) not permitted to access image '%s'",
 						id.RealUsername, id.RealUID, truncID(imageID)),
 					http.StatusForbidden)
 				return false
@@ -540,6 +548,76 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 		copyHeaders(w, resp.Header)
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(body)
+
+	case ActionLoad:
+		// 流式转发 load 输出，捕获加载的镜像 ID 并记录归属
+		copyHeaders(w, resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		if resp.StatusCode == http.StatusOK {
+			imageIDs := streamAndCaptureLoadedImageIDs(w, resp)
+			for _, imageID := range imageIDs {
+				if err := p.db.SetImageOwner(imageID, id, false, "load"); err != nil {
+					p.logger.Error("save_image_owner_failed",
+						zap.String("image_id", imageID),
+						zap.String("real_username", id.RealUsername),
+						zap.Int("real_uid", id.RealUID),
+						zap.Error(err))
+				} else {
+					p.logger.Info("image_loaded",
+						append(logIdentityFields(id),
+							zap.String("image_id", truncID(imageID)),
+						)...)
+				}
+			}
+		} else {
+			_, _ = io.Copy(w, resp.Body)
+		}
+
+	case ActionPrune:
+		// 清理成功时从 DB 中删除归属记录
+		body, err := readFullBody(resp.Body)
+		if err != nil {
+			http.Error(w, "read upstream response failed", http.StatusBadGateway)
+			return
+		}
+		if resp.StatusCode == http.StatusOK {
+			if strings.HasPrefix(requestURI, "/containers") || strings.Contains(requestURI, "/containers/") {
+				// docker container prune：{"ContainersDeleted": ["id1", "id2", ...]}
+				var pruneResp struct {
+					ContainersDeleted []string `json:"ContainersDeleted"`
+				}
+				if json.Unmarshal(body, &pruneResp) == nil {
+					for _, cid := range pruneResp.ContainersDeleted {
+						_ = p.db.DeleteContainer(cid)
+					}
+				}
+			} else if strings.HasPrefix(requestURI, "/images") || strings.Contains(requestURI, "/images/") ||
+				strings.HasPrefix(requestURI, "/build") {
+				// docker image prune / builder prune：{"ImagesDeleted": [{"Deleted":"sha256:..."}]}
+				var pruneResp struct {
+					ImagesDeleted []struct {
+						Deleted  string `json:"Deleted"`
+						Untagged string `json:"Untagged"`
+					} `json:"ImagesDeleted"`
+				}
+				if json.Unmarshal(body, &pruneResp) == nil {
+					for _, img := range pruneResp.ImagesDeleted {
+						if img.Deleted != "" {
+							_ = p.db.DeleteImage(img.Deleted)
+						}
+					}
+				}
+			}
+		}
+		copyHeaders(w, resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(body)
+
+	case ActionStartContainer, ActionRestart, ActionStop:
+		// 容器启动/重启/停止：透明转发
+		copyHeaders(w, resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
 
 	case ActionRemoveContainer:
 		// 删除成功时清除归属记录

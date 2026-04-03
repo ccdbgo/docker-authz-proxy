@@ -107,7 +107,39 @@ func filterImageListResponse(body []byte, realUID int, db *OwnershipDB) ([]byte,
 	return json.Marshal(filtered)
 }
 
-// extractContainerIDFromCreateResponse 从创建容器的响应中提取容器 ID
+// streamAndCaptureLoadedImageIDs 流式转发 docker load 响应，捕获加载的镜像 ID
+// docker load 输出行格式：{"stream":"Loaded image ID: sha256:..."}
+// 或：{"stream":"Loaded image: nginx:latest\n"}（有 tag 时）
+func streamAndCaptureLoadedImageIDs(w http.ResponseWriter, resp *http.Response) []string {
+	flusher, canFlush := w.(http.Flusher)
+	var imageIDs []string
+
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		_, _ = w.Write([]byte(line + "\n"))
+		if canFlush {
+			flusher.Flush()
+		}
+		var msg struct {
+			Stream string `json:"stream"`
+		}
+		if err := json.Unmarshal([]byte(line), &msg); err == nil {
+			// "Loaded image ID: sha256:abc123..."
+			if strings.HasPrefix(msg.Stream, "Loaded image ID: ") {
+				id := strings.TrimSpace(strings.TrimPrefix(msg.Stream, "Loaded image ID: "))
+				if id != "" {
+					imageIDs = append(imageIDs, id)
+				}
+			}
+		}
+	}
+	return imageIDs
+}
+
+
 func extractContainerIDFromCreateResponse(body []byte) string {
 	var resp struct {
 		ID string `json:"Id"`

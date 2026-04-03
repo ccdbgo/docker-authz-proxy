@@ -5,6 +5,8 @@
 #   - 配置只需填写用户名/组名，后台启动时自动从 /etc/passwd、/etc/group 解析 uid/gid
 #   - 白名单模式（default_action: allow）：默认允许所有操作，通过 deny_rules 禁止特定操作
 #   - 所有用户（含 root）均受此策略约束，无豁免
+#   - 系统健康检查操作（info、df、events）总是允许，不受策略限制
+#     这些是 Docker CLI 内部使用的只读操作，拦截它们会导致所有命令失败
 #
 # 操作名称说明：
 #   run             - docker run（别名：同时覆盖 create_container + start，推荐使用）
@@ -49,17 +51,66 @@ deny_rules:
 
 # 操作分类映射（仅供参考，实际映射由程序内部硬编码实现）
 action_mapping:
-  ps:              ["GET /containers/json"]
+  # ── 容器操作 ─────────────────────────────────────���────────────
+  ps:               ["GET /containers/json"]
   create_container: ["POST /containers/create"]
-  start:           ["POST /containers/{id}/start"]
-  stop:            ["POST /containers/{id}/stop", "POST /containers/{id}/kill"]
-  rm:              ["DELETE /containers/{id}"]
-  exec:            ["POST /containers/{id}/exec"]
-  inspect:         ["GET /containers/{id}/json", "GET /images/{id}/json"]
-  logs:            ["GET /containers/{id}/logs"]
-  images:          ["GET /images/json"]
-  pull:            ["POST /images/create"]
-  build:           ["POST /build"]
-  push:            ["POST /images/{name}/push"]
-  rmi:             ["DELETE /images/{id}"]
-  tag:             ["POST /images/{id}/tag"]
+  start:            ["POST /containers/{id}/start"]
+  restart:          ["POST /containers/{id}/restart"]
+  stop:             ["POST /containers/{id}/stop", "POST /containers/{id}/kill",
+                     "POST /containers/{id}/pause", "POST /containers/{id}/unpause"]
+  rm:               ["DELETE /containers/{id}"]
+  exec:             ["POST /containers/{id}/exec", "POST /containers/{id}/attach",
+                     "POST /exec/{id}/start", "POST /exec/{id}/resize"]
+  inspect:          ["GET /containers/{id}/json", "GET /images/{id}/json",
+                     "GET /exec/{id}/json"]
+  logs:             ["GET /containers/{id}/logs", "GET /containers/{id}/stats",
+                     "GET /containers/{id}/top"]
+  cp:               ["GET /containers/{id}/archive", "PUT /containers/{id}/archive",
+                     "GET /containers/{id}/export"]
+  commit:           ["POST /commit"]
+
+  # ── 镜像操作 ────────────────────────��─────────────────────────
+  images:  ["GET /images/json"]
+  pull:    ["POST /images/create"]
+  load:    ["POST /images/load"]
+  save:    ["GET /images/{name}/get", "GET /images/get"]
+  build:   ["POST /build", "POST /images/build"]
+  push:    ["POST /images/{name}/push"]
+  rmi:     ["DELETE /images/{name}"]
+  tag:     ["POST /images/{name}/tag"]
+  search:  ["GET /images/search"]
+
+  # ── 清理操作（统一归类）──────────────────────────────────────
+  prune:   ["POST /containers/prune", "POST /images/prune",
+            "POST /volumes/prune", "POST /networks/prune",
+            "POST /build/prune", "POST /system/prune"]
+
+  # ── 网络操作 ──────────────────────────────────────────────────
+  network_ls:         ["GET /networks"]
+  network_inspect:    ["GET /networks/{id}"]
+  network_create:     ["POST /networks/create"]
+  network_connect:    ["POST /networks/{id}/connect"]
+  network_disconnect: ["POST /networks/{id}/disconnect"]
+  network_rm:         ["DELETE /networks/{id}"]
+
+  # ── 卷操作 ──────────────────────────────────────────────────
+  volume_ls:      ["GET /volumes"]
+  volume_inspect: ["GET /volumes/{name}"]
+  volume_create:  ["POST /volumes/create"]
+  volume_rm:      ["DELETE /volumes/{name}"]
+
+  # ── 系统操作 ──────────────────────────��───────────────────────
+  info:    ["GET /info", "GET /version", "GET /_ping"]
+  df:      ["GET /system/df"]
+  events:  ["GET /events"]
+  login:   ["POST /auth"]
+
+  # ── Swarm / Service / Node / Task ──────────────────────────────
+  swarm:   ["/swarm/*", "/nodes/*", "/services/*", "/tasks/*"]
+
+  # ── 插件操作 ──────────────────────────────────────────────────
+  plugin:  ["/plugins/*"]
+
+  # ── Secret / Config ───────────────────────────────────────────
+  secret:  ["/secrets/*"]
+  config:  ["/configs/*"]

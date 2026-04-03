@@ -175,11 +175,8 @@ ssh -p "$LINUX_PORT" "$LINUX_USER@$LINUX_SERVER" "cd $REMOTE_DIR && chmod +x dep
 
 echo ""
 log_info "========================================="
-log_info "部署完成！"
+log_info "部署完成！服务已自动启动"
 log_info "========================================="
-echo ""
-echo "启动服务（在 Linux 服务器上执行）："
-echo "  ssh -p $LINUX_PORT $LINUX_USER@$LINUX_SERVER 'systemctl start docker-authz'"
 echo ""
 echo "查看状态："
 echo "  ssh -p $LINUX_PORT $LINUX_USER@$LINUX_SERVER 'systemctl status docker-authz'"
@@ -190,26 +187,3 @@ echo ""
 echo "运行测试："
 echo "  ssh -p $LINUX_PORT $LINUX_USER@$LINUX_SERVER 'cd $REMOTE_DIR && chmod +x test-on-linux.sh && ./test-on-linux.sh'"
 echo ""
-
-# 询问是否立即启动服务
-read -p "是否立即启动服务？(Y/n) " -n 1 -r
-echo
-if [[ $REPLY =~ ^[Yy]$ ]] || [[ -z $REPLY ]]; then
-    log_info "启动服务..."
-    ssh -p "$LINUX_PORT" "$LINUX_USER@$LINUX_SERVER" "systemctl start docker-authz && systemctl status docker-authz --no-pager" || {
-        log_error "启动失败"
-        exit 1
-    }
-    echo ""
-    log_info "服务已启动"
-fi
-
-# 询问是否运行测试
-read -p "是否运行测试？(Y/n) " -n 1 -r
-echo
-if [[ $REPLY =~ ^[Yy]$ ]] || [[ -z $REPLY ]]; then
-    log_info "运行测试..."
-    ssh -p "$LINUX_PORT" "$LINUX_USER@$LINUX_SERVER" "cd $REMOTE_DIR && chmod +x test-on-linux.sh && ./test-on-linux.sh" || {
-        log_warn "测试失败，请查看日志"
-    }
-fi
