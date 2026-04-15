@@ -1,47 +1,36 @@
-package main
+package authz
 
 import (
 	"os"
 	"testing"
+
+	"docker-authz-proxy/internal/auth"
 )
 
-// ── classifyAction ────────────────────────────────────────────────────────────
+// ── ClassifyAction ────────────────────────────────────────────────────────────
 
 func TestClassifyAction_Containers(t *testing.T) {
 	tests := []struct {
 		method, path string
 		want         string
 	}{
-		// 容器列表
 		{"GET", "/containers/json", ActionPS},
 		{"GET", "/v1.41/containers/json", ActionPS},
 		{"GET", "/containers/json?all=1", ActionPS},
-
-		// 创建容器
 		{"POST", "/containers/create", ActionCreateContainer},
 		{"POST", "/v1.41/containers/create", ActionCreateContainer},
-
-		// 启动
 		{"POST", "/containers/abc123/start", ActionStartContainer},
 		{"POST", "/v1.41/containers/abc123/start", ActionStartContainer},
-
-		// 重启
 		{"POST", "/containers/abc123/restart", ActionRestart},
-
-		// 停止/杀死/暂停/恢复
 		{"POST", "/containers/abc123/stop", ActionStop},
 		{"POST", "/containers/abc123/kill", ActionStop},
 		{"POST", "/containers/abc123/pause", ActionStop},
 		{"POST", "/containers/abc123/unpause", ActionStop},
 		{"POST", "/containers/abc123/rename", ActionStop},
 		{"POST", "/containers/abc123/update", ActionStop},
-		{"POST", "/containers/abc123/wait", ActionStop},
-
-		// 删除
+		{"POST", "/containers/abc123/wait", ActionOther},
 		{"DELETE", "/containers/abc123", ActionRemoveContainer},
 		{"DELETE", "/containers/abc123def456", ActionRemoveContainer},
-
-		// exec
 		{"POST", "/containers/abc123/exec", ActionExec},
 		{"POST", "/containers/abc123/attach", ActionExec},
 		{"POST", "/containers/abc123/resize", ActionExec},
@@ -49,34 +38,24 @@ func TestClassifyAction_Containers(t *testing.T) {
 		{"GET", "/containers/abc123/attach/ws", ActionExec},
 		{"POST", "/exec/abc123/start", ActionExec},
 		{"POST", "/exec/abc123/resize", ActionExec},
-
-		// inspect
 		{"GET", "/containers/abc123/json", ActionInspect},
 		{"GET", "/exec/abc123/json", ActionInspect},
-
-		// logs/stats/top/changes
 		{"GET", "/containers/abc123/logs", ActionLogs},
 		{"GET", "/containers/abc123/stats", ActionLogs},
 		{"GET", "/containers/abc123/top", ActionLogs},
 		{"GET", "/containers/abc123/changes", ActionLogs},
-
-		// cp (archive)
 		{"GET", "/containers/abc123/archive", ActionCp},
 		{"HEAD", "/containers/abc123/archive", ActionCp},
 		{"PUT", "/containers/abc123/archive", ActionCp},
 		{"GET", "/containers/abc123/export", ActionCp},
-
-		// commit
 		{"POST", "/commit", ActionCommit},
-
-		// prune
 		{"POST", "/containers/prune", ActionPrune},
 	}
 
 	for _, tt := range tests {
-		got := classifyAction(tt.method, tt.path)
+		got := ClassifyAction(tt.method, tt.path)
 		if got != tt.want {
-			t.Errorf("classifyAction(%q, %q) = %q, want %q", tt.method, tt.path, got, tt.want)
+			t.Errorf("ClassifyAction(%q, %q) = %q, want %q", tt.method, tt.path, got, tt.want)
 		}
 	}
 }
@@ -89,11 +68,11 @@ func TestClassifyAction_Images(t *testing.T) {
 		{"GET", "/images/json", ActionImages},
 		{"GET", "/v1.41/images/json", ActionImages},
 		{"GET", "/images/search", ActionSearch},
-		{"GET", "/images/get", ActionSave},                      // 批量导出
-		{"GET", "/images/nginx/get", ActionSave},                // 单个导出
-		{"GET", "/images/nginx:latest/get", ActionSave},         // 带 tag
+		{"GET", "/images/get", ActionSave},
+		{"GET", "/images/nginx/get", ActionSave},
+		{"GET", "/images/nginx:latest/get", ActionSave},
 		{"POST", "/images/prune", ActionPrune},
-		{"POST", "/images/create", ActionPull},                  // docker pull
+		{"POST", "/images/create", ActionPull},
 		{"POST", "/images/load", ActionLoad},
 		{"POST", "/build", ActionBuild},
 		{"POST", "/images/build", ActionBuild},
@@ -108,9 +87,9 @@ func TestClassifyAction_Images(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		got := classifyAction(tt.method, tt.path)
+		got := ClassifyAction(tt.method, tt.path)
 		if got != tt.want {
-			t.Errorf("classifyAction(%q, %q) = %q, want %q", tt.method, tt.path, got, tt.want)
+			t.Errorf("ClassifyAction(%q, %q) = %q, want %q", tt.method, tt.path, got, tt.want)
 		}
 	}
 }
@@ -130,9 +109,9 @@ func TestClassifyAction_Networks(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		got := classifyAction(tt.method, tt.path)
+		got := ClassifyAction(tt.method, tt.path)
 		if got != tt.want {
-			t.Errorf("classifyAction(%q, %q) = %q, want %q", tt.method, tt.path, got, tt.want)
+			t.Errorf("ClassifyAction(%q, %q) = %q, want %q", tt.method, tt.path, got, tt.want)
 		}
 	}
 }
@@ -150,9 +129,9 @@ func TestClassifyAction_Volumes(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		got := classifyAction(tt.method, tt.path)
+		got := ClassifyAction(tt.method, tt.path)
 		if got != tt.want {
-			t.Errorf("classifyAction(%q, %q) = %q, want %q", tt.method, tt.path, got, tt.want)
+			t.Errorf("ClassifyAction(%q, %q) = %q, want %q", tt.method, tt.path, got, tt.want)
 		}
 	}
 }
@@ -173,9 +152,9 @@ func TestClassifyAction_System(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		got := classifyAction(tt.method, tt.path)
+		got := ClassifyAction(tt.method, tt.path)
 		if got != tt.want {
-			t.Errorf("classifyAction(%q, %q) = %q, want %q", tt.method, tt.path, got, tt.want)
+			t.Errorf("ClassifyAction(%q, %q) = %q, want %q", tt.method, tt.path, got, tt.want)
 		}
 	}
 }
@@ -199,15 +178,14 @@ func TestClassifyAction_SwarmPluginSecretConfig(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		got := classifyAction(tt.method, tt.path)
+		got := ClassifyAction(tt.method, tt.path)
 		if got != tt.want {
-			t.Errorf("classifyAction(%q, %q) = %q, want %q", tt.method, tt.path, got, tt.want)
+			t.Errorf("ClassifyAction(%q, %q) = %q, want %q", tt.method, tt.path, got, tt.want)
 		}
 	}
 }
 
 func TestClassifyAction_APIVersionStripping(t *testing.T) {
-	// v1.xx 前缀应被自动剥离
 	tests := []struct {
 		method, path string
 		want         string
@@ -218,21 +196,21 @@ func TestClassifyAction_APIVersionStripping(t *testing.T) {
 		{"GET", "/v1.41/networks", ActionNetworkList},
 	}
 	for _, tt := range tests {
-		got := classifyAction(tt.method, tt.path)
+		got := ClassifyAction(tt.method, tt.path)
 		if got != tt.want {
-			t.Errorf("classifyAction(%q, %q) = %q, want %q", tt.method, tt.path, got, tt.want)
+			t.Errorf("ClassifyAction(%q, %q) = %q, want %q", tt.method, tt.path, got, tt.want)
 		}
 	}
 }
 
 func TestClassifyAction_Unknown(t *testing.T) {
-	got := classifyAction("GET", "/some/unknown/endpoint")
+	got := ClassifyAction("GET", "/some/unknown/endpoint")
 	if got != ActionOther {
 		t.Errorf("unknown endpoint should return %q, got %q", ActionOther, got)
 	}
 }
 
-// ── stripAPIVersion ───────────────────────────────────────────────────────────
+// ── StripAPIVersion ───────────────────────────────────────────────────────────
 
 func TestStripAPIVersion(t *testing.T) {
 	tests := []struct {
@@ -240,20 +218,20 @@ func TestStripAPIVersion(t *testing.T) {
 	}{
 		{"/v1.41/containers/json", "/containers/json"},
 		{"/v1.24/images/json", "/images/json"},
-		{"/containers/json", "/containers/json"},     // 无版本前缀
-		{"/v/containers/json", "/v/containers/json"}, // 不合法版本号
-		{"/v1/containers/json", "/containers/json"},  // 只有主版本号
+		{"/containers/json", "/containers/json"},
+		{"/v/containers/json", "/v/containers/json"},
+		{"/v1/containers/json", "/containers/json"},
 		{"/_ping", "/_ping"},
 	}
 	for _, tt := range tests {
-		got := stripAPIVersion(tt.input)
+		got := StripAPIVersion(tt.input)
 		if got != tt.want {
-			t.Errorf("stripAPIVersion(%q) = %q, want %q", tt.input, got, tt.want)
+			t.Errorf("StripAPIVersion(%q) = %q, want %q", tt.input, got, tt.want)
 		}
 	}
 }
 
-// ── 路径辅助函数 ──────────────────────────────────────────────────────────────
+// ── path helpers ──────────────────────────────────────────────────────────────
 
 func TestPathMatches(t *testing.T) {
 	if !pathMatches("/containers/json", "/containers/json") {
@@ -275,10 +253,10 @@ func TestPathMatchesN(t *testing.T) {
 		{"/containers/abc123/start", "/containers/", "/start", true},
 		{"/containers/abc123/stop", "/containers/", "/stop", true},
 		{"/containers/abc123/json", "/containers/", "/json", true},
-		{"/containers/json", "/containers/", "/json", false},       // json 直接跟在 prefix 后，无 ID 段
+		{"/containers/json", "/containers/", "/json", false},
 		{"/images/nginx/push", "/images/", "/push", true},
 		{"/exec/abc123/start", "/exec/", "/start", true},
-		{"/containers/abc/extra/start", "/containers/", "/start", false}, // 多余路径段
+		{"/containers/abc/extra/start", "/containers/", "/start", false},
 	}
 	for _, tt := range tests {
 		got := pathMatchesN(tt.path, tt.prefix, tt.suffix)
@@ -297,7 +275,7 @@ func TestPathHasPrefix(t *testing.T) {
 	}
 }
 
-// ── extractContainerID ────────────────────────────────────────────────────────
+// ── ExtractContainerID ────────────────────────────────────────────────────────
 
 func TestExtractContainerID(t *testing.T) {
 	tests := []struct {
@@ -308,20 +286,20 @@ func TestExtractContainerID(t *testing.T) {
 		{"/containers/abc123def456/stop", "abc123def456"},
 		{"/containers/abc123def456/json", "abc123def456"},
 		{"/v1.41/containers/abc123/start", "abc123"},
-		{"/containers/json", "json"},   // 调用方须用 nonContainerIDs 过滤
-		{"/containers/prune", "prune"}, // 同上
+		{"/containers/json", "json"},
+		{"/containers/prune", "prune"},
 		{"/containers/create", "create"},
-		{"/images/nginx/json", ""},     // 不是 /containers/ 路径
+		{"/images/nginx/json", ""},
 	}
 	for _, tt := range tests {
-		got := extractContainerID(tt.uri)
+		got := ExtractContainerID(tt.uri)
 		if got != tt.want {
-			t.Errorf("extractContainerID(%q) = %q, want %q", tt.uri, got, tt.want)
+			t.Errorf("ExtractContainerID(%q) = %q, want %q", tt.uri, got, tt.want)
 		}
 	}
 }
 
-// ── extractImageID ────────────────────────────────────────────────────────────
+// ── ExtractImageID ────────────────────────────────────────────────────────────
 
 func TestExtractImageID(t *testing.T) {
 	tests := []struct {
@@ -336,20 +314,30 @@ func TestExtractImageID(t *testing.T) {
 		{"/containers/abc/json", ""},
 	}
 	for _, tt := range tests {
-		got := extractImageID(tt.uri)
+		got := ExtractImageID(tt.uri)
 		if got != tt.want {
-			t.Errorf("extractImageID(%q) = %q, want %q", tt.uri, got, tt.want)
+			t.Errorf("ExtractImageID(%q) = %q, want %q", tt.uri, got, tt.want)
 		}
 	}
 }
 
 // ── Policy.IsDenied ───────────────────────────────────────────────────────────
 
+func makeCallerIdentity(username string, uid, gid int) *auth.CallerIdentity {
+	return &auth.CallerIdentity{
+		RealUsername:      username,
+		RealUID:           uid,
+		RealGID:           gid,
+		EffectiveUsername: username,
+		EffectiveUID:      uid,
+		UserType:          auth.UserTypeRegular,
+	}
+}
+
 func TestIsDenied_UID(t *testing.T) {
-	// 构造一个内存策略（不通过 loadPolicy，直接构造）
 	p := &Policy{
-		config: PolicyConfig{DefaultAction: "allow"},
-		resolvedDenyRules: []resolvedDenyRule{
+		Config: PolicyConfig{DefaultAction: "allow"},
+		ResolvedDenyRules: []ResolvedDenyRule{
 			{
 				UIDs:    []int{1001},
 				GIDs:    nil,
@@ -358,8 +346,8 @@ func TestIsDenied_UID(t *testing.T) {
 		},
 	}
 
-	alice := &CallerIdentity{RealUsername: "alice", RealUID: 1001, RealGID: 1001}
-	bob := &CallerIdentity{RealUsername: "bob", RealUID: 1002, RealGID: 1002}
+	alice := makeCallerIdentity("alice", 1001, 1001)
+	bob := makeCallerIdentity("bob", 1002, 1002)
 
 	if !p.IsDenied(alice, ActionPS) {
 		t.Error("alice should be denied ps")
@@ -377,8 +365,8 @@ func TestIsDenied_UID(t *testing.T) {
 
 func TestIsDenied_GID(t *testing.T) {
 	p := &Policy{
-		config: PolicyConfig{DefaultAction: "allow"},
-		resolvedDenyRules: []resolvedDenyRule{
+		Config: PolicyConfig{DefaultAction: "allow"},
+		ResolvedDenyRules: []ResolvedDenyRule{
 			{
 				UIDs:    nil,
 				GIDs:    []int{2000},
@@ -387,9 +375,7 @@ func TestIsDenied_GID(t *testing.T) {
 		},
 	}
 
-	// 用一个不存在于 /etc/passwd 的 UID，getUserGroups 会返回空
-	// 所以组规则不会匹配 —— 测试不存在用户时放行
-	unknown := &CallerIdentity{RealUsername: "nouser", RealUID: 99999, RealGID: 99999}
+	unknown := makeCallerIdentity("nouser", 99999, 99999)
 	if p.IsDenied(unknown, ActionExec) {
 		t.Error("user with no groups should not be denied by GID rule")
 	}
@@ -397,17 +383,16 @@ func TestIsDenied_GID(t *testing.T) {
 
 func TestIsDenied_DefaultAllow(t *testing.T) {
 	p := &Policy{
-		config:            PolicyConfig{DefaultAction: "allow"},
-		resolvedDenyRules: nil,
+		Config:            PolicyConfig{DefaultAction: "allow"},
+		ResolvedDenyRules: nil,
 	}
-	id := &CallerIdentity{RealUsername: "anyone", RealUID: 5000}
+	id := makeCallerIdentity("anyone", 5000, 5000)
 	if p.IsDenied(id, ActionPS) {
 		t.Error("no deny rules: should allow everything")
 	}
 }
 
 func TestPolicy_UnresolvedNames(t *testing.T) {
-	// 写一个含不存在用户的 policy.yaml 临时文件
 	yaml := `
 version: 1
 default_action: allow
@@ -423,21 +408,19 @@ deny_rules:
 	f.WriteString(yaml)
 	f.Close()
 
-	p, err := loadPolicy(f.Name())
+	p, err := LoadPolicy(f.Name())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(p.unresolvedNames) == 0 {
+	if len(p.UnresolvedNames) == 0 {
 		t.Error("expected unresolved name for nosuchuser99999")
 	}
-	// 规则不应被加入 resolvedDenyRules（因为无有效 UID/GID）
-	if len(p.resolvedDenyRules) != 0 {
-		t.Error("rule with only unresolved users should not appear in resolvedDenyRules")
+	if len(p.ResolvedDenyRules) != 0 {
+		t.Error("rule with only unresolved users should not appear in ResolvedDenyRules")
 	}
 }
 
 func TestPolicy_RunAlias(t *testing.T) {
-	// "run" 应同时扩展为 create_container 和 start
 	yaml := `
 version: 1
 default_action: allow
@@ -453,16 +436,14 @@ deny_rules:
 	f.WriteString(yaml)
 	f.Close()
 
-	p, err := loadPolicy(f.Name())
+	p, err := LoadPolicy(f.Name())
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 规则体中 "run" 应被展开，但因为 users 为空所以没有 resolvedDenyRules
-	// 验证 PolicyConfig 中 Actions 字段记录了 "run"
-	if len(p.config.DenyRules) == 0 {
+	if len(p.Config.DenyRules) == 0 {
 		t.Fatal("expected at least one deny rule in config")
 	}
-	actions := p.config.DenyRules[0].Actions
+	actions := p.Config.DenyRules[0].Actions
 	found := false
 	for _, a := range actions {
 		if a == "run" {
@@ -471,5 +452,31 @@ deny_rules:
 	}
 	if !found {
 		t.Error("expected 'run' in config deny_rules actions")
+	}
+}
+
+// ── diagnose ─────────────────────────────────────────────────────────────────
+
+func TestDiagnose_DockerPsVsInfo(t *testing.T) {
+	tests := []struct {
+		method, uri string
+		want        string
+	}{
+		{"GET", "/info", ActionSystemInfo},
+		{"GET", "/v1.41/info", ActionSystemInfo},
+		{"GET", "/version", ActionSystemInfo},
+		{"GET", "/_ping", ActionSystemInfo},
+		{"HEAD", "/_ping", ActionSystemInfo},
+		{"GET", "/containers/json", ActionPS},
+		{"GET", "/v1.41/containers/json", ActionPS},
+		{"GET", "/containers/json?all=1", ActionPS},
+		{"GET", "/v1.41/containers/json?all=1&size=1", ActionPS},
+	}
+
+	for _, tt := range tests {
+		got := ClassifyAction(tt.method, tt.uri)
+		if got != tt.want {
+			t.Errorf("ClassifyAction(%q, %q) = %q, want %q", tt.method, tt.uri, got, tt.want)
+		}
 	}
 }

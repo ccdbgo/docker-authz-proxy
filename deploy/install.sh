@@ -42,6 +42,7 @@ DATA_DIR="/var/lib/docker-authz"
 LOG_DIR="/var/log/docker-authz"
 SOCKET_DIR="/run/docker-authz"
 SERVICE_FILE="/etc/systemd/system/docker-authz.service"
+LOGROTATE_FILE="/etc/logrotate.d/docker-authz"
 
 # 检查二进制文件是否存在
 if [ ! -f "docker-authz-proxy" ]; then
@@ -89,8 +90,8 @@ else
     log_warn "如需更新配置，请手动编辑: $CONFIG_DIR/policy.yaml"
 fi
 
-# 步骤 5: 安装 systemd service
-log_info "步骤 5/5: 安装并启动 systemd 服务..."
+# 步骤 5: 安装 systemd service 和 logrotate
+log_info "步骤 5/6: 安装并启动 systemd 服务..."
 if [ -f "deploy/docker-authz.service" ]; then
     cp deploy/docker-authz.service "$SERVICE_FILE"
     systemctl daemon-reload
@@ -100,6 +101,16 @@ if [ -f "deploy/docker-authz.service" ]; then
 else
     log_error "未找到 deploy/docker-authz.service"
     exit 1
+fi
+
+# 步骤 6: 安装 logrotate 配置
+log_info "步骤 6/6: 安装 logrotate 配置..."
+if [ -f "deploy/logrotate.conf" ]; then
+    cp deploy/logrotate.conf "$LOGROTATE_FILE"
+    chmod 644 "$LOGROTATE_FILE"
+    log_info "已安装: $LOGROTATE_FILE"
+else
+    log_warn "未找到 deploy/logrotate.conf，跳过 logrotate 配置"
 fi
 
 # 配置用户环境变量

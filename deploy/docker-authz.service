@@ -7,6 +7,7 @@ Before=docker.service
 
 [Service]
 Type=simple
+PIDFile=/run/docker-authz-proxy.pid
 ExecStart=/usr/local/bin/docker-authz-proxy \
     --socket-dir=/run/docker-authz \
     --upstream=/var/run/docker.sock \

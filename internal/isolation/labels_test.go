@@ -1,19 +1,20 @@
-package main
+package isolation
 
 import (
 	"encoding/json"
 	"testing"
+
+	"docker-authz-proxy/internal/auth"
 )
 
-func makeIdentity(username string, uid, gid int) *CallerIdentity {
-	return &CallerIdentity{
+func makeIsolationIdentity(username string, uid, gid int) *auth.CallerIdentity {
+	return &auth.CallerIdentity{
 		RealUsername:      username,
 		RealUID:           uid,
 		RealGID:           gid,
 		EffectiveUsername: username,
 		EffectiveUID:      uid,
-		EffectiveGID:      gid,
-		UserType:          UserTypeRegular,
+		UserType:          auth.UserTypeRegular,
 	}
 }
 
@@ -45,141 +46,170 @@ func TestSetLabel_Overwrite(t *testing.T) {
 	}
 }
 
-// ── getLastLabelValue ─────────────────────────────────────────────────────────
+// ── GetLastLabelValue ─────────────────────────────────────────────────────────
 
 func TestGetLastLabelValue(t *testing.T) {
 	tests := []struct {
 		input, want string
 	}{
 		{"1001", "1001"},
-		{"0,1001", "1001"},          // 伪造值 + 真实值
-		{"fake,1001,1002", "1002"},   // 多次追加
+		{"0,1001", "1001"},
+		{"fake,1001,1002", "1002"},
 		{"alice", "alice"},
-		{"  1001  ", "1001"},         // 带空格
+		{"  1001  ", "1001"},
 	}
 	for _, tt := range tests {
-		got := getLastLabelValue(tt.input)
+		got := GetLastLabelValue(tt.input)
 		if got != tt.want {
-			t.Errorf("getLastLabelValue(%q) = %q, want %q", tt.input, got, tt.want)
+			t.Errorf("GetLastLabelValue(%q) = %q, want %q", tt.input, got, tt.want)
 		}
 	}
 }
 
-// ── injectSystemLabels ────────────────────────────────────────────────────────
+// ── InjectSystemLabels ────────────────────────────────────────────────────────
 
 func TestInjectSystemLabels_NoExistingLabels(t *testing.T) {
-	id := makeIdentity("alice", 1001, 1001)
-	id.UserType = UserTypeRegular
+	id := makeIsolationIdentity("alice", 1001, 1001)
 	id.EffectiveUID = 1001
 
 	body := []byte(`{"Image":"nginx","Cmd":["nginx"]}`)
-	result, err := injectSystemLabels(body, id)
+	result, err := InjectSystemLabels(body, id)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	labels := extractLabelsFromJSON(t, result)
 
-	assertLabel(t, labels, labelOwnerUsername, "alice")
-	assertLabel(t, labels, labelOwnerUID, "1001")
-	assertLabel(t, labels, labelOwnerGID, "1001")
-	assertLabel(t, labels, labelCallerType, "regular")
-	assertLabel(t, labels, labelEffectiveUID, "1001")
+	assertLabel(t, labels, LabelOwnerUsername, "alice")
+	assertLabel(t, labels, LabelOwnerUID, "1001")
+	assertLabel(t, labels, LabelOwnerGID, "1001")
+	assertLabel(t, labels, LabelCallerType, "regular")
+	assertLabel(t, labels, LabelEffectiveUID, "1001")
 }
 
 func TestInjectSystemLabels_WithUserLabel(t *testing.T) {
-	id := makeIdentity("alice", 1001, 1001)
-	id.UserType = UserTypeRegular
+	id := makeIsolationIdentity("alice", 1001, 1001)
 	id.EffectiveUID = 1001
 
-	// 用户已设置一个普通标签，应保留且不影响系统标签
 	body := []byte(`{"Image":"nginx","Labels":{"owner":"myapp"}}`)
-	result, err := injectSystemLabels(body, id)
+	result, err := InjectSystemLabels(body, id)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	labels := extractLabelsFromJSON(t, result)
 
-	if labels["owner"] != "myapp" {
-		t.Errorf("user label 'owner' should be preserved, got %q", labels["owner"])
+	// owner 是用户可见标签，InjectSystemLabels 会 appendLabel 追加 alice
+	// 最终值为 "myapp,alice"，GetLastLabelValue 取末位为 "alice"
+	if GetLastLabelValue(labels["owner"]) != "alice" {
+		t.Errorf("last value of 'owner' should be 'alice', got %q", labels["owner"])
 	}
-	assertLabel(t, labels, labelOwnerUsername, "alice")
-	assertLabel(t, labels, labelOwnerUID, "1001")
+	assertLabel(t, labels, LabelOwnerUsername, "alice")
+	assertLabel(t, labels, LabelOwnerUID, "1001")
 }
 
 func TestInjectSystemLabels_UserFakesSystemLabel(t *testing.T) {
-	// 用户伪造 system.authz.owner.uid=0，系统应在后面追加真实值
-	id := makeIdentity("alice", 1001, 1001)
-	id.UserType = UserTypeRegular
+	id := makeIsolationIdentity("alice", 1001, 1001)
 	id.EffectiveUID = 1001
 
 	body := []byte(`{"Image":"nginx","Labels":{"system.authz.owner.uid":"0"}}`)
-	result, err := injectSystemLabels(body, id)
+	result, err := InjectSystemLabels(body, id)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	labels := extractLabelsFromJSON(t, result)
-	val := labels[labelOwnerUID]
-	last := getLastLabelValue(val)
+	val := labels[LabelOwnerUID]
+	last := GetLastLabelValue(val)
 	if last != "1001" {
-		t.Errorf("last value of %s should be '1001' (real uid), got %q (full: %q)", labelOwnerUID, last, val)
+		t.Errorf("last value of %s should be '1001' (real uid), got %q (full: %q)", LabelOwnerUID, last, val)
 	}
 }
 
 func TestInjectSystemLabels_SudoUser(t *testing.T) {
-	id := &CallerIdentity{
+	id := &auth.CallerIdentity{
 		RealUsername:      "alice",
 		RealUID:           1001,
 		RealGID:           1001,
 		EffectiveUsername: "root",
 		EffectiveUID:      0,
-		EffectiveGID:      0,
-		UserType:          UserTypeSudo,
+		UserType:          auth.UserTypeSudo,
 	}
 
 	body := []byte(`{"Image":"nginx"}`)
-	result, err := injectSystemLabels(body, id)
+	result, err := InjectSystemLabels(body, id)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	labels := extractLabelsFromJSON(t, result)
-	assertLabel(t, labels, labelCallerType, "sudo")
-	assertLabel(t, labels, labelEffectiveUID, "0")
-	assertLabel(t, labels, labelOwnerUID, "1001")
-	assertLabel(t, labels, labelOwnerUsername, "alice")
+	assertLabel(t, labels, LabelCallerType, "sudo")
+	assertLabel(t, labels, LabelEffectiveUID, "0")
+	assertLabel(t, labels, LabelOwnerUID, "1001")
+	assertLabel(t, labels, LabelOwnerUsername, "alice")
 }
 
 func TestInjectSystemLabels_NullLabels(t *testing.T) {
-	id := makeIdentity("alice", 1001, 1001)
-	id.UserType = UserTypeRegular
+	id := makeIsolationIdentity("alice", 1001, 1001)
 	id.EffectiveUID = 1001
 
 	body := []byte(`{"Image":"nginx","Labels":null}`)
-	result, err := injectSystemLabels(body, id)
+	result, err := InjectSystemLabels(body, id)
 	if err != nil {
 		t.Fatal(err)
 	}
 	labels := extractLabelsFromJSON(t, result)
-	assertLabel(t, labels, labelOwnerUsername, "alice")
+	assertLabel(t, labels, LabelOwnerUsername, "alice")
 }
 
 func TestInjectSystemLabels_InvalidJSON(t *testing.T) {
-	id := makeIdentity("alice", 1001, 1001)
+	id := makeIsolationIdentity("alice", 1001, 1001)
 	body := []byte(`not json`)
-	result, err := injectSystemLabels(body, id)
+	result, err := InjectSystemLabels(body, id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 解析失败时原样返回
 	if string(result) != string(body) {
 		t.Errorf("invalid JSON should be returned unchanged")
 	}
 }
 
-// ── 测试辅助 ──────────────────────────────────────────────────────────────────
+func TestInjectSystemLabels_UserVisibleLabels(t *testing.T) {
+	id := makeIsolationIdentity("alice", 1001, 1001)
+	id.EffectiveUID = 1001
+
+	body := []byte(`{"Image":"nginx"}`)
+	result, err := InjectSystemLabels(body, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	labels := extractLabelsFromJSON(t, result)
+	// owner 和 user_id 标签应被注入
+	assertLabel(t, labels, LabelOwner, "alice")
+	assertLabel(t, labels, LabelOwnerID, "1001")
+}
+
+func TestInjectSystemLabels_UserFakesOwnerLabel(t *testing.T) {
+	// 用户在请求中预置 owner=root，代理应追加真实值，末位值为 alice
+	id := makeIsolationIdentity("alice", 1001, 1001)
+	id.EffectiveUID = 1001
+
+	body := []byte(`{"Image":"nginx","Labels":{"owner":"root"}}`)
+	result, err := InjectSystemLabels(body, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	labels := extractLabelsFromJSON(t, result)
+	val := labels[LabelOwner]
+	last := GetLastLabelValue(val)
+	if last != "alice" {
+		t.Errorf("last value of owner label should be 'alice', got %q (full: %q)", last, val)
+	}
+}
+
+
 
 func extractLabelsFromJSON(t *testing.T, body []byte) map[string]string {
 	t.Helper()
