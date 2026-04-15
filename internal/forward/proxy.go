@@ -979,31 +979,54 @@ func (p *ProxyServer) checkImagePullPermission(w http.ResponseWriter, r *http.Re
 
 	auditID := toAuditIdentity(id)
 	if isPublic {
-		// 公共镜像：非属主不能覆盖（重新 pull 同 tag 视为覆盖）
+		// 公共镜像：非属主 pull 视为增加引用计数，模拟 pull 成功
 		if owner.UID != id.RealUID {
-			p.logger.Warn("image_pull_overwrite_denied",
+			if err := p.db.EnsureImageAccess(resolvedID, id.RealUID); err != nil {
+				p.logger.Error("ensure_image_access_failed",
+					zap.String("image_id", resolvedID),
+					zap.String("real_username", id.RealUsername),
+					zap.Int("real_uid", id.RealUID),
+					zap.Error(err))
+				http.Error(w, "internal error", http.StatusInternalServerError)
+				return false
+			}
+			p.logger.Info("image_pull_virtual",
 				append(audit.LogIdentityShortFields(auditID),
 					zap.String("image_ref", imageRef),
 					zap.String("image_id", truncID(resolvedID)),
 					zap.String("owner", owner.Username),
+					zap.Bool("public", true),
 				)...)
-			http.Error(w,
-				fmt.Sprintf("image '%s' is a public image owned by '%s'(uid=%d); only the owner or root can overwrite it",
-					imageRef, owner.Username, owner.UID),
-				http.StatusForbidden)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, "{\"status\":\"Pull complete\",\"id\":\"%s\"}\r\n", truncID(resolvedID))
 			return false
 		}
 		return true
 	}
 
-	// 私有镜像：只有属主可拉取
+	// 私有镜像且非属主：镜像已在本地，模拟 pull 成功并记录引用计数
+	// 不需要从仓库重新下载，直接给当前用户添加访问权限
 	if owner.UID != id.RealUID {
-		auditOwner := &audit.OwnerInfo{Username: owner.Username, UID: owner.UID, GID: owner.GID}
-		audit.LogAuthzDeniedOwnership(p.logger, auditID, auditOwner, "image", truncID(resolvedID), authz.ActionPull)
-		http.Error(w,
-			fmt.Sprintf("image '%s' is a private image owned by '%s'(uid=%d); only the owner or root can pull it",
-				imageRef, owner.Username, owner.UID),
-			http.StatusForbidden)
+		if err := p.db.EnsureImageAccess(resolvedID, id.RealUID); err != nil {
+			p.logger.Error("ensure_image_access_failed",
+				zap.String("image_id", resolvedID),
+				zap.String("real_username", id.RealUsername),
+				zap.Int("real_uid", id.RealUID),
+				zap.Error(err))
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return false
+		}
+		p.logger.Info("image_pull_virtual",
+			append(audit.LogIdentityShortFields(auditID),
+				zap.String("image_ref", imageRef),
+				zap.String("image_id", truncID(resolvedID)),
+				zap.String("owner", owner.Username),
+			)...)
+		// 模拟 Docker pull 的流式输出格式
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "{\"status\":\"Pull complete\",\"id\":\"%s\"}\r\n", truncID(resolvedID))
 		return false
 	}
 	return true
