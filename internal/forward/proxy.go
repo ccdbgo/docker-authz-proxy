@@ -2079,12 +2079,15 @@ func (p *ProxyServer) handleHijack(w http.ResponseWriter, r *http.Request, id *a
 	done := make(chan struct{}, 2)
 	go func() {
 		io.Copy(upstreamConn, clientConn)
-		upstreamConn.Close()
+		// 客户端输入结束，半关闭写端让上游知道不再有输入
+		type closeWriter interface{ CloseWrite() error }
+		if cw, ok := upstreamConn.(closeWriter); ok {
+			cw.CloseWrite()
+		}
 		done <- struct{}{}
 	}()
 	go func() {
 		io.Copy(clientConn, upstreamReader)
-		clientConn.Close()
 		done <- struct{}{}
 	}()
 	<-done
