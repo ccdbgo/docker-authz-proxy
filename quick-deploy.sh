@@ -104,10 +104,10 @@ echo ""
 
 # 检查每个用户的 socket
 for user in root alice bob; do
-    if [ -S "/run/docker-authz/${user}.sock" ]; then
-        log_info "${user}.sock 已创建"
+    if [ -S "/run/docker-authz/${user}/docker.sock" ]; then
+        log_info "${user}/docker.sock 已创建"
     else
-        log_warn "${user}.sock 未创建"
+        log_warn "${user}/docker.sock 未创建"
     fi
 done
 echo ""
@@ -124,7 +124,7 @@ echo ""
 
 for user in alice bob; do
     echo "测试 $user 用户:"
-    if sudo -u "$user" DOCKER_HOST="unix:///run/docker-authz/${user}.sock" docker version --format '{{.Server.Version}}' 2>/dev/null; then
+    if sudo -u "$user" DOCKER_HOST="unix:///run/docker-authz/${user}/docker.sock" docker version --format '{{.Server.Version}}' 2>/dev/null; then
         log_info "$user 可以连接 Docker"
     else
         log_warn "$user 无法连接 Docker"
@@ -142,7 +142,7 @@ for user in alice bob root; do
     [ -z "$homedir" ] || [ -z "$uid" ] || [ ! -d "$homedir" ] && continue
     bashrc="${homedir}/.bashrc"
     marker="# docker-authz-proxy: DOCKER_HOST"
-    export_line="export DOCKER_HOST=unix:///run/docker-authz/${user}.sock"
+    export_line="export DOCKER_HOST=unix:///run/docker-authz/${user}/docker.sock"
     if grep -q "$marker" "$bashrc" 2>/dev/null; then
         log_info "$user: ~/.bashrc 已配置"
     else
@@ -169,7 +169,7 @@ log_info "新功能: 程序每 10 秒自动扫描新用户并创建 socket"
 echo ""
 echo "用户使用方法:"
 echo "  1. 用户重新登录（加载环境变量）"
-echo "  2. 或手动设置: export DOCKER_HOST=unix:///run/docker-authz/\$(whoami).sock"
+echo "  2. 或手动设置: export DOCKER_HOST=unix:///run/docker-authz/\$(whoami)/docker.sock"
 echo "  3. 执行: docker ps"
 echo ""
 echo "查看实时日志:"
@@ -178,5 +178,5 @@ echo ""
 echo "验证新用户自动创建:"
 echo "  1. 创建新用户: useradd -m -s /bin/bash testuser"
 echo "  2. 等待 10 秒"
-echo "  3. 检查: ls -la /run/docker-authz/testuser.sock"
+echo "  3. 检查: ls -la /run/docker-authz/testuser/docker.sock"
 echo ""

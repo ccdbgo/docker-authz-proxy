@@ -25,7 +25,7 @@ SOCKET_DIR="/run/docker-authz"
 docker_as() {
     local user="$1"
     shift
-    local sock="${SOCKET_DIR}/${user}.sock"
+    local sock="${SOCKET_DIR}/${user}/docker.sock"
     sudo -u "$user" env DOCKER_HOST="unix://${sock}" docker "$@"
 }
 

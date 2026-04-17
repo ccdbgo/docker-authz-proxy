@@ -58,14 +58,14 @@ echo ""
 
 # 测试 1: 检查 socket 文件是否创建
 log_test "测试 1: 检查用户 socket 文件"
-if [ -S "/run/docker-authz/root.sock" ]; then
-    log_pass "root.sock 已创建"
+if [ -S "/run/docker-authz/root/docker.sock" ]; then
+    log_pass "root/docker.sock 已创建"
 else
-    log_fail "root.sock 未创建"
+    log_fail "root/docker.sock 未创建"
 fi
 
 # 列出所有创建的 socket
-SOCKETS=$(ls -1 /run/docker-authz/*.sock 2>/dev/null | wc -l)
+SOCKETS=$(ls -1 /run/docker-authz/*/docker.sock 2>/dev/null | wc -l)
 log_info "已创建 $SOCKETS 个用户 socket"
 
 # 测试 2: 检查策略配置
@@ -80,7 +80,7 @@ fi
 log_test "测试 3: 测试 alice 用户策略限制"
 if id alice &>/dev/null; then
     # 测试 alice 执行 docker ps（应该被拒绝）
-    if sudo -u alice DOCKER_HOST=unix:///run/docker-authz/alice.sock docker ps &>/dev/null; then
+    if sudo -u alice DOCKER_HOST=unix:///run/docker-authz/alice/docker.sock docker ps &>/dev/null; then
         log_fail "alice 用户执行 docker ps 成功（应该被拒绝）"
     else
         log_pass "alice 用户执行 docker ps 被正确拒绝"
@@ -91,7 +91,7 @@ fi
 
 # 测试 4: 测试 root 用户可以执行命令
 log_test "测试 4: 测试 root 用户访问"
-if DOCKER_HOST=unix:///run/docker-authz/root.sock docker ps &>/dev/null; then
+if DOCKER_HOST=unix:///run/docker-authz/root/docker.sock docker ps &>/dev/null; then
     log_pass "root 用户可以执行 docker ps"
 else
     log_fail "root 用户无法执行 docker ps"
@@ -101,14 +101,14 @@ fi
 log_test "测试 5: 测试容器创建和归属隔离"
 if id alice &>/dev/null && id bob &>/dev/null; then
     # alice 创建容器
-    CONTAINER_ID=$(sudo -u alice DOCKER_HOST=unix:///run/docker-authz/alice.sock \
+    CONTAINER_ID=$(sudo -u alice DOCKER_HOST=unix:///run/docker-authz/alice/docker.sock \
         docker run -d --name test-alice-container nginx:alpine 2>/dev/null || echo "")
 
     if [ -n "$CONTAINER_ID" ]; then
         log_info "alice 创建容器: ${CONTAINER_ID:0:12}"
 
         # bob 尝试停止 alice 的容器（应该被拒绝）
-        if sudo -u bob DOCKER_HOST=unix:///run/docker-authz/bob.sock \
+        if sudo -u bob DOCKER_HOST=unix:///run/docker-authz/bob/docker.sock \
             docker stop test-alice-container &>/dev/null; then
             log_fail "bob 可以停止 alice 的容器（应该被拒绝）"
         else
@@ -116,7 +116,7 @@ if id alice &>/dev/null && id bob &>/dev/null; then
         fi
 
         # alice 停止自己的容器（应该成功）
-        if sudo -u alice DOCKER_HOST=unix:///run/docker-authz/alice.sock \
+        if sudo -u alice DOCKER_HOST=unix:///run/docker-authz/alice/docker.sock \
             docker stop test-alice-container &>/dev/null; then
             log_pass "alice 可以停止自己的容器"
         else
@@ -124,7 +124,7 @@ if id alice &>/dev/null && id bob &>/dev/null; then
         fi
 
         # 清理
-        sudo -u alice DOCKER_HOST=unix:///run/docker-authz/alice.sock \
+        sudo -u alice DOCKER_HOST=unix:///run/docker-authz/alice/docker.sock \
             docker rm test-alice-container &>/dev/null || true
     else
         log_skip "无法创建测试容器（可能 nginx:alpine 镜像不存在）"
@@ -137,16 +137,16 @@ fi
 log_test "测试 6: 测试容器列表可见性过滤"
 if id alice &>/dev/null && id bob &>/dev/null; then
     # alice 创建容器
-    ALICE_CONTAINER=$(sudo -u alice DOCKER_HOST=unix:///run/docker-authz/alice.sock \
+    ALICE_CONTAINER=$(sudo -u alice DOCKER_HOST=unix:///run/docker-authz/alice/docker.sock \
         docker run -d --name test-visibility-alice nginx:alpine 2>/dev/null || echo "")
 
     # bob 创建容器
-    BOB_CONTAINER=$(sudo -u bob DOCKER_HOST=unix:///run/docker-authz/bob.sock \
+    BOB_CONTAINER=$(sudo -u bob DOCKER_HOST=unix:///run/docker-authz/bob/docker.sock \
         docker run -d --name test-visibility-bob nginx:alpine 2>/dev/null || echo "")
 
     if [ -n "$ALICE_CONTAINER" ] && [ -n "$BOB_CONTAINER" ]; then
         # alice 执行 docker ps，应该只看到自己的容器
-        ALICE_PS=$(sudo -u alice DOCKER_HOST=unix:///run/docker-authz/alice.sock \
+        ALICE_PS=$(sudo -u alice DOCKER_HOST=unix:///run/docker-authz/alice/docker.sock \
             docker ps --format '{{.Names}}' 2>/dev/null || echo "")
 
         if echo "$ALICE_PS" | grep -q "test-visibility-alice" && \
@@ -157,9 +157,9 @@ if id alice &>/dev/null && id bob &>/dev/null; then
         fi
 
         # 清理
-        sudo -u alice DOCKER_HOST=unix:///run/docker-authz/alice.sock \
+        sudo -u alice DOCKER_HOST=unix:///run/docker-authz/alice/docker.sock \
             docker rm -f test-visibility-alice &>/dev/null || true
-        sudo -u bob DOCKER_HOST=unix:///run/docker-authz/bob.sock \
+        sudo -u bob DOCKER_HOST=unix:///run/docker-authz/bob/docker.sock \
             docker rm -f test-visibility-bob &>/dev/null || true
     else
         log_skip "无法创建测试容器"
@@ -187,7 +187,7 @@ fi
 log_test "测试 8: 测试 sudo 用户身份识别"
 if id alice &>/dev/null; then
     # 使用 sudo 执行 docker 命令
-    sudo -u alice DOCKER_HOST=unix:///run/docker-authz/alice.sock docker version &>/dev/null || true
+    sudo -u alice DOCKER_HOST=unix:///run/docker-authz/alice/docker.sock docker version &>/dev/null || true
 
     # 检查日志中是否正确识别了 sudo 用户
     if grep -q '"user_type":"sudo"' /var/log/docker-authz/authz.log 2>/dev/null || \

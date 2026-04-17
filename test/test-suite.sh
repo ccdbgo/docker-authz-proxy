@@ -23,7 +23,7 @@ SOCKET_DIR="/run/docker-authz"
 docker_as() {
     local user="$1"
     shift
-    local sock="${SOCKET_DIR}/${user}.sock"
+    local sock="${SOCKET_DIR}/${user}/docker.sock"
     sudo -u "$user" env DOCKER_HOST="unix://${sock}" docker "$@"
 }
 
@@ -137,7 +137,7 @@ fi
 
 # 检查用户 socket 是否存在
 for user in alice bob; do
-    sock="/run/docker-authz/${user}.sock"
+    sock="/run/docker-authz/${user}/docker.sock"
     if [ ! -S "$sock" ]; then
         log_error "用户 socket 不存在: $sock"
         exit 1
@@ -153,11 +153,11 @@ log_info "前置检查通过"
 test_case "环境变量自动设置"
 
 assert_contains "alice 的 DOCKER_HOST 指向专属 socket" \
-    "alice.sock" \
+    "alice/docker.sock" \
     sudo -u alice -i bash -c 'echo $DOCKER_HOST'
 
 assert_contains "bob 的 DOCKER_HOST 指向专属 socket" \
-    "bob.sock" \
+    "bob/docker.sock" \
     sudo -u bob -i bash -c 'echo $DOCKER_HOST'
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

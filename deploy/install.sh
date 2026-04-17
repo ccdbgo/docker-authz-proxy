@@ -119,8 +119,8 @@ log_info "配置用户环境变量..."
 # 系统级：新用户登录时自动生效
 cat > /etc/profile.d/docker-authz.sh << 'EOF'
 # docker-authz-proxy: 每个用户通过自己的 socket 访问 Docker
-if [ -S "/run/docker-authz/$(whoami).sock" ]; then
-    export DOCKER_HOST="unix:///run/docker-authz/$(whoami).sock"
+if [ -S "/run/docker-authz/$(whoami)/docker.sock" ]; then
+    export DOCKER_HOST="unix:///run/docker-authz/$(whoami)/docker.sock"
 fi
 EOF
 chmod 644 /etc/profile.d/docker-authz.sh
@@ -133,7 +133,7 @@ setup_user_docker_host() {
     local homedir="$4"
     local bashrc="${homedir}/.bashrc"
     local marker="# docker-authz-proxy: DOCKER_HOST"
-    local export_line="export DOCKER_HOST=unix:///run/docker-authz/${username}.sock"
+    local export_line="export DOCKER_HOST=unix:///run/docker-authz/${username}/docker.sock"
 
     [ -z "$homedir" ] && return
     [ ! -d "$homedir" ] && return
