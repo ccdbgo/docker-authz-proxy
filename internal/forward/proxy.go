@@ -2052,6 +2052,9 @@ func (p *ProxyServer) handleHijack(w http.ResponseWriter, r *http.Request, id *a
 		return
 	}
 
+	// 判断是否真正升级为双向流（101）；exec 非 TTY 时 dockerd 返回 200
+	is101 := strings.HasPrefix(statusLine, "HTTP/1.1 101") || strings.HasPrefix(statusLine, "HTTP/1.0 101")
+
 	for {
 		line, err := upstreamReader.ReadString('\n')
 		if err != nil {
@@ -2065,6 +2068,12 @@ func (p *ProxyServer) handleHijack(w http.ResponseWriter, r *http.Request, id *a
 		if line == "\r\n" || line == "\n" {
 			break
 		}
+	}
+
+	if !is101 {
+		// 非升级响应（如 exec 非 TTY 的 200），直接把响应体透传给客户端即可
+		io.Copy(clientConn, upstreamReader)
+		return
 	}
 
 	done := make(chan struct{}, 2)
