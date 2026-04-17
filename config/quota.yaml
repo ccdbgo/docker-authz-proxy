@@ -17,24 +17,39 @@ defaults:
 
 # 按用户配置
 users:
-  # 示例：alice 有更多资源
-  # alice:
-  #   cpu_cores: 4.0
-  #   mem_mb: 8192
+  # root：不限制资源
+  root:
+    cpu_cores: 0
+    mem_mb: 0
 
-  # 示例：bob 资源受限
-  # bob:
-  #   cpu_cores: 1.0
-  #   mem_mb: 1024
+  # test-sudo：sudo 组成员，给予较多资源
+  test-sudo:
+    cpu_cores: 4.0
+    mem_mb: 4096
+
+  # test-docker-g：docker 组成员，标准资源
+  test-docker-g:
+    cpu_cores: 2.0
+    mem_mb: 2048
+
+  # bob：普通开发者，标准资源
+  bob:
+    cpu_cores: 2.0
+    mem_mb: 2048
+
+  # alice：受限用户，较少资源
+  alice:
+    cpu_cores: 1.0
+    mem_mb: 1024
 
 # 按组配置
 groups:
-  # 示例：intern 组资源受限
-  # intern:
-  #   cpu_cores: 0.5
-  #   mem_mb: 512
+  # sudo 组：给予较多资源（test-sudo 属于此组）
+  sudo:
+    cpu_cores: 4.0
+    mem_mb: 4096
 
-  # 示例：developer 组有更多资源
-  # developer:
-  #   cpu_cores: 4.0
-  #   mem_mb: 4096
+  # docker 组：标准资源（test-docker-g 属于此组）
+  docker:
+    cpu_cores: 2.0
+    mem_mb: 2048

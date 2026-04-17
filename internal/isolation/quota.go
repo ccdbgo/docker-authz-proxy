@@ -59,7 +59,7 @@ func (e *QuotaExceededError) Error() string {
 type containerCreateRequest struct {
 	HostConfig struct {
 		// CPU 相关
-		NanoCPUs   int64  `json:"NanoCPUs"`   // --cpus（优先级最高）
+		NanoCPUs   int64  `json:"NanoCpus"`   // --cpus（优先级最高）
 		CpuQuota   int64  `json:"CpuQuota"`   // --cpu-quota（微秒，与 CpuPeriod 配合）
 		CpuPeriod  int64  `json:"CpuPeriod"`  // --cpu-period（默认 100000 微秒）
 		CpuShares  int64  `json:"CpuShares"`  // --cpu-shares（相对权重，不是硬上限）
@@ -467,7 +467,7 @@ func injectQuotaLimits(body []byte, req *containerCreateRequest, quota UserQuota
 		if currentNano == 0 {
 			// 未指定：注入配额上限
 			b, _ := json.Marshal(quotaNano)
-			hostConfig["NanoCPUs"] = b
+			hostConfig["NanoCpus"] = b
 			result.cpuCores = quota.CPUCores
 		} else {
 			// 已指定且不超限：保持原值，但清除 CpuQuota/CpuPeriod 避免冲突
@@ -477,7 +477,7 @@ func injectQuotaLimits(body []byte, req *containerCreateRequest, quota UserQuota
 			} else {
 				// 将 CpuQuota/CpuPeriod 转换为 NanoCPUs，统一表示
 				b, _ := json.Marshal(currentNano)
-				hostConfig["NanoCPUs"] = b
+				hostConfig["NanoCpus"] = b
 				// 清除 CpuQuota/CpuPeriod，避免 Docker 报冲突错误
 				zero, _ := json.Marshal(int64(0))
 				hostConfig["CpuQuota"] = zero

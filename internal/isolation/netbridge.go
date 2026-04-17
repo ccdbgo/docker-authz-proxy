@@ -467,7 +467,19 @@ type DockerEventListener struct {
 }
 
 func NewDockerEventListener(upstreamSock string) *DockerEventListener {
-	return &DockerEventListener{client: newDockerClient(upstreamSock)}
+	// /events 是长连接流式接口，不能使用带 Timeout 的 http.Client
+	// 否则 15s 后触发 context deadline exceeded 导致反复重连
+	streamClient := &dockerClient{
+		http: &http.Client{
+			Transport: &http.Transport{
+				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+					return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "unix", upstreamSock)
+				},
+			},
+			// 不设置 Timeout，由调用方通过 ctx 控制生命周期
+		},
+	}
+	return &DockerEventListener{client: streamClient}
 }
 
 // DockerEvent Docker 事件结构

@@ -3,6 +3,7 @@ package authz
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"docker-authz-proxy/internal/auth"
@@ -225,7 +226,28 @@ func (o *OwnershipDB) GetContainerIDsByOwner(uid int) ([]string, error) {
 
 // ── 镜像归属 ────────────────────────────────────────────────
 
+// normalizeImageID 规范化镜像 ID：去除 "sha256:" 前缀
+func normalizeImageID(id string) string {
+	return strings.TrimPrefix(id, "sha256:")
+}
+
+// matchesImageID 判断两个镜像 ID 是否指向同一镜像（支持短 ID 前缀匹配）
+// 规则：strip sha256: → 短 ID 是长 ID 的前缀
+func matchesImageID(stored, query string) bool {
+	s := normalizeImageID(stored)
+	q := normalizeImageID(query)
+	if s == q {
+		return true
+	}
+	// 允许 12-char 短 ID 匹配长 ID（例如 "ba6dc382fcdc" 匹配 "ba6dc382fcdc19e3..."）
+	if len(s) < len(q) {
+		return strings.HasPrefix(q, s)
+	}
+	return strings.HasPrefix(s, q)
+}
+
 func (o *OwnershipDB) SetImageOwner(imageID string, identity *auth.CallerIdentity, isPublic bool, source string) error {
+	imageID = normalizeImageID(imageID)
 	publicInt := 0
 	if isPublic {
 		publicInt = 1
@@ -251,12 +273,48 @@ func (o *OwnershipDB) SetImageOwner(imageID string, identity *auth.CallerIdentit
 	return err
 }
 
+// resolveImageIDInDB 在数据库中查找镜像 ID（支持多种格式：短ID/长ID/sha256:前缀）
+// 返回数据库中实际存储的 image_id（可能是短 ID）
+func (o *OwnershipDB) resolveImageIDInDB(imageID string) string {
+	norm := normalizeImageID(imageID)
+	// 1. 精确匹配（规范化后）
+	var stored string
+	err := o.DB.QueryRow(`SELECT image_id FROM images WHERE image_id = ?`, norm).Scan(&stored)
+	if err == nil {
+		return stored
+	}
+	// 2. 若 norm 是长 ID（>12 char hex），尝试短 ID（前12 char）前缀匹配
+	if len(norm) > 12 {
+		isHex := true
+		for _, c := range norm[:12] {
+			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+				isHex = false
+				break
+			}
+		}
+		if isHex {
+			short := norm[:12]
+			// 用 LIKE 匹配 DB 中以 short 开头的条目（短ID或长ID均可）
+			err = o.DB.QueryRow(`SELECT image_id FROM images WHERE image_id = ? OR image_id LIKE ?`,
+				short, short+"%").Scan(&stored)
+			if err == nil {
+				return stored
+			}
+		}
+	}
+	return ""
+}
+
 // GetImageOwner 返回镜像归属信息及是否为公共镜像
 func (o *OwnershipDB) GetImageOwner(imageID string) (*OwnerInfo, bool, bool) {
+	resolvedID := o.resolveImageIDInDB(imageID)
+	if resolvedID == "" {
+		return nil, false, false
+	}
 	var info OwnerInfo
 	var isPublicInt int
 	err := o.DB.QueryRow(
-		`SELECT owner_username, owner_uid, owner_gid, is_public FROM images WHERE image_id = ?`, imageID,
+		`SELECT owner_username, owner_uid, owner_gid, is_public FROM images WHERE image_id = ?`, resolvedID,
 	).Scan(&info.Username, &info.UID, &info.GID, &isPublicInt)
 	if err != nil {
 		return nil, false, false
@@ -266,46 +324,57 @@ func (o *OwnershipDB) GetImageOwner(imageID string) (*OwnerInfo, bool, bool) {
 
 // CanUseImage 判断用户是否有权使用某镜像
 func (o *OwnershipDB) CanUseImage(realUID int, imageID string) bool {
+	resolvedID := o.resolveImageIDInDB(imageID)
+	if resolvedID == "" {
+		return realUID == 0
+	}
 	var isPublic int
+	var ownerUID int
 	err := o.DB.QueryRow(
-		`SELECT is_public FROM images WHERE image_id = ?`, imageID,
-	).Scan(&isPublic)
+		`SELECT is_public, owner_uid FROM images WHERE image_id = ?`, resolvedID,
+	).Scan(&isPublic, &ownerUID)
 	if err != nil {
 		return realUID == 0
 	}
+	// 只有 is_public=1 的镜像对所有用户开放
 	if isPublic != 0 {
+		return true
+	}
+	// 属主本人始终可以使用自己的镜像
+	if ownerUID == realUID {
 		return true
 	}
 	var count int
 	_ = o.DB.QueryRow(
 		`SELECT COUNT(*) FROM image_access WHERE image_id = ? AND user_uid = ?`,
-		imageID, realUID,
+		resolvedID, realUID,
 	).Scan(&count)
 	return count > 0
 }
 
 // CanSeeImage 判断用户是否能在列表中看到某镜像
+// 规则：is_public=1 的镜像所有人可见；否则只有属主可见
 func (o *OwnershipDB) CanSeeImage(realUID int, imageID string) bool {
-	var isPublic int
+	resolvedID := o.resolveImageIDInDB(imageID)
+	if resolvedID == "" {
+		return false
+	}
+	var isPublic, ownerUID int
 	err := o.DB.QueryRow(
-		`SELECT is_public FROM images WHERE image_id = ?`, imageID,
-	).Scan(&isPublic)
+		`SELECT is_public, owner_uid FROM images WHERE image_id = ?`, resolvedID,
+	).Scan(&isPublic, &ownerUID)
 	if err != nil {
 		return false
 	}
 	if isPublic != 0 {
 		return true
 	}
-	var count int
-	_ = o.DB.QueryRow(
-		`SELECT COUNT(*) FROM image_access WHERE image_id = ? AND user_uid = ?`,
-		imageID, realUID,
-	).Scan(&count)
-	return count > 0
+	return ownerUID == realUID
 }
 
 // MarkImagePublic 将镜像标记为公共
 func (o *OwnershipDB) MarkImagePublic(imageID string, isPublic bool) error {
+	imageID = normalizeImageID(imageID)
 	publicInt := 0
 	if isPublic {
 		publicInt = 1
@@ -358,6 +427,7 @@ func (o *OwnershipDB) GetImageRefUsers(imageID string) ([]int, error) {
 
 // HasUserImageAccess 检查用户是否已有该镜像的引用（用于 pull 去重）
 func (o *OwnershipDB) HasUserImageAccess(imageID string, uid int) (bool, error) {
+	imageID = normalizeImageID(imageID)
 	var count int
 	err := o.DB.QueryRow(
 		`SELECT COUNT(*) FROM image_access WHERE image_id = ? AND user_uid = ?`, imageID, uid,
@@ -367,6 +437,8 @@ func (o *OwnershipDB) HasUserImageAccess(imageID string, uid int) (bool, error) 
 
 // EnsureImageAccess 确保用户对镜像有访问权限（幂等）
 func (o *OwnershipDB) EnsureImageAccess(imageID string, uid int) error {
+	// 规范化：与 SetImageOwner 保持一致
+	imageID = normalizeImageID(imageID)
 	_, err := o.DB.Exec(
 		`INSERT OR IGNORE INTO image_access (image_id, user_uid) VALUES (?, ?)`,
 		imageID, uid,
@@ -427,6 +499,7 @@ func (o *OwnershipDB) Close() error {
 
 // SetImagePublic 设置镜像是否为公共镜像
 func (o *OwnershipDB) SetImagePublic(imageID string, isPublic bool) error {
+	imageID = normalizeImageID(imageID)
 	pub := 0
 	if isPublic {
 		pub = 1
@@ -466,6 +539,18 @@ func (o *OwnershipDB) SetManagedNetworkOwner(networkID, name string, uid int, us
 		networkID, name, uid, username, time.Now().UTC(),
 	)
 	return err
+}
+
+// GetNetworkIDByName 按网络名称查找网络 ID
+func (o *OwnershipDB) GetNetworkIDByName(name string) (string, bool) {
+	var networkID string
+	err := o.DB.QueryRow(
+		`SELECT network_id FROM networks WHERE name = ?`, name,
+	).Scan(&networkID)
+	if err != nil {
+		return "", false
+	}
+	return networkID, true
 }
 
 // GetNetworkOwner 返回网络归属信息

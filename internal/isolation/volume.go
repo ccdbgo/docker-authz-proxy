@@ -2,6 +2,7 @@ package isolation
 
 import (
 	"encoding/json"
+	"net/http"
 	"strings"
 
 	"docker-authz-proxy/internal/auth"
@@ -98,6 +99,24 @@ func FilterVolumeListResponse(body []byte, realUID int, db OwnershipReader) ([]b
 		Volumes  []json.RawMessage `json:"Volumes"`
 		Warnings []string          `json:"Warnings"`
 	}{Volumes: filtered, Warnings: resp.Warnings})
+}
+
+// RewriteVolumeURL 将请求 URL 中的卷名补全用户前缀（未带前缀时）
+func RewriteVolumeURL(r *http.Request, uid int) *http.Request {
+	volName := ExtractVolumeName(r.URL.Path)
+	if volName == "" {
+		return r
+	}
+	prefix := UserVolumePrefix(uid)
+	if strings.HasPrefix(volName, prefix) {
+		return r
+	}
+	newPath := strings.Replace(r.URL.Path, "/volumes/"+volName, "/volumes/"+prefix+volName, 1)
+	newURL := *r.URL
+	newURL.Path = newPath
+	newReq := r.Clone(r.Context())
+	newReq.URL = &newURL
+	return newReq
 }
 
 // ExtractVolumeName 从路径中提取 Volume 名称

@@ -3,6 +3,7 @@ package isolation
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"docker-authz-proxy/internal/auth"
@@ -51,9 +52,15 @@ func InjectContainerNamePrefix(body []byte, identity *auth.CallerIdentity) ([]by
 
 // InjectNetworkNamePrefix 向网络创建请求体注入用户前缀
 func InjectNetworkNamePrefix(body []byte, identity *auth.CallerIdentity) ([]byte, error) {
+	result, _, err := InjectNetworkNamePrefixWithName(body, identity)
+	return result, err
+}
+
+// InjectNetworkNamePrefixWithName 向网络创建请求体注入用户前缀，同时返回注入后的实际网络名
+func InjectNetworkNamePrefixWithName(body []byte, identity *auth.CallerIdentity) ([]byte, string, error) {
 	var req map[string]json.RawMessage
 	if err := json.Unmarshal(body, &req); err != nil {
-		return body, nil
+		return body, "", nil
 	}
 
 	prefix := UserResourcePrefix(identity)
@@ -61,16 +68,37 @@ func InjectNetworkNamePrefix(body []byte, identity *auth.CallerIdentity) ([]byte
 	if raw, ok := req["Name"]; ok {
 		_ = json.Unmarshal(raw, &name)
 	}
+	actualName := name
 	if !strings.HasPrefix(name, prefix) {
-		raw, _ := json.Marshal(prefix + name)
+		actualName = prefix + name
+		raw, _ := json.Marshal(actualName)
 		req["Name"] = raw
 	}
 
 	result, err := json.Marshal(req)
 	if err != nil {
-		return body, nil
+		return body, actualName, nil
 	}
-	return result, nil
+	return result, actualName, nil
+}
+
+// RewriteNetworkURL 将请求 URL 中的网络名补全用户前缀（未带前缀时）
+func RewriteNetworkURL(r *http.Request, identity *auth.CallerIdentity) *http.Request {
+	netName := ExtractNetworkID(r.URL.Path)
+	if netName == "" {
+		return r
+	}
+	prefix := UserResourcePrefix(identity)
+	if strings.HasPrefix(netName, prefix) {
+		return r
+	}
+	newName := prefix + netName
+	newPath := strings.Replace(r.URL.Path, "/networks/"+netName, "/networks/"+newName, 1)
+	newURL := *r.URL
+	newURL.Path = newPath
+	newReq := r.Clone(r.Context())
+	newReq.URL = &newURL
+	return newReq
 }
 
 // FilterNetworkListResponse 过滤网络列表，只返回用户可访问的网络
@@ -130,6 +158,85 @@ func FilterNetworkListResponse(body []byte, realUID int, db OwnershipReader) ([]
 		return emptyJSONArray, nil
 	}
 	return json.Marshal(filtered)
+}
+
+// isHexID 判断字符串是否为纯十六进制 ID（只含 0-9 a-f A-F，长度 12 或 64）
+func isHexID(s string) bool {
+	if len(s) != 12 && len(s) != 64 {
+		return false
+	}
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+// containerSpecialIDs 是 /containers/{id} 中不是真实容器名的保留路径片段
+var containerSpecialIDs = map[string]bool{
+	"json": true, "create": true, "prune": true,
+}
+
+// RewriteContainerURL 将请求 URL 中的容器名补全用户前缀（未带前缀时）
+// 只对看起来是名称的部分补前缀（跳过十六进制 ID 和保留路径片段）
+func RewriteContainerURL(r *http.Request, uid int) *http.Request {
+	p := authz.StripAPIVersion(r.URL.Path)
+	const containersPrefix = "/containers/"
+	if !strings.HasPrefix(p, containersPrefix) {
+		return r
+	}
+	rest := p[len(containersPrefix):]
+	var containerID string
+	if idx := strings.Index(rest, "/"); idx >= 0 {
+		containerID = rest[:idx]
+	} else {
+		containerID = rest
+	}
+	if containerID == "" || containerSpecialIDs[containerID] || isHexID(containerID) {
+		return r // 保留路径或已是 hex ID，不需要重写
+	}
+	// 包含 ':' 或 '/' 的标识符是镜像引用，不是容器名（如 busybox:latest, library/nginx）
+	if strings.ContainsAny(containerID, ":/") {
+		return r
+	}
+	prefix := UserContainerPrefix(uid)
+	if strings.HasPrefix(containerID, prefix) {
+		return r // 已有前缀
+	}
+	newName := prefix + containerID
+	newPath := strings.Replace(r.URL.Path, containersPrefix+containerID, containersPrefix+newName, 1)
+	newURL := *r.URL
+	newURL.Path = newPath
+	newReq := r.Clone(r.Context())
+	newReq.URL = &newURL
+	return newReq
+}
+// RewriteContainerInNetworkBody 重写网络 connect/disconnect 请求体中的容器名，补全用户前缀
+func RewriteContainerInNetworkBody(body []byte, uid int) []byte {
+	var req map[string]json.RawMessage
+	if err := json.Unmarshal(body, &req); err != nil {
+		return body
+	}
+	raw, ok := req["Container"]
+	if !ok {
+		return body
+	}
+	var containerName string
+	if err := json.Unmarshal(raw, &containerName); err != nil || containerName == "" {
+		return body
+	}
+	prefix := UserContainerPrefix(uid)
+	if strings.HasPrefix(containerName, prefix) || isHexID(containerName) {
+		return body
+	}
+	newName, _ := json.Marshal(prefix + containerName)
+	req["Container"] = newName
+	result, err := json.Marshal(req)
+	if err != nil {
+		return body
+	}
+	return result
 }
 
 // ExtractNetworkID 从路径中提取网络 ID
