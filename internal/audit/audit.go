@@ -68,6 +68,7 @@ type AuditLogger struct {
 	logDir  string
 	mu      sync.Mutex
 	files   map[string]*os.File
+	uids    map[string]int // username -> uid，用于 Reopen 时恢复属组
 	authLog *os.File
 }
 
@@ -84,6 +85,7 @@ func NewAuditLogger(logDir string) (*AuditLogger, error) {
 	return &AuditLogger{
 		logDir:  logDir,
 		files:   make(map[string]*os.File),
+		uids:    make(map[string]int),
 		authLog: authLog,
 	}, nil
 }
@@ -170,14 +172,14 @@ func (a *AuditLogger) WriteEntry(entry AuditEntry) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	f, err := a.getFile(entry.User)
+	f, err := a.getFile(entry.User, entry.UID)
 	if err != nil {
 		return
 	}
 	_, _ = f.Write(out)
 }
 
-func (a *AuditLogger) getFile(username string) (*os.File, error) {
+func (a *AuditLogger) getFile(username string, uid int) (*os.File, error) {
 	if f, ok := a.files[username]; ok {
 		return f, nil
 	}
@@ -186,7 +188,10 @@ func (a *AuditLogger) getFile(username string) (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 属主 root（防篡改），属组设为该用户，配合 0640 让用户可读自己的日志
+	_ = os.Chown(path, 0, uid)
 	a.files[username] = f
+	a.uids[username] = uid
 	return f, nil
 }
 
@@ -204,6 +209,9 @@ func (a *AuditLogger) Reopen() {
 		_ = f.Close()
 		newF, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0640)
 		if err == nil {
+			if uid, ok := a.uids[username]; ok {
+				_ = os.Chown(path, 0, uid)
+			}
 			a.files[username] = newF
 		} else {
 			delete(a.files, username)

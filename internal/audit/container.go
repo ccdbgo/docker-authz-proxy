@@ -32,6 +32,7 @@ type ContainerLogger struct {
 	dockerSock string
 	mu         sync.Mutex
 	files      map[string]*os.File
+	uids       map[string]int // username -> uid，用于 Reopen 时恢复属组
 }
 
 // NewContainerLogger 创建容器运行日志记录器
@@ -44,6 +45,7 @@ func NewContainerLogger(logDir, dockerSock string) (*ContainerLogger, error) {
 		logDir:     logDir,
 		dockerSock: dockerSock,
 		files:      make(map[string]*os.File),
+		uids:       make(map[string]int),
 	}, nil
 }
 
@@ -140,13 +142,13 @@ func (c *ContainerLogger) stream(ctx context.Context, client *http.Client, owner
 			ExitCode:    exitCode,
 		}
 
-		c.write(username, entry)
+		c.write(username, uid, entry)
 	}
 
 	return scanner.Err()
 }
 
-func (c *ContainerLogger) write(username string, entry ContainerEvent) {
+func (c *ContainerLogger) write(username string, uid int, entry ContainerEvent) {
 	line, err := json.Marshal(entry)
 	if err != nil {
 		return
@@ -165,14 +167,14 @@ func (c *ContainerLogger) write(username string, entry ContainerEvent) {
 	if key == "" {
 		key = "unknown"
 	}
-	f, err := c.getFile(key)
+	f, err := c.getFile(key, uid)
 	if err != nil {
 		return
 	}
 	_, _ = f.Write(out)
 }
 
-func (c *ContainerLogger) getFile(username string) (*os.File, error) {
+func (c *ContainerLogger) getFile(username string, uid int) (*os.File, error) {
 	if f, ok := c.files[username]; ok {
 		return f, nil
 	}
@@ -181,7 +183,10 @@ func (c *ContainerLogger) getFile(username string) (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 属主 root（防篡改），属组设为该用户，配合 0640 让用户可读自己的日志
+	_ = os.Chown(path, 0, uid)
 	c.files[username] = f
+	c.uids[username] = uid
 	return f, nil
 }
 
@@ -194,6 +199,9 @@ func (c *ContainerLogger) Reopen() {
 		_ = f.Close()
 		newF, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0640)
 		if err == nil {
+			if uid, ok := c.uids[username]; ok {
+				_ = os.Chown(path, 0, uid)
+			}
 			c.files[username] = newF
 		} else {
 			delete(c.files, username)
