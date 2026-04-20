@@ -878,7 +878,7 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 	}
 
 	switch action {
-	case authz.ActionNetworkConnect, authz.ActionNetworkDisconnect, authz.ActionNetworkRemove:
+	case authz.ActionNetworkInspect, authz.ActionNetworkConnect, authz.ActionNetworkDisconnect, authz.ActionNetworkRemove:
 		networkName := isolation.ExtractNetworkID(r.URL.Path)
 		if networkName != "" && id.RealUID != 0 {
 			// 尝试按用户前缀名查找真实 Docker 网络 ID
@@ -900,11 +900,8 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 						zap.String("network_id", truncID(lookupID)),
 						zap.String("action", action),
 					)...)
-				p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "network_not_accessible", "", http.StatusForbidden))
-				http.Error(w,
-					fmt.Sprintf("network '%s' not accessible by '%s'(uid=%d)",
-						truncID(lookupID), id.RealUsername, id.RealUID),
-					http.StatusForbidden)
+				p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "network_not_accessible", "", http.StatusNotFound))
+				writeDockerNotFound(w, "network", networkName)
 				return false
 			}
 		}
@@ -927,10 +924,8 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 						zap.String("volume_name", volName),
 						zap.String("action", action),
 					)...)
-				p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "volume_not_tracked", "", http.StatusForbidden))
-				http.Error(w,
-					fmt.Sprintf("volume '%s' not tracked by proxy (only root can manage untracked volumes)", volName),
-					http.StatusForbidden)
+				p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "volume_not_tracked", "", http.StatusNotFound))
+				writeDockerNotFound(w, "volume", volName)
 				return false
 			} else if owner.UID != id.RealUID {
 				auditID := toAuditIdentity(id)
@@ -970,9 +965,7 @@ func (p *ProxyServer) checkImageRemovePermission(w http.ResponseWriter, r *http.
 		if id.RealUID != 0 {
 			auditID := toAuditIdentity(id)
 			audit.LogAuthzDeniedNotTracked(p.logger, auditID, "image", truncID(resolvedID), authz.ActionRemoveImage)
-			http.Error(w,
-				fmt.Sprintf("image '%s' not tracked by proxy (only root can manage untracked images)", truncID(resolvedID)),
-				http.StatusForbidden)
+			writeDockerNotFound(w, "image", resolvedID)
 			return false
 		}
 		return true
@@ -986,10 +979,7 @@ func (p *ProxyServer) checkImageRemovePermission(w http.ResponseWriter, r *http.
 		if !isImageOwner {
 			auditOwner := &audit.OwnerInfo{Username: owner.Username, UID: owner.UID, GID: owner.GID}
 			audit.LogAuthzDeniedOwnership(p.logger, auditID, auditOwner, "image", truncID(resolvedID), authz.ActionRemoveImage)
-			http.Error(w,
-				fmt.Sprintf("image '%s' is not accessible by '%s'(uid=%d)",
-					truncID(resolvedID), id.RealUsername, id.RealUID),
-				http.StatusForbidden)
+			writeDockerNotFound(w, "image", resolvedID)
 			return false
 		}
 	}
@@ -2365,6 +2355,8 @@ func writeDockerNotFound(w http.ResponseWriter, kind, name string) {
 		msg = fmt.Sprintf("get %s: no such volume", name)
 	case "image":
 		msg = fmt.Sprintf("No such image: %s", name)
+	case "network":
+		msg = fmt.Sprintf("network %s not found", name)
 	default:
 		msg = fmt.Sprintf("No such container: %s", name)
 	}
@@ -2880,11 +2872,8 @@ func (p *ProxyServer) checkCreateContainerNetworks(w http.ResponseWriter, r *htt
 					zap.String("network", netName),
 					zap.String("action", action),
 				)...)
-			p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "network_not_accessible", netName, http.StatusForbidden))
-			http.Error(w,
-				fmt.Sprintf("network '%s' not accessible by '%s'(uid=%d)",
-					netName, id.RealUsername, id.RealUID),
-				http.StatusForbidden)
+			p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "network_not_accessible", netName, http.StatusNotFound))
+			writeDockerNotFound(w, "network", netName)
 			return fmt.Errorf("network not accessible")
 		}
 	}
