@@ -662,12 +662,8 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 			auditOwner := &audit.OwnerInfo{Username: owner.Username, UID: owner.UID, GID: owner.GID}
 			audit.LogAuthzDeniedOwnership(p.logger, auditID, auditOwner, "container", truncID(containerID), action)
 			p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "container_not_owned",
-				fmt.Sprintf("owner=%s(uid=%d)", owner.Username, owner.UID), http.StatusForbidden))
-			http.Error(w,
-				fmt.Sprintf("container '%s' belongs to '%s'(uid=%d), not '%s'(uid=%d)",
-					truncID(containerID), owner.Username, owner.UID,
-					id.RealUsername, id.RealUID),
-				http.StatusForbidden)
+				fmt.Sprintf("owner=%s(uid=%d)", owner.Username, owner.UID), http.StatusNotFound))
+			writeDockerNotFound(w, "container", containerID)
 			return false
 		}
 	}
@@ -693,11 +689,7 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 				auditID := toAuditIdentity(id)
 				auditOwner := &audit.OwnerInfo{Username: owner.Username, UID: owner.UID, GID: owner.GID}
 				audit.LogAuthzDeniedOwnership(p.logger, auditID, auditOwner, "container", truncID(qContainerID), action)
-				http.Error(w,
-					fmt.Sprintf("container '%s' belongs to '%s'(uid=%d), not '%s'(uid=%d)",
-						truncID(qContainerID), owner.Username, owner.UID,
-						id.RealUsername, id.RealUID),
-					http.StatusForbidden)
+				writeDockerNotFound(w, "container", qContainerID)
 				return false
 			}
 		}
@@ -948,11 +940,8 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 						zap.String("volume_name", volName),
 						zap.String("action", action),
 					)...)
-				p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "not_your_volume", "", http.StatusForbidden))
-				http.Error(w,
-					fmt.Sprintf("volume '%s' belongs to '%s'(uid=%d), not '%s'(uid=%d)",
-						volName, owner.Username, owner.UID, id.RealUsername, id.RealUID),
-					http.StatusForbidden)
+				p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "not_your_volume", "", http.StatusNotFound))
+				writeDockerNotFound(w, "volume", volName)
 				return false
 			}
 		}
@@ -1150,10 +1139,7 @@ func (p *ProxyServer) checkImageTagPermission(w http.ResponseWriter, r *http.Req
 		auditID := toAuditIdentity(id)
 		auditOwner := &audit.OwnerInfo{Username: owner.Username, UID: owner.UID, GID: owner.GID}
 		audit.LogAuthzDeniedOwnership(p.logger, auditID, auditOwner, "image", truncID(resolvedID), authz.ActionTag)
-		http.Error(w,
-			fmt.Sprintf("image '%s' belongs to '%s'(uid=%d); only the owner or root can tag it",
-				truncID(resolvedID), owner.Username, owner.UID),
-			http.StatusForbidden)
+		writeDockerNotFound(w, "image", resolvedID)
 		return false
 	}
 	return true
@@ -1185,10 +1171,7 @@ func (p *ProxyServer) checkImagePushPermission(w http.ResponseWriter, r *http.Re
 		auditID := toAuditIdentity(id)
 		auditOwner := &audit.OwnerInfo{Username: owner.Username, UID: owner.UID, GID: owner.GID}
 		audit.LogAuthzDeniedOwnership(p.logger, auditID, auditOwner, "image", truncID(resolvedID), authz.ActionPush)
-		http.Error(w,
-			fmt.Sprintf("image '%s' belongs to '%s'(uid=%d); only the owner or root can push it",
-				truncID(resolvedID), owner.Username, owner.UID),
-			http.StatusForbidden)
+		writeDockerNotFound(w, "image", resolvedID)
 		return false
 	}
 	return true
@@ -2319,9 +2302,7 @@ func (p *ProxyServer) checkContainerOwnershipByLabel(w http.ResponseWriter, id *
 			AuthSource: string(id.AuthSource), Action: action, Result: "deny",
 			DenyReason: "container_not_found", ContainerID: truncID(containerID), StatusCode: http.StatusForbidden,
 		})
-		http.Error(w,
-			fmt.Sprintf("container '%s' not found or not accessible", truncID(containerID)),
-			http.StatusForbidden)
+		writeDockerNotFound(w, "container", containerID)
 		return false
 	}
 
@@ -2371,11 +2352,25 @@ func (p *ProxyServer) checkContainerOwnershipByLabel(w http.ResponseWriter, id *
 		AuthSource: string(id.AuthSource), Action: action, Result: "deny",
 		DenyReason: "container_not_owned_label", ContainerID: truncID(containerID), StatusCode: http.StatusForbidden,
 	})
-	http.Error(w,
-		fmt.Sprintf("container '%s' is not owned by '%s'(uid=%d)",
-			truncID(containerID), id.RealUsername, id.RealUID),
-		http.StatusForbidden)
+	writeDockerNotFound(w, "container", containerID)
 	return false
+}
+
+// writeDockerNotFound 以 Docker daemon 标准 404 JSON 格式响应，
+// 避免向调用方泄露资源归属信息（统一伪装成"不存在"）。
+func writeDockerNotFound(w http.ResponseWriter, kind, name string) {
+	var msg string
+	switch kind {
+	case "volume":
+		msg = fmt.Sprintf("get %s: no such volume", name)
+	case "image":
+		msg = fmt.Sprintf("No such image: %s", name)
+	default:
+		msg = fmt.Sprintf("No such container: %s", name)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusNotFound)
+	_, _ = fmt.Fprintf(w, `{"message":%q}`, msg)
 }
 
 // resolveImageIDByRef 查询 dockerd 获取镜像的真实内容 ID
@@ -2856,6 +2851,10 @@ func (p *ProxyServer) checkCreateContainerNetworks(w http.ResponseWriter, r *htt
 	bridgeName := isolation.UserBridgeName(id.RealUID)
 
 	for _, netName := range networks {
+		// 跳过 Docker 默认网络名（不带 --network 时 CLI 自动填入，由 InjectUserNetwork 覆盖）
+		if netName == "default" || netName == "bridge" || netName == "host" || netName == "none" {
+			continue
+		}
 		// 跳过用户自己的专属 bridge 网络（由 InjectUserNetwork 注入，始终允许）
 		if netName == bridgeName {
 			continue

@@ -306,7 +306,17 @@ func TestExtractRequestedNetworks_Empty(t *testing.T) {
 	}
 }
 
-func TestExtractRequestedNetworks_SingleNetwork(t *testing.T) {
+func TestExtractRequestedNetworks_NetworkMode(t *testing.T) {
+	// Docker CLI 28+ 将 --network 放在 HostConfig.NetworkMode
+	body := []byte(`{"Image":"nginx:alpine","HostConfig":{"NetworkMode":"alice-net"},"NetworkingConfig":{"EndpointsConfig":{}}}`)
+	nets := ExtractRequestedNetworks(body)
+	if len(nets) != 1 || nets[0] != "alice-net" {
+		t.Errorf("expected [alice-net], got %v", nets)
+	}
+}
+
+func TestExtractRequestedNetworks_EndpointsConfig(t *testing.T) {
+	// 旧版 Docker CLI 将 --network 放在 NetworkingConfig.EndpointsConfig
 	body := []byte(`{"Image":"nginx:alpine","NetworkingConfig":{"EndpointsConfig":{"alice-net":{}}}}`)
 	nets := ExtractRequestedNetworks(body)
 	if len(nets) != 1 || nets[0] != "alice-net" {
@@ -314,11 +324,12 @@ func TestExtractRequestedNetworks_SingleNetwork(t *testing.T) {
 	}
 }
 
-func TestExtractRequestedNetworks_MultipleNetworks(t *testing.T) {
-	body := []byte(`{"Image":"nginx:alpine","NetworkingConfig":{"EndpointsConfig":{"net-a":{},"net-b":{}}}}`)
+func TestExtractRequestedNetworks_BothDeduped(t *testing.T) {
+	// 两处都有同一个网络名，去重后只返回一个
+	body := []byte(`{"HostConfig":{"NetworkMode":"alice-net"},"NetworkingConfig":{"EndpointsConfig":{"alice-net":{}}}}`)
 	nets := ExtractRequestedNetworks(body)
-	if len(nets) != 2 {
-		t.Errorf("expected 2 networks, got %v", nets)
+	if len(nets) != 1 {
+		t.Errorf("expected 1 network after dedup, got %v", nets)
 	}
 }
 

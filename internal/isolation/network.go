@@ -239,11 +239,14 @@ func RewriteContainerInNetworkBody(body []byte, uid int) []byte {
 	return result
 }
 
-// ExtractRequestedNetworks 从容器创建请求体中提取用户显式指定的网络名列表
-// 来源：NetworkingConfig.EndpointsConfig 的 key（docker run --network 传入的值）
-// 不包含 HostConfig.NetworkMode，因为该字段会被 InjectUserNetwork 强制覆盖
+// ExtractRequestedNetworks 从容器创建请求体中提取用户显式指定的网络名列表。
+// Docker CLI 28+ 将 --network 放在 HostConfig.NetworkMode，旧版本放在 NetworkingConfig.EndpointsConfig。
+// 两处都检查，去重后返回。
 func ExtractRequestedNetworks(body []byte) []string {
 	var req struct {
+		HostConfig struct {
+			NetworkMode string `json:"NetworkMode"`
+		} `json:"HostConfig"`
 		NetworkingConfig struct {
 			EndpointsConfig map[string]json.RawMessage `json:"EndpointsConfig"`
 		} `json:"NetworkingConfig"`
@@ -251,9 +254,17 @@ func ExtractRequestedNetworks(body []byte) []string {
 	if err := json.Unmarshal(body, &req); err != nil {
 		return nil
 	}
+	seen := make(map[string]bool)
 	var names []string
+	if req.HostConfig.NetworkMode != "" {
+		seen[req.HostConfig.NetworkMode] = true
+		names = append(names, req.HostConfig.NetworkMode)
+	}
 	for name := range req.NetworkingConfig.EndpointsConfig {
-		names = append(names, name)
+		if !seen[name] {
+			seen[name] = true
+			names = append(names, name)
+		}
 	}
 	return names
 }
