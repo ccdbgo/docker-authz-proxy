@@ -241,6 +241,65 @@ func TestFilterNetworkListResponse_UserSeesOwnNetworks(t *testing.T) {
 	}
 }
 
+// 场景：用户应能看到自己的专属 bridge 网络（user-{uid}-bridge），
+// 该网络名不带用户前缀，只能通过 DB 归属匹配。
+// 若 DB 中无记录，该网络会被过滤掉——这是已知 bug 的验证测试。
+func TestFilterNetworkListResponse_UserBridgeVisible(t *testing.T) {
+	db := newFilterTestDB(t)
+
+	bridgeName := "user-1001-bridge"
+	bridgeID := "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+
+	// 模拟 ensureUserBridge 调用 SetManagedNetworkOwner 写入 DB
+	if err := db.SetManagedNetworkOwner(bridgeID, bridgeName, 1001, "alice"); err != nil {
+		t.Fatalf("SetManagedNetworkOwner: %v", err)
+	}
+
+	body := mustMarshalFilter(t, []map[string]interface{}{
+		{"Id": bridgeID, "Name": bridgeName},
+		{"Id": "other-net-id-000000000000000000000000000000000000000000000000000", "Name": "bob_u1002_mynet"},
+	})
+
+	filtered, err := FilterNetworkListResponse(body, 1001, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result []map[string]interface{}
+	_ = json.Unmarshal(filtered, &result)
+	if len(result) != 1 {
+		t.Errorf("alice should see her bridge network, got %d networks (want 1)", len(result))
+	}
+	if len(result) == 1 {
+		if result[0]["Name"] != bridgeName {
+			t.Errorf("network name = %q, want %q", result[0]["Name"], bridgeName)
+		}
+	}
+}
+
+// 场景：DB 中无记录时，user-{uid}-bridge 不应出现在列表（验证过滤严格性）
+func TestFilterNetworkListResponse_UserBridgeHiddenWithoutDB(t *testing.T) {
+	db := newFilterTestDB(t)
+	// 不写 DB，模拟 ensureUserBridge 未执行或 DB 丢失的情况
+
+	bridgeName := "user-1001-bridge"
+	bridgeID := "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+
+	body := mustMarshalFilter(t, []map[string]interface{}{
+		{"Id": bridgeID, "Name": bridgeName},
+	})
+
+	filtered, err := FilterNetworkListResponse(body, 1001, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result []map[string]interface{}
+	_ = json.Unmarshal(filtered, &result)
+	// DB 无记录时，bridge 网络不可见——这是当前行为，也是 bug 的根因
+	if len(result) != 0 {
+		t.Errorf("bridge without DB record should be hidden, got %d networks", len(result))
+	}
+}
+
 // 场景：FilterNetworkListResponse 无效 JSON 返回错误
 func TestFilterNetworkListResponse_InvalidJSON(t *testing.T) {
 	db := newFilterTestDB(t)

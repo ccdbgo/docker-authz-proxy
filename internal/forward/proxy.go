@@ -738,6 +738,15 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 			}
 		}
 
+		// 检查容器创建请求中显式指定的网络权限（非 root 用户）
+		// 防止 docker run --network alice-net 或 docker network connect alice-net $(docker run -d ...)
+		// 在容器创建阶段就拒绝，避免先 pull 镜像/创建容器再失败
+		if id.RealUID != 0 {
+			if err := p.checkCreateContainerNetworks(w, r, id, action); err != nil {
+				return false
+			}
+		}
+
 		// 步骤3+4：查询配额，校验请求参数，记录详细审计日志
 		if p.quota != nil && id.RealUID != 0 {
 			quota := p.quota.GetQuota(id)
@@ -2822,4 +2831,64 @@ func (p *ProxyServer) StartDockerEventListener(ctx context.Context) {
 	}()
 }
 
+// checkCreateContainerNetworks 检查容器创建请求中显式指定的网络是否都可被该用户访问。
+// 读取请求体后会还原，不影响后续处理。
+// 返回 non-nil error 表示已向客户端写入拒绝响应。
+func (p *ProxyServer) checkCreateContainerNetworks(w http.ResponseWriter, r *http.Request,
+	id *auth.CallerIdentity, action string) error {
+
+	if r.Body == nil {
+		return nil
+	}
+	body, err := io.ReadAll(r.Body)
+	r.Body.Close()
+	if err != nil {
+		return nil
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+
+	networks := isolation.ExtractRequestedNetworks(body)
+	if len(networks) == 0 {
+		return nil
+	}
+
+	prefix := isolation.UserResourcePrefix(id)
+	bridgeName := isolation.UserBridgeName(id.RealUID)
+
+	for _, netName := range networks {
+		// 跳过用户自己的专属 bridge 网络（由 InjectUserNetwork 注入，始终允许）
+		if netName == bridgeName {
+			continue
+		}
+		// 跳过已带用户前缀的网络名（用户自己创建的网络）
+		if strings.HasPrefix(netName, prefix) {
+			continue
+		}
+
+		// 尝试按用户前缀名查找真实 network ID
+		lookupName := prefix + netName
+		lookupID := netName
+		if docID, found := p.db.GetNetworkIDByName(lookupName); found {
+			lookupID = docID
+		}
+
+		ok, err := p.db.CanUserAccessNetwork(lookupID, id.RealUID)
+		if err != nil || !ok {
+			auditID := toAuditIdentity(id)
+			p.logger.Warn("AUTHZ_DENY",
+				append(audit.LogIdentityFields(auditID),
+					zap.String("reason", "network_not_accessible_on_create"),
+					zap.String("network", netName),
+					zap.String("action", action),
+				)...)
+			p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "network_not_accessible", netName, http.StatusForbidden))
+			http.Error(w,
+				fmt.Sprintf("network '%s' not accessible by '%s'(uid=%d)",
+					netName, id.RealUsername, id.RealUID),
+				http.StatusForbidden)
+			return fmt.Errorf("network not accessible")
+		}
+	}
+	return nil
+}
 

@@ -296,6 +296,39 @@ func TestFilterImageListResponse_NotInDB(t *testing.T) {
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
+// ── ExtractRequestedNetworks ──────────────────────────────────────────────────
+
+func TestExtractRequestedNetworks_Empty(t *testing.T) {
+	body := []byte(`{"Image":"nginx:alpine"}`)
+	nets := ExtractRequestedNetworks(body)
+	if len(nets) != 0 {
+		t.Errorf("expected no networks, got %v", nets)
+	}
+}
+
+func TestExtractRequestedNetworks_SingleNetwork(t *testing.T) {
+	body := []byte(`{"Image":"nginx:alpine","NetworkingConfig":{"EndpointsConfig":{"alice-net":{}}}}`)
+	nets := ExtractRequestedNetworks(body)
+	if len(nets) != 1 || nets[0] != "alice-net" {
+		t.Errorf("expected [alice-net], got %v", nets)
+	}
+}
+
+func TestExtractRequestedNetworks_MultipleNetworks(t *testing.T) {
+	body := []byte(`{"Image":"nginx:alpine","NetworkingConfig":{"EndpointsConfig":{"net-a":{},"net-b":{}}}}`)
+	nets := ExtractRequestedNetworks(body)
+	if len(nets) != 2 {
+		t.Errorf("expected 2 networks, got %v", nets)
+	}
+}
+
+func TestExtractRequestedNetworks_InvalidJSON(t *testing.T) {
+	nets := ExtractRequestedNetworks([]byte(`not json`))
+	if len(nets) != 0 {
+		t.Errorf("expected no networks on invalid JSON, got %v", nets)
+	}
+}
+
 func mustMarshalFilter(t *testing.T, v interface{}) []byte {
 	t.Helper()
 	b, err := json.Marshal(v)

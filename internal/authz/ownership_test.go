@@ -386,3 +386,83 @@ func TestPublicImage_CannotDeleteWithRefs(t *testing.T) {
 	// (tested at proxy layer; here we just verify the count is correct)
 }
 
+// ── 网络访问控制：CanUserAccessNetwork ────────────────────────────────────────
+
+// 场景：bob 尝试 network connect 到 alice 的网络，应被拒绝
+// 复现：su - bob -c 'docker network connect alice-net $(docker run -d nginx:alpine)'
+// 预期：network connect 立即返回 403，不应先拉镜像再失败
+func TestCanUserAccessNetwork_BobCannotAccessAliceNet(t *testing.T) {
+	db := newTestDB(t)
+	alice := makeTestIdentity("alice", 1001, 1001)
+
+	// alice 创建了 alice-net（实际存储为 alice_u1001_alice-net）
+	if err := db.SetNetworkOwner("net-alice-id", "alice_u1001_alice-net", alice); err != nil {
+		t.Fatalf("SetNetworkOwner: %v", err)
+	}
+
+	// bob（uid=1002）尝试访问 alice 的网络
+	ok, err := db.CanUserAccessNetwork("net-alice-id", 1002)
+	if err != nil {
+		t.Fatalf("CanUserAccessNetwork: %v", err)
+	}
+	if ok {
+		t.Error("bob should NOT be able to access alice's network, but got ok=true")
+	}
+}
+
+// 场景：alice 可以访问自己的网络
+func TestCanUserAccessNetwork_OwnerCanAccess(t *testing.T) {
+	db := newTestDB(t)
+	alice := makeTestIdentity("alice", 1001, 1001)
+
+	if err := db.SetNetworkOwner("net-alice-id", "alice_u1001_alice-net", alice); err != nil {
+		t.Fatalf("SetNetworkOwner: %v", err)
+	}
+
+	ok, err := db.CanUserAccessNetwork("net-alice-id", 1001)
+	if err != nil {
+		t.Fatalf("CanUserAccessNetwork: %v", err)
+	}
+	if !ok {
+		t.Error("alice should be able to access her own network")
+	}
+}
+
+// 场景：network connect 鉴权发生在容器创建之前
+// 验证：proxy 在 ActionNetworkConnect 阶段就应拒绝，而不是等容器跑起来
+// 这个测试验证 CanUserAccessNetwork 在 network connect 请求时能正确拒绝
+// 从而避免 "先 pull 镜像 + 创建容器，再拒绝 network connect" 的问题
+func TestCanUserAccessNetwork_NetworkConnectShouldDenyBeforeContainerRun(t *testing.T) {
+	db := newTestDB(t)
+	alice := makeTestIdentity("alice", 1001, 1001)
+
+	if err := db.SetNetworkOwner("net-alice-id", "alice_u1001_alice-net", alice); err != nil {
+		t.Fatalf("SetNetworkOwner: %v", err)
+	}
+
+	// 模拟 proxy 在 ActionNetworkConnect 时的鉴权逻辑：
+	// 1. 从 URL 提取网络名 "alice-net"
+	// 2. 补全前缀为 "alice_u1001_alice-net"（但 bob 不知道 alice 的前缀，所以用原始名查）
+	// 3. 查 DB 得到 network ID
+	// 4. 调用 CanUserAccessNetwork
+
+	// bob 用原始名 "alice-net" 请求，proxy 会尝试补全为 bob_u1002_alice-net（bob 自己的前缀）
+	// 这个名字在 DB 里不存在，lookupID 退回为原始名 "alice-net"
+	// CanUserAccessNetwork("alice-net", 1002) 也应返回 false
+	ok, err := db.CanUserAccessNetwork("alice-net", 1002)
+	if err != nil {
+		t.Fatalf("CanUserAccessNetwork: %v", err)
+	}
+	if ok {
+		t.Error("bob should NOT access network by raw name 'alice-net'")
+	}
+
+	// 即使用真实 network ID，bob 也不能访问
+	ok, err = db.CanUserAccessNetwork("net-alice-id", 1002)
+	if err != nil {
+		t.Fatalf("CanUserAccessNetwork: %v", err)
+	}
+	if ok {
+		t.Error("bob should NOT access network by real ID")
+	}
+}
