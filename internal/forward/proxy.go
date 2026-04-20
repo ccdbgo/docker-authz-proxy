@@ -793,6 +793,24 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 				return false
 			}
 
+			// named volume 校验与重写：确保用户只能挂载自己的 volume，并补全前缀
+			var volViolation *isolation.NamedVolumeViolation
+			body, volViolation = isolation.ValidateAndRewriteNamedVolumes(body, id.RealUID, p.db)
+			if volViolation != nil {
+				auditID := toAuditIdentity(id)
+				p.logger.Warn("AUTHZ_DENY",
+					append(audit.LogIdentityFields(auditID),
+						zap.String("reason", "volume_not_accessible"),
+						zap.String("volume", volViolation.VolumeName),
+						zap.String("action", action),
+					)...)
+				p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "volume_not_accessible", volViolation.VolumeName, http.StatusInternalServerError))
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = fmt.Fprintf(w, `{"message":%q}`, volViolation.Error())
+				return false
+			}
+
 			// 端口冲突检测（在注入网络前，使用原始请求体）
 			if !p.checkPortConflict(w, r, id, body) {
 				return false
