@@ -147,8 +147,14 @@ func (m *BridgeManager) CreatePeerNetwork(uidA, uidB int) (string, error) {
 	return networkID, nil
 }
 
-// DeletePeerNetwork 删除共享辅助网络
+// DeletePeerNetwork 先断开所有容器再删除共享辅助网络，
+// 避免容器重启时因网络已删除而启动失败。
 func (m *BridgeManager) DeletePeerNetwork(peerNetworkID string) error {
+	// 查出网络里的所有容器并逐一 disconnect
+	containerIDs, _ := m.client.listNetworkContainers(peerNetworkID)
+	for _, cid := range containerIDs {
+		_ = m.client.disconnectContainerFromNetwork(cid, peerNetworkID)
+	}
 	return m.client.deleteNetwork(peerNetworkID)
 }
 
@@ -459,6 +465,28 @@ func (c *dockerClient) listContainersByLabel(labelFilter string) ([]string, erro
 	ids := make([]string, 0, len(containers))
 	for _, c := range containers {
 		ids = append(ids, c.ID)
+	}
+	return ids, nil
+}
+
+func (c *dockerClient) listNetworkContainers(networkID string) ([]string, error) {
+	resp, err := c.http.Get(fmt.Sprintf("http://docker/v1.41/networks/%s", networkID))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, nil
+	}
+	var result struct {
+		Containers map[string]struct{} `json:"Containers"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(result.Containers))
+	for id := range result.Containers {
+		ids = append(ids, id)
 	}
 	return ids, nil
 }
