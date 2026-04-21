@@ -102,13 +102,16 @@ func initSchema(db *sql.DB) error {
 		);
 
 		-- 用户网络互通记录表：记录管理员开启的跨用户网络互通
+		-- container_id_a/b 为空表示用户级互通（双方所有容器），非空表示容器级互通（仅指定容器）
 		CREATE TABLE IF NOT EXISTS network_peers (
-			id             INTEGER PRIMARY KEY AUTOINCREMENT,
-			uid_a          INT  NOT NULL,
-			uid_b          INT  NOT NULL,
+			id              INTEGER PRIMARY KEY AUTOINCREMENT,
+			uid_a           INT  NOT NULL,
+			uid_b           INT  NOT NULL,
 			peer_network_id TEXT NOT NULL,  -- 共享辅助网络 ID
-			created_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
-			UNIQUE(uid_a, uid_b)
+			container_id_a  TEXT NOT NULL DEFAULT '',  -- 用户 A 的容器 ID（空=用户级）
+			container_id_b  TEXT NOT NULL DEFAULT '',  -- 用户 B 的容器 ID（空=用户级）
+			created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(uid_a, uid_b, container_id_a, container_id_b)
 		);
 
 		CREATE INDEX IF NOT EXISTS idx_containers_owner_uid  ON containers(owner_uid);
@@ -138,13 +141,18 @@ func initSchema(db *sql.DB) error {
 		UNIQUE(host_port, protocol)
 	)`)
 	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS network_peers (
-		id             INTEGER PRIMARY KEY AUTOINCREMENT,
-		uid_a          INT  NOT NULL,
-		uid_b          INT  NOT NULL,
+		id              INTEGER PRIMARY KEY AUTOINCREMENT,
+		uid_a           INT  NOT NULL,
+		uid_b           INT  NOT NULL,
 		peer_network_id TEXT NOT NULL,
-		created_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
-		UNIQUE(uid_a, uid_b)
+		container_id_a  TEXT NOT NULL DEFAULT '',
+		container_id_b  TEXT NOT NULL DEFAULT '',
+		created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+		UNIQUE(uid_a, uid_b, container_id_a, container_id_b)
 	)`)
+	// 迁移：为已有 network_peers 表添加容器级互通列
+	_, _ = db.Exec(`ALTER TABLE network_peers ADD COLUMN container_id_a TEXT NOT NULL DEFAULT ''`)
+	_, _ = db.Exec(`ALTER TABLE network_peers ADD COLUMN container_id_b TEXT NOT NULL DEFAULT ''`)
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_port_mappings_container ON port_mappings(container_id)`)
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_port_mappings_owner ON port_mappings(owner_uid)`)
 	return nil
@@ -810,57 +818,121 @@ type NetworkPeerInfo struct {
 	UidA          int
 	UidB          int
 	PeerNetworkID string // 共享辅助网络 ID
+	ContainerIDA  string // 用户 A 的容器 ID（空=用户级互通）
+	ContainerIDB  string // 用户 B 的容器 ID（空=用户级互通）
 }
 
-// AddNetworkPeer 记录两个用户之间的网络互通
-func (o *OwnershipDB) AddNetworkPeer(uidA, uidB int, peerNetworkID string) error {
-	// 规范化顺序（小 uid 在前），保证 UNIQUE 约束有效
+// IsUserLevel 返回 true 表示用户级互通（双方所有容器），false 表示容器级互通
+func (p *NetworkPeerInfo) IsUserLevel() bool {
+	return p.ContainerIDA == "" && p.ContainerIDB == ""
+}
+
+// AddNetworkPeer 记录网络互通。
+// containerIDA/B 为空表示用户级互通（双方所有容器），非空表示容器级互通（仅指定容器）。
+// uid 顺序按小 uid 在前规范化，容器 ID 顺序随 uid 同步交换。
+func (o *OwnershipDB) AddNetworkPeer(uidA, uidB int, peerNetworkID, containerIDA, containerIDB string) error {
 	if uidA > uidB {
 		uidA, uidB = uidB, uidA
+		containerIDA, containerIDB = containerIDB, containerIDA
 	}
 	_, err := o.DB.Exec(
-		`INSERT OR REPLACE INTO network_peers(uid_a, uid_b, peer_network_id, created_at)
-		 VALUES (?, ?, ?, ?)`,
-		uidA, uidB, peerNetworkID, time.Now().UTC(),
+		`INSERT OR REPLACE INTO network_peers(uid_a, uid_b, peer_network_id, container_id_a, container_id_b, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		uidA, uidB, peerNetworkID, containerIDA, containerIDB, time.Now().UTC(),
 	)
 	return err
 }
 
-// RemoveNetworkPeer 删除两个用户之间的网络互通记录
-func (o *OwnershipDB) RemoveNetworkPeer(uidA, uidB int) (string, error) {
+// RemoveNetworkPeer 删除互通记录。
+// containerIDA/B 为空时删除该用户对的所有互通记录（含容器级），非空时只删除指定容器级记录。
+// 返回被删除的所有 peer_network_id 列表。
+func (o *OwnershipDB) RemoveNetworkPeer(uidA, uidB int, containerIDA, containerIDB string) ([]string, error) {
 	if uidA > uidB {
 		uidA, uidB = uidB, uidA
+		containerIDA, containerIDB = containerIDB, containerIDA
 	}
-	var peerNetworkID string
-	_ = o.DB.QueryRow(
-		`SELECT peer_network_id FROM network_peers WHERE uid_a = ? AND uid_b = ?`,
-		uidA, uidB,
-	).Scan(&peerNetworkID)
-	_, err := o.DB.Exec(
-		`DELETE FROM network_peers WHERE uid_a = ? AND uid_b = ?`, uidA, uidB,
-	)
-	return peerNetworkID, err
+	var rows *sql.Rows
+	var err error
+	if containerIDA == "" && containerIDB == "" {
+		// 删除该用户对的全部记录
+		rows, err = o.DB.Query(
+			`SELECT peer_network_id FROM network_peers WHERE uid_a = ? AND uid_b = ?`,
+			uidA, uidB,
+		)
+	} else {
+		rows, err = o.DB.Query(
+			`SELECT peer_network_id FROM network_peers WHERE uid_a = ? AND uid_b = ? AND container_id_a = ? AND container_id_b = ?`,
+			uidA, uidB, containerIDA, containerIDB,
+		)
+	}
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	if containerIDA == "" && containerIDB == "" {
+		_, err = o.DB.Exec(`DELETE FROM network_peers WHERE uid_a = ? AND uid_b = ?`, uidA, uidB)
+	} else {
+		_, err = o.DB.Exec(
+			`DELETE FROM network_peers WHERE uid_a = ? AND uid_b = ? AND container_id_a = ? AND container_id_b = ?`,
+			uidA, uidB, containerIDA, containerIDB,
+		)
+	}
+	return ids, err
 }
 
-// GetNetworkPeer 查询两个用户之间的互通记录
+// GetNetworkPeer 查询用户级互通记录（container_id_a/b 均为空）
 func (o *OwnershipDB) GetNetworkPeer(uidA, uidB int) (*NetworkPeerInfo, bool) {
 	if uidA > uidB {
 		uidA, uidB = uidB, uidA
 	}
 	var info NetworkPeerInfo
 	err := o.DB.QueryRow(
-		`SELECT uid_a, uid_b, peer_network_id FROM network_peers WHERE uid_a = ? AND uid_b = ?`,
+		`SELECT uid_a, uid_b, peer_network_id, container_id_a, container_id_b
+		 FROM network_peers WHERE uid_a = ? AND uid_b = ? AND container_id_a = '' AND container_id_b = ''`,
 		uidA, uidB,
-	).Scan(&info.UidA, &info.UidB, &info.PeerNetworkID)
+	).Scan(&info.UidA, &info.UidB, &info.PeerNetworkID, &info.ContainerIDA, &info.ContainerIDB)
 	if err != nil {
 		return nil, false
 	}
 	return &info, true
 }
 
-// GetAllNetworkPeers 查询所有互通记录（启动时恢复 iptables 规则用）
+// GetContainerPeer 查询容器级互通记录
+func (o *OwnershipDB) GetContainerPeer(uidA, uidB int, containerIDA, containerIDB string) (*NetworkPeerInfo, bool) {
+	if uidA > uidB {
+		uidA, uidB = uidB, uidA
+		containerIDA, containerIDB = containerIDB, containerIDA
+	}
+	var info NetworkPeerInfo
+	err := o.DB.QueryRow(
+		`SELECT uid_a, uid_b, peer_network_id, container_id_a, container_id_b
+		 FROM network_peers WHERE uid_a = ? AND uid_b = ? AND container_id_a = ? AND container_id_b = ?`,
+		uidA, uidB, containerIDA, containerIDB,
+	).Scan(&info.UidA, &info.UidB, &info.PeerNetworkID, &info.ContainerIDA, &info.ContainerIDB)
+	if err != nil {
+		return nil, false
+	}
+	return &info, true
+}
+
+// GetAllNetworkPeers 查询所有互通记录
 func (o *OwnershipDB) GetAllNetworkPeers() ([]NetworkPeerInfo, error) {
-	rows, err := o.DB.Query(`SELECT uid_a, uid_b, peer_network_id FROM network_peers`)
+	rows, err := o.DB.Query(
+		`SELECT uid_a, uid_b, peer_network_id, container_id_a, container_id_b FROM network_peers`,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -868,7 +940,51 @@ func (o *OwnershipDB) GetAllNetworkPeers() ([]NetworkPeerInfo, error) {
 	var result []NetworkPeerInfo
 	for rows.Next() {
 		var info NetworkPeerInfo
-		if err := rows.Scan(&info.UidA, &info.UidB, &info.PeerNetworkID); err != nil {
+		if err := rows.Scan(&info.UidA, &info.UidB, &info.PeerNetworkID, &info.ContainerIDA, &info.ContainerIDB); err != nil {
+			return nil, err
+		}
+		result = append(result, info)
+	}
+	return result, rows.Err()
+}
+
+// GetNetworkPeersByContainer 查询包含指定容器 ID 的互通记录（容器级互通过滤）
+func (o *OwnershipDB) GetNetworkPeersByContainer(containerID string) ([]NetworkPeerInfo, error) {
+	rows, err := o.DB.Query(
+		`SELECT uid_a, uid_b, peer_network_id, container_id_a, container_id_b
+		 FROM network_peers WHERE container_id_a = ? OR container_id_b = ?`,
+		containerID, containerID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []NetworkPeerInfo
+	for rows.Next() {
+		var info NetworkPeerInfo
+		if err := rows.Scan(&info.UidA, &info.UidB, &info.PeerNetworkID, &info.ContainerIDA, &info.ContainerIDB); err != nil {
+			return nil, err
+		}
+		result = append(result, info)
+	}
+	return result, rows.Err()
+}
+
+// GetNetworkPeersByUID 查询某用户参与的所有互通记录（含用户级和容器级）
+func (o *OwnershipDB) GetNetworkPeersByUID(uid int) ([]NetworkPeerInfo, error) {
+	rows, err := o.DB.Query(
+		`SELECT uid_a, uid_b, peer_network_id, container_id_a, container_id_b
+		 FROM network_peers WHERE uid_a = ? OR uid_b = ?`,
+		uid, uid,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []NetworkPeerInfo
+	for rows.Next() {
+		var info NetworkPeerInfo
+		if err := rows.Scan(&info.UidA, &info.UidB, &info.PeerNetworkID, &info.ContainerIDA, &info.ContainerIDB); err != nil {
 			return nil, err
 		}
 		result = append(result, info)

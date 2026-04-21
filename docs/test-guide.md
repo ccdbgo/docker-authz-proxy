@@ -575,3 +575,245 @@ ok  docker-authz-proxy/internal/isolation  1.705s
 | forward | 15.8% | 27.3% | +11.5% |
 | **总计** | **~29%** | **32.6%** | **+3.6%** |
 
+---
+
+### 7.6 跨用户网络互通（NetworkPeer）测试（2025-07）
+
+**文件：** `internal/forward/network_peer_test.go`
+
+**执行命令：**
+
+```bash
+go test ./internal/forward/ -run 'TestNetworkPeer' -v -count=1
+```
+
+**测试前提与辅助函数：**
+
+- alice uid=1001，bob uid=1002，charlie uid=1003
+- 共享辅助网络 ID 常量：`peer-net-id-001`
+- `setupPeer(t, p)` — 在 DB 中预置 alice↔bob 互通记录，步骤：
+  1. `db.AddNetworkPeer(1001, 1002, "peer-net-id-001")` — 写入 peer 记录
+  2. `db.SetManagedNetworkOwner("peer-net-id-001", "peer-1001-1002", 1001, "alice")` — 注册辅助网络归属
+  3. `db.SetNetworkShared("peer-net-id-001", []int{1001, 1002})` — 授权双方访问
+
+> **注意：** 单元测试绕过 `BridgeManager`（其内部 `dockerClient` 硬编码 Unix socket，无法被 fake upstream 拦截）。`connectContainerToPeerNetworks` + `EnsureUserBridge` 的完整链路需在真实 Docker 环境中端到端验证。
+
+#### 用例列表
+
+| 用例 | 函数名 | 验证点 |
+|------|--------|--------|
+| 互通前 bob 无法访问 alice 网络 | `TestNetworkPeer_BeforeAllow_BobCannotInspectAliceNetwork` | GET /networks/alice-net-id/json → 404 |
+| 互通后 bob 可访问共享辅助网络 | `TestNetworkPeer_AfterAllow_BobCanInspectPeerNetwork` | GET /networks/peer-net-id-001/json → 200 |
+| 互通后 alice 可访问共享辅助网络 | `TestNetworkPeer_AfterAllow_AliceCanInspectPeerNetwork` | GET /networks/peer-net-id-001/json → 200 |
+| peer 记录对新容器可见（DB 层） | `TestNetworkPeer_AfterAllow_PeerRecordVisibleForNewContainer` | `GetAllNetworkPeers` 返回 1 条，uid_a/uid_b 包含 alice 和 bob |
+| 撤销互通后 bob 无法访问辅助网络 | `TestNetworkPeer_AfterDeny_BobCannotAccessPeerNetwork` | RemoveNetworkPeer + DeleteNetwork 后 → 404 |
+| AddNetworkPeer 幂等 | `TestNetworkPeer_AddPeer_Idempotent` | 重复调用不报 unique constraint 错误，peer 记录存在 |
+| 第三方用户 charlie 不受影响 | `TestNetworkPeer_ThirdUser_CannotAccessPeerNetwork` | charlie GET /networks/peer-net-id-001/json → 404 |
+| 互通后 bob 可 connect 容器到辅助网络 | `TestNetworkPeer_NetworkConnect_AllowedAfterPeer` | POST /networks/peer-net-id-001/connect → 200 |
+| 互通前 bob 无法 connect 到辅助网络 | `TestNetworkPeer_NetworkConnect_DeniedBeforePeer` | POST /networks/peer-net-id-001/connect → 404 |
+
+#### 详细测试步骤
+
+---
+
+**用例 1：互通前 bob 无法访问 alice 的私有网络**
+
+```
+前置条件：
+  - alice 拥有私有网络 alice-net-id（通过 db.SetNetworkOwner 注册）
+  - 未调用 setupPeer，alice↔bob 互通未配置
+
+测试步骤：
+  1. 创建 fake upstream（返回 200）
+  2. 创建 ProxyServer（newTestProxy）
+  3. 调用 db.SetNetworkOwner("alice-net-id", "alice_u1001_mynet", aliceID) 注册 alice 的私有网络
+  4. 构造 GET /networks/alice-net-id/json 请求，注入 bob 身份（uid=1002）
+  5. 调用 p.ServeHTTP
+
+期望结果：HTTP 404（bob 未被授权访问 alice 的私有网络）
+```
+
+---
+
+**用例 2：互通后 bob 可访问共享辅助网络**
+
+```
+前置条件：
+  - 调用 setupPeer 预置 alice↔bob 互通记录及辅助网络归属
+
+测试步骤：
+  1. 创建 fake upstream（返回 200，body: {"Id":"peer-net-id-001","Name":"peer-1001-1002"}）
+  2. 创建 ProxyServer，调用 setupPeer
+  3. 构造 GET /networks/peer-net-id-001/json 请求，注入 bob 身份（uid=1002）
+  4. 调用 p.ServeHTTP
+
+期望结果：HTTP 200（bob 在共享网络访问列表中）
+```
+
+---
+
+**用例 3：互通后 alice 可访问共享辅助网络**
+
+```
+前置条件：
+  - 调用 setupPeer 预置 alice↔bob 互通记录及辅助网络归属
+
+测试步骤：
+  1. 创建 fake upstream（返回 200）
+  2. 创建 ProxyServer，调用 setupPeer
+  3. 构造 GET /networks/peer-net-id-001/json 请求，注入 alice 身份（uid=1001）
+  4. 调用 p.ServeHTTP
+
+期望结果：HTTP 200（alice 是辅助网络的 owner，同样在访问列表中）
+```
+
+---
+
+**用例 4：peer 记录对新容器可见（DB 层验证）**
+
+```
+前置条件：
+  - 调用 setupPeer 预置 alice↔bob 互通记录
+
+测试步骤：
+  1. 创建 ProxyServer，调用 setupPeer
+  2. 直接调用 p.db.GetAllNetworkPeers()
+  3. 验证返回列表长度为 1
+  4. 验证 peer.PeerNetworkID == "peer-net-id-001"
+  5. 验证 peer.UidA 或 peer.UidB 包含 alice uid（1001）
+  6. 验证 peer.UidA 或 peer.UidB 包含 bob uid（1002）
+
+期望结果：返回 1 条 peer 记录，uid_a/uid_b 正确包含双方 UID
+说明：此用例直接测试 DB 层，不经过 ServeHTTP，避免触发 BridgeManager 的 Unix socket 依赖
+```
+
+---
+
+**用例 5：撤销互通后 bob 无法再访问辅助网络**
+
+```
+前置条件：
+  - 调用 setupPeer 预置 alice↔bob 互通记录
+
+测试步骤：
+  1. 创建 ProxyServer，调用 setupPeer
+  2. 调用 db.RemoveNetworkPeer(1001, 1002) — 删除 peer 记录
+  3. 调用 db.DeleteNetwork("peer-net-id-001") — 删除辅助网络及所有访问权限
+  4. 构造 GET /networks/peer-net-id-001/json 请求，注入 bob 身份（uid=1002）
+  5. 调用 p.ServeHTTP
+
+期望结果：HTTP 404（互通撤销后 bob 无法访问辅助网络）
+注意：必须调用 DeleteNetwork 而非 SetNetworkShared([]int{})，因为 SetNetworkShared 只做
+      INSERT OR IGNORE，不删除已有的 network_access 行
+```
+
+---
+
+**用例 6：AddNetworkPeer 幂等性**
+
+```
+前置条件：无
+
+测试步骤：
+  1. 创建 ProxyServer
+  2. 第一次调用 db.AddNetworkPeer(1001, 1002, "peer-net-id-001")，期望无错误
+  3. 第二次调用 db.AddNetworkPeer(1001, 1002, "peer-net-id-001")，期望无错误（不报 unique constraint）
+  4. 调用 db.GetNetworkPeer(1001, 1002)，验证 exists=true
+
+期望结果：两次调用均成功，peer 记录存在且唯一
+```
+
+---
+
+**用例 7：第三方用户 charlie 不受 alice↔bob 互通影响**
+
+```
+前置条件：
+  - 调用 setupPeer 预置 alice↔bob 互通记录
+
+测试步骤：
+  1. 创建 ProxyServer，调用 setupPeer
+  2. 构造 GET /networks/peer-net-id-001/json 请求，注入 charlie 身份（uid=1003）
+  3. 调用 p.ServeHTTP
+
+期望结果：HTTP 404（charlie 不在 alice↔bob 的共享网络访问列表中）
+```
+
+---
+
+**用例 8：互通后 bob 可将自己的容器连接到辅助网络**
+
+```
+前置条件：
+  - 调用 setupPeer 预置 alice↔bob 互通记录
+  - bob 拥有容器 bob-cont-x（通过 db.SetContainerOwner 注册）
+
+测试步骤：
+  1. 创建 fake upstream（返回 200）
+  2. 创建 ProxyServer，调用 setupPeer
+  3. 调用 db.SetContainerOwner("bob-cont-x", bobID, "") 注册 bob 的容器
+  4. 构造 POST /networks/peer-net-id-001/connect 请求
+     body: {"Container": "bob-cont-x"}
+     Content-Type: application/json
+     注入 bob 身份（uid=1002）
+  5. 调用 p.ServeHTTP
+
+期望结果：HTTP 200（bob 可将自己的容器连接到已授权的辅助网络）
+```
+
+---
+
+**用例 9：互通前 bob 无法将容器连接到辅助网络**
+
+```
+前置条件：
+  - 未调用 setupPeer，互通未配置
+
+测试步骤：
+  1. 创建 fake upstream（返回 200）
+  2. 创建 ProxyServer（不调用 setupPeer）
+  3. 构造 POST /networks/peer-net-id-001/connect 请求
+     body: {"Container": "bob-cont-y"}
+     Content-Type: application/json
+     注入 bob 身份（uid=1002）
+  4. 调用 p.ServeHTTP
+
+期望结果：HTTP 404（辅助网络不在 bob 的可访问网络列表中）
+```
+
+#### 执行结果（192.168.2.7，2025-07）
+
+```
+=== RUN   TestNetworkPeer_BeforeAllow_BobCannotInspectAliceNetwork
+--- PASS: TestNetworkPeer_BeforeAllow_BobCannotInspectAliceNetwork (0.00s)
+=== RUN   TestNetworkPeer_AfterAllow_BobCanInspectPeerNetwork
+--- PASS: TestNetworkPeer_AfterAllow_BobCanInspectPeerNetwork (0.00s)
+=== RUN   TestNetworkPeer_AfterAllow_AliceCanInspectPeerNetwork
+--- PASS: TestNetworkPeer_AfterAllow_AliceCanInspectPeerNetwork (0.00s)
+=== RUN   TestNetworkPeer_AfterAllow_PeerRecordVisibleForNewContainer
+--- PASS: TestNetworkPeer_AfterAllow_PeerRecordVisibleForNewContainer (0.00s)
+=== RUN   TestNetworkPeer_AfterDeny_BobCannotAccessPeerNetwork
+--- PASS: TestNetworkPeer_AfterDeny_BobCannotAccessPeerNetwork (0.00s)
+=== RUN   TestNetworkPeer_AddPeer_Idempotent
+--- PASS: TestNetworkPeer_AddPeer_Idempotent (0.00s)
+=== RUN   TestNetworkPeer_ThirdUser_CannotAccessPeerNetwork
+--- PASS: TestNetworkPeer_ThirdUser_CannotAccessPeerNetwork (0.00s)
+=== RUN   TestNetworkPeer_NetworkConnect_AllowedAfterPeer
+--- PASS: TestNetworkPeer_NetworkConnect_AllowedAfterPeer (0.00s)
+=== RUN   TestNetworkPeer_NetworkConnect_DeniedBeforePeer
+--- PASS: TestNetworkPeer_NetworkConnect_DeniedBeforePeer (0.00s)
+PASS
+ok  docker-authz-proxy/internal/forward
+```
+
+全部 9 个用例 PASS。
+
+#### 关键行为发现
+
+| 行为 | 说明 |
+|------|------|
+| `SetNetworkShared` 只增不删 | 底层为 `INSERT OR IGNORE`，撤销访问必须调用 `DeleteNetwork` 删除 `network_access` 行 |
+| `BridgeManager` 不可在单元测试中 mock | 其内部 `dockerClient` 硬编码 Unix socket transport，fake upstream 无法拦截；`connectContainerToPeerNetworks` 的完整链路需端到端测试 |
+| peer 记录方向无关 | `GetNetworkPeer(uidA, uidB)` 与 `GetNetworkPeer(uidB, uidA)` 均能找到同一条记录 |
+| 辅助网络命名约定 | `peer-{min_uid}-{max_uid}`，较小 uid 在前 |
+

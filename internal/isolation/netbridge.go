@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os/exec"
 	"strings"
 	"time"
@@ -164,7 +165,7 @@ func (m *BridgeManager) DisconnectContainerFromPeerNetwork(containerID, peerNetw
 // GetContainersByOwner 查询用户的所有运行中容器 ID
 func (m *BridgeManager) GetContainersByOwner(uid int) ([]string, error) {
 	return m.client.listContainersByLabel(
-		fmt.Sprintf("docker-authz-proxy.owner_uid=%d", uid),
+		fmt.Sprintf("%s=%d", LabelOwnerUID, uid),
 	)
 }
 
@@ -443,7 +444,8 @@ func (c *dockerClient) listContainersByLabel(labelFilter string) ([]string, erro
 		"label": {labelFilter},
 	})
 	resp, err := c.http.Get(
-		fmt.Sprintf("http://docker/v1.41/containers/json?all=true&filters=%s", filterJSON))
+		fmt.Sprintf("http://docker/v1.41/containers/json?all=true&filters=%s",
+			url.QueryEscape(string(filterJSON))))
 	if err != nil {
 		return nil, err
 	}

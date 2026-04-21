@@ -56,6 +56,10 @@ go build -o docker-authz-proxy . || {
     log_error "编译失败"
     exit 1
 }
+go build -o docker-authz-proxy-ctl ./cmd/ctl/ || {
+    log_error "编译 ctl 失败"
+    exit 1
+}
 log_info "编译成功"
 
 # 步骤 2: 停止现有服务（如果存在）
@@ -76,6 +80,8 @@ chmod 755 "$SOCKET_DIR"
 log_info "步骤 4/6: 安装二进制文件..."
 cp docker-authz-proxy "$INSTALL_BIN"
 chmod 755 "$INSTALL_BIN"
+cp docker-authz-proxy-ctl /usr/local/bin/docker-authz-proxy-ctl
+chmod 755 /usr/local/bin/docker-authz-proxy-ctl
 
 # 步骤 5: 安装配置文件
 log_info "步骤 5/6: 安装配置文件..."

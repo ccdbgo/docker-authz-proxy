@@ -2047,51 +2047,106 @@ func (p *ProxyServer) handleHijack(w http.ResponseWriter, r *http.Request, id *a
 		fmt.Fprintf(clientConn, "HTTP/1.1 502 Bad Gateway\r\n\r\nread upstream status failed: %s", err.Error())
 		return
 	}
-	if _, err := clientConn.Write([]byte(statusLine)); err != nil {
-		p.logger.Error("write_status_to_client_failed", zap.Error(err))
-		return
-	}
 
 	// 判断是否真正升级为双向流（101）；exec 非 TTY 时 dockerd 返回 200
 	is101 := strings.HasPrefix(statusLine, "HTTP/1.1 101") || strings.HasPrefix(statusLine, "HTTP/1.0 101")
 
+	// 读取并收集所有响应头（直到空行），同时检测 Transfer-Encoding
+	peeked := statusLine
+	isChunked := false
 	for {
 		line, err := upstreamReader.ReadString('\n')
 		if err != nil {
 			p.logger.Error("read_upstream_header_failed", zap.Error(err))
 			return
 		}
-		if _, err := clientConn.Write([]byte(line)); err != nil {
-			p.logger.Error("write_header_to_client_failed", zap.Error(err))
-			return
+		peeked += line
+		if strings.HasPrefix(strings.ToLower(line), "transfer-encoding:") &&
+			strings.Contains(strings.ToLower(line), "chunked") {
+			isChunked = true
 		}
 		if line == "\r\n" || line == "\n" {
 			break
 		}
 	}
 
-	if !is101 {
-		// 非升级响应（如 exec 非 TTY 的 200），直接把响应体透传给客户端即可
-		io.Copy(clientConn, upstreamReader)
+	if !is101 && isChunked {
+		// exec 非 TTY + chunked：dockerd 发 0\r\n\r\n 结束但不关闭 TCP。
+		// 把头部原样转发给客户端（保留 Transfer-Encoding: chunked），
+		// 再把 chunked body 原样透传；当读到终止块 0\r\n\r\n 时停止，避免永久阻塞。
+		if _, err := clientConn.Write([]byte(peeked)); err != nil {
+			return
+		}
+		// 逐 chunk 读取并转发，直到终止块
+		for {
+			// 读 chunk size 行
+			sizeLine, err := upstreamReader.ReadString('\n')
+			if err != nil {
+				return
+			}
+			clientConn.Write([]byte(sizeLine))
+			// 解析 chunk size（十六进制，可能带扩展）
+			sizeStr := strings.TrimSpace(strings.SplitN(sizeLine, ";", 2)[0])
+			size, err := strconv.ParseInt(sizeStr, 16, 64)
+			if err != nil {
+				return
+			}
+			if size == 0 {
+				// 终止块：读并转发剩余的 \r\n
+				trailer, _ := upstreamReader.ReadString('\n')
+				clientConn.Write([]byte(trailer))
+				return
+			}
+			// 读 chunk data + \r\n
+			buf := make([]byte, size+2)
+			if _, err := io.ReadFull(upstreamReader, buf); err != nil {
+				return
+			}
+			clientConn.Write(buf)
+		}
+	}
+
+	// 101 升级 或 非 chunked 的 200（raw-stream）：
+	// 先把已收集的头部发给客户端，再双向透传直到任意一端关闭。
+	if _, err := clientConn.Write([]byte(peeked)); err != nil {
+		p.logger.Error("write_status_to_client_failed", zap.Error(err))
 		return
 	}
 
-	done := make(chan struct{}, 2)
+	upstreamDone := make(chan struct{})
+	clientDone := make(chan struct{})
 	go func() {
 		io.Copy(upstreamConn, clientConn)
-		// 客户端输入结束，半关闭写端让上游知道不再有输入
+		// 客户端→上游方向结束：半关闭上游写端，通知上游不再有输入
 		type closeWriter interface{ CloseWrite() error }
 		if cw, ok := upstreamConn.(closeWriter); ok {
 			cw.CloseWrite()
 		}
-		done <- struct{}{}
+		close(clientDone)
 	}()
 	go func() {
 		io.Copy(clientConn, upstreamReader)
-		done <- struct{}{}
+		close(upstreamDone)
 	}()
-	<-done
-	<-done
+	// 优先等待上游→客户端方向结束（exec 输出完毕）；
+	// 若客户端先断开（TTY Ctrl+C 等），也能正常退出。
+	select {
+	case <-upstreamDone:
+		// 上游输出完毕，关闭客户端连接
+		clientConn.Close()
+		upstreamConn.Close()
+		<-clientDone
+	case <-clientDone:
+		// 客户端→上游方向结束（无 stdin 或 TTY 退出）；
+		// 半关闭上游写端（不关闭读端），等上游把剩余输出发完再关闭。
+		type closeWriter interface{ CloseWrite() error }
+		if cw, ok := upstreamConn.(closeWriter); ok {
+			cw.CloseWrite()
+		}
+		<-upstreamDone
+		clientConn.Close()
+		upstreamConn.Close()
+	}
 
 	p.logger.Debug("hijack_done",
 		zap.String("user", fmt.Sprintf("%s(uid=%d)", id.RealUsername, id.RealUID)),
@@ -2683,74 +2738,118 @@ func (p *ProxyServer) checkPortConflict(w http.ResponseWriter, r *http.Request,
 	return true
 }
 
+// PeerOptions 配置网络互通的选项
+type PeerOptions struct {
+	// ContainerIDA/B 非空时为容器级互通，只有这两个容器可以互通；
+	// 为空时为用户级互通，双方所有容器（含未来新建容器）均可互通。
+	ContainerIDA string // 用户 A 的容器 ID（完整 ID 或短 ID）
+	ContainerIDB string // 用户 B 的容器 ID（完整 ID 或短 ID）
+}
+
 // AllowNetworkPeer 开启两个用户之间的网络互通（管理员调用）
-// 实现：创建共享辅助网络，将双方已有容器连接到辅助网络，记录到 DB
-func (p *ProxyServer) AllowNetworkPeer(uidA, uidB int) error {
-	// 检查是否已经互通
-	if _, exists := p.db.GetNetworkPeer(uidA, uidB); exists {
-		return nil // 幂等
+//
+// opts.ContainerIDA/B 均为空 → 用户级互通：双方所有已有容器接入辅助网络，新容器创建时自动接入。
+// opts.ContainerIDA/B 均非空 → 容器级互通：只将指定的两个容器接入辅助网络，其他容器不受影响，
+//
+//	新容器创建时也不会自动接入。
+func (p *ProxyServer) AllowNetworkPeer(uidA, uidB int, opts PeerOptions) error {
+	containerLevel := opts.ContainerIDA != "" || opts.ContainerIDB != ""
+
+	if containerLevel {
+		// 容器级：两个容器 ID 必须同时指定
+		if opts.ContainerIDA == "" || opts.ContainerIDB == "" {
+			return fmt.Errorf("container-level peer requires both --container-a and --container-b")
+		}
+		// 幂等检查
+		if _, exists := p.db.GetContainerPeer(uidA, uidB, opts.ContainerIDA, opts.ContainerIDB); exists {
+			return nil
+		}
+	} else {
+		// 用户级：幂等检查
+		if _, exists := p.db.GetNetworkPeer(uidA, uidB); exists {
+			return nil
+		}
 	}
 
-	// 创建共享辅助网络
+	// 创建共享辅助网络（用户级和容器级各自独立的辅助网络）
 	peerNetworkID, err := p.bridge.CreatePeerNetwork(uidA, uidB)
 	if err != nil {
 		return fmt.Errorf("create peer network: %w", err)
 	}
 
-	// 将双方已有容器连接到辅助网络
-	for _, uid := range []int{uidA, uidB} {
-		containers, err := p.bridge.GetContainersByOwner(uid)
-		if err != nil {
-			p.logger.Warn("list_containers_for_peer_failed",
-				zap.Int("uid", uid), zap.Error(err))
-			continue
-		}
-		for _, cid := range containers {
+	if containerLevel {
+		// 只连接指定的两个容器
+		for _, cid := range []string{opts.ContainerIDA, opts.ContainerIDB} {
 			if err := p.bridge.ConnectContainerToPeerNetwork(cid, peerNetworkID); err != nil {
 				p.logger.Warn("connect_container_to_peer_failed",
 					zap.String("container", cid[:min(12, len(cid))]),
-					zap.Int("uid", uid),
 					zap.Error(err))
+			}
+		}
+	} else {
+		// 用户级：将双方所有已有容器连接到辅助网络
+		for _, uid := range []int{uidA, uidB} {
+			containers, err := p.bridge.GetContainersByOwner(uid)
+			if err != nil {
+				p.logger.Warn("list_containers_for_peer_failed",
+					zap.Int("uid", uid), zap.Error(err))
+				continue
+			}
+			for _, cid := range containers {
+				if err := p.bridge.ConnectContainerToPeerNetwork(cid, peerNetworkID); err != nil {
+					p.logger.Warn("connect_container_to_peer_failed",
+						zap.String("container", cid[:min(12, len(cid))]),
+						zap.Int("uid", uid),
+						zap.Error(err))
+				}
 			}
 		}
 	}
 
 	// 记录到 DB
-	if err := p.db.AddNetworkPeer(uidA, uidB, peerNetworkID); err != nil {
+	if err := p.db.AddNetworkPeer(uidA, uidB, peerNetworkID, opts.ContainerIDA, opts.ContainerIDB); err != nil {
 		return fmt.Errorf("save peer record: %w", err)
 	}
 
 	p.logger.Info("network_peer_allowed",
 		zap.Int("uid_a", uidA),
 		zap.Int("uid_b", uidB),
-		zap.String("peer_network", isolation.PeerNetworkName(uidA, uidB)),
+		zap.Bool("container_level", containerLevel),
+		zap.String("container_a", opts.ContainerIDA),
+		zap.String("container_b", opts.ContainerIDB),
 		zap.String("peer_network_id", peerNetworkID[:min(12, len(peerNetworkID))]),
 	)
 	return nil
 }
 
-// DenyNetworkPeer 撤销两个用户之间的网络互通，恢复隔离（管理员调用）
-// 实现：删除共享辅助网络（Docker 会自动断开所有容器），从 DB 删除记录
-func (p *ProxyServer) DenyNetworkPeer(uidA, uidB int) error {
-	peerNetworkID, err := p.db.RemoveNetworkPeer(uidA, uidB)
+// DenyNetworkPeer 撤销网络互通，恢复隔离（管理员调用）
+//
+// opts.ContainerIDA/B 均为空 → 删除该用户对的所有互通记录（含容器级），删除所有辅助网络。
+// opts.ContainerIDA/B 均非空 → 只删除指定容器级互通记录，删除对应辅助网络。
+func (p *ProxyServer) DenyNetworkPeer(uidA, uidB int, opts PeerOptions) error {
+	peerNetworkIDs, err := p.db.RemoveNetworkPeer(uidA, uidB, opts.ContainerIDA, opts.ContainerIDB)
 	if err != nil {
 		return fmt.Errorf("remove peer record: %w", err)
 	}
-	if peerNetworkID == "" {
+	if len(peerNetworkIDs) == 0 {
 		return nil // 本来就没有互通
 	}
 
 	// 删除辅助网络（Docker 自动断开所有已连接的容器）
-	if err := p.bridge.DeletePeerNetwork(peerNetworkID); err != nil {
-		p.logger.Warn("delete_peer_network_failed",
-			zap.String("peer_network_id", peerNetworkID[:min(12, len(peerNetworkID))]),
-			zap.Error(err))
+	for _, netID := range peerNetworkIDs {
+		if err := p.bridge.DeletePeerNetwork(netID); err != nil {
+			p.logger.Warn("delete_peer_network_failed",
+				zap.String("peer_network_id", netID[:min(12, len(netID))]),
+				zap.Error(err))
+		}
 	}
 
 	p.logger.Info("network_peer_denied",
 		zap.Int("uid_a", uidA),
 		zap.Int("uid_b", uidB),
-		zap.String("peer_network", isolation.PeerNetworkName(uidA, uidB)),
+		zap.String("container_a", opts.ContainerIDA),
+		zap.String("container_b", opts.ContainerIDB),
+		zap.Int("networks_removed", len(peerNetworkIDs)),
 	)
 	return nil
 }
@@ -2762,14 +2861,16 @@ func min(a, b int) int {
 	return b
 }
 
-// connectContainerToPeerNetworks 将新容器连接到该用户所有已配置的互通辅助网络
+// connectContainerToPeerNetworks 将新容器连接到该用户所有已配置的用户级互通辅助网络。
+// 容器级互通不在此处处理（只有指定容器才接入，新容器不自动加入）。
 func (p *ProxyServer) connectContainerToPeerNetworks(containerID string, uid int) {
-	peers, err := p.db.GetAllNetworkPeers()
+	peers, err := p.db.GetNetworkPeersByUID(uid)
 	if err != nil {
 		return
 	}
 	for _, peer := range peers {
-		if peer.UidA != uid && peer.UidB != uid {
+		// 只处理用户级互通（container_id_a/b 均为空）
+		if !peer.IsUserLevel() {
 			continue
 		}
 		if err := p.bridge.ConnectContainerToPeerNetwork(containerID, peer.PeerNetworkID); err != nil {
