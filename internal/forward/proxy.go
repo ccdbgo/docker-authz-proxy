@@ -26,6 +26,9 @@ import (
 	"go.uber.org/zap"
 )
 
+// ErrPeerNotFound 表示撤销互通时指定的用户对不存在互通记录。
+var ErrPeerNotFound = fmt.Errorf("peer record not found")
+
 // contextKey 用于在 request context 中传递 CallerIdentity
 type contextKey string
 
@@ -2832,7 +2835,7 @@ func (p *ProxyServer) DenyNetworkPeer(uidA, uidB int, opts PeerOptions) error {
 		return fmt.Errorf("remove peer record: %w", err)
 	}
 	if len(peerNetworkIDs) == 0 {
-		return nil // 本来就没有互通
+		return ErrPeerNotFound
 	}
 
 	// 删除辅助网络（Docker 自动断开所有已连接的容器）

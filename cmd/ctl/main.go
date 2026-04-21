@@ -205,6 +205,10 @@ func peerMutate(cmd string, args []string, db *authz.OwnershipDB) error {
 		}
 	case "deny":
 		if err := proxy.DenyNetworkPeer(a, b, opts); err != nil {
+			if err == forward.ErrPeerNotFound {
+				fmt.Fprintf(os.Stderr, "peer not found: uid=%d <-> uid=%d\n", a, b)
+				return nil
+			}
 			return err
 		}
 		if *contA != "" {
