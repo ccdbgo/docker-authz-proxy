@@ -1475,8 +1475,8 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 							)
 						}
 					}
-					// 若该用户有互通配置，将新容器连接到所有辅助网络
-					p.connectContainerToPeerNetworks(containerID, id.RealUID)
+					// 若该用户有互通配置，将新容器连接到所有辅助网络（异步，避免阻塞 handler）
+					go p.connectContainerToPeerNetworks(containerID, id.RealUID)
 				}
 				// 步骤8：记录资源使用情况到审计日志
 				resUsage, _ := r.Context().Value(resourceUsageCtxKey).(map[string]string)
@@ -2869,8 +2869,13 @@ func min(a, b int) int {
 func (p *ProxyServer) connectContainerToPeerNetworks(containerID string, uid int) {
 	peers, err := p.db.GetNetworkPeersByUID(uid)
 	if err != nil {
+		p.logger.Warn("connect_peer_get_peers_failed", zap.Int("uid", uid), zap.Error(err))
 		return
 	}
+	p.logger.Info("connect_peer_networks_check",
+		zap.String("container_id", containerID[:min(12, len(containerID))]),
+		zap.Int("uid", uid),
+		zap.Int("peer_count", len(peers)))
 	for _, peer := range peers {
 		// 只处理用户级互通（container_id_a/b 均为空）
 		if !peer.IsUserLevel() {
@@ -2882,6 +2887,11 @@ func (p *ProxyServer) connectContainerToPeerNetworks(containerID string, uid int
 				zap.Int("uid", uid),
 				zap.String("peer_network_id", peer.PeerNetworkID[:min(12, len(peer.PeerNetworkID))]),
 				zap.Error(err))
+		} else {
+			p.logger.Info("connect_new_container_to_peer_ok",
+				zap.String("container_id", containerID[:min(12, len(containerID))]),
+				zap.Int("uid", uid),
+				zap.String("peer_network_id", peer.PeerNetworkID[:min(12, len(peer.PeerNetworkID))]))
 		}
 	}
 }
