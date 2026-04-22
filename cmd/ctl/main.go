@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/user"
 	"strconv"
+	"strings"
 	"time"
 
 	"docker-authz-proxy/internal/authz"
@@ -449,7 +450,6 @@ func imageSetPublic(args []string, db *authz.OwnershipDB) error {
 	// 优先通过 Docker API 解析（支持镜像名/tag）
 	imageID, err := resolveImageID(ref)
 	if err != nil {
-		// Docker API 找不到时，直接把输入当 image ID（支持直接传 DB 里的完整/短 ID）
 		imageID = ref
 	}
 
@@ -457,6 +457,31 @@ func imageSetPublic(args []string, db *authz.OwnershipDB) error {
 	resolvedID, found := resolveImageIDInDB(db, imageID)
 	if !found {
 		return fmt.Errorf("镜像 %q 不存在", ref)
+	}
+
+	// 改为 private 时，检查是否有其他用户引用
+	if !*public {
+		refUIDs, err := db.GetImageRefUsers(resolvedID)
+		if err != nil {
+			return fmt.Errorf("查询引用用户失败: %w", err)
+		}
+		// 获取属主，排除属主自身
+		owner, _, _ := db.GetImageOwner(resolvedID)
+		var others []string
+		for _, uid := range refUIDs {
+			if owner != nil && uid == owner.UID {
+				continue
+			}
+			u, err := user.LookupId(strconv.Itoa(uid))
+			if err != nil {
+				others = append(others, fmt.Sprintf("uid=%d", uid))
+			} else {
+				others = append(others, fmt.Sprintf("%s(uid=%d)", u.Username, uid))
+			}
+		}
+		if len(others) > 0 {
+			return fmt.Errorf("镜像 %q 仍被其他用户引用（%s），无法改为私有", ref, strings.Join(others, ", "))
+		}
 	}
 
 	if err := db.SetImagePublic(resolvedID, *public); err != nil {

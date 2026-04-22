@@ -973,9 +973,11 @@ func (p *ProxyServer) checkImageRemovePermission(w http.ResponseWriter, r *http.
 		if !isImageOwner {
 			auditOwner := &audit.OwnerInfo{Username: owner.Username, UID: owner.UID, GID: owner.GID}
 			audit.LogAuthzDeniedOwnership(p.logger, auditID, auditOwner, "image", truncID(resolvedID), authz.ActionRemoveImage)
-			http.Error(w,
-				fmt.Sprintf("image '%s' belongs to user '%s', only the owner can remove it", truncID(resolvedID), owner.Username),
-				http.StatusForbidden)
+			msg := fmt.Sprintf("image '%s' belongs to user '%s', only the owner can remove it", truncID(resolvedID), owner.Username)
+			if isPublic {
+				msg = fmt.Sprintf("image '%s' is public and belongs to user '%s', only the owner can remove it", truncID(resolvedID), owner.Username)
+			}
+			http.Error(w, msg, http.StatusForbidden)
 			return false
 		}
 	}
