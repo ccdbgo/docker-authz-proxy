@@ -93,7 +93,47 @@ sudo bash install.sh --upgrade   # 升级（备份并覆盖配置）
 sudo bash install.sh --uninstall # 卸载
 ```
 
-### 方式三：源码编译部署（目标机需安装 Go）
+### 方式三：ARM 架构部署（源码包，目标机需安装 Go）
+
+适用于 ARM64（树莓派 4、AWS Graviton 等）、ARMv7 等非 x86_64 架构：
+
+```bash
+# 步骤 1：构建源码部署包（在开发机上，无需 Go）
+bash build-src-package.sh
+# 输出：dist/docker-authz-proxy-src.tar.gz (约 120KB)
+
+# 步骤 2：传输到 ARM 机器
+scp dist/docker-authz-proxy-src.tar.gz root@arm-server:/tmp/
+
+# 步骤 3：在 ARM 机器上编译并安装（需要 Go 1.21+）
+ssh root@arm-server
+cd /tmp && tar xzf docker-authz-proxy-src.tar.gz
+sudo bash docker-authz-proxy-src/build-and-install.sh
+```
+
+ARM 机器上安装 Go（如未安装）：
+
+```bash
+# ARM64 (aarch64)
+wget https://go.dev/dl/go1.21.13.linux-arm64.tar.gz
+tar -C /usr/local -xzf go1.21.13.linux-arm64.tar.gz
+export PATH=$PATH:/usr/local/go/bin
+
+# ARMv7
+wget https://go.dev/dl/go1.21.13.linux-armv6l.tar.gz
+tar -C /usr/local -xzf go1.21.13.linux-armv6l.tar.gz
+export PATH=$PATH:/usr/local/go/bin
+```
+
+`build-and-install.sh` 支持的选项：
+
+```bash
+sudo bash build-and-install.sh             # 编译并安装
+sudo bash build-and-install.sh --upgrade   # 升级（备份并覆盖配置）
+sudo bash build-and-install.sh --uninstall # 卸载
+```
+
+### 方式四：源码编译部署（目标机需安装 Go）
 
 ```bash
 # 在目标 Linux 机器上
@@ -230,7 +270,8 @@ docker-authz-proxy/
 ├── config/             # 默认配置文件
 ├── deploy/             # systemd 服务文件、logrotate 配置
 ├── dist/               # 构建输出（二进制部署包）
-├── build-release.sh    # 构建 Linux 发布包
+├── build-release.sh    # 构建 Linux amd64 发布包
+├── build-src-package.sh    # 构建源码部署包（适用于 ARM 等架构）
 ├── deploy-from-windows.sh  # Windows 一键部署脚本
 └── deploy-to-linux.sh      # Linux 端编译部署脚本
 ```
