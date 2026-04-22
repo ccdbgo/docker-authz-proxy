@@ -1,0 +1,31 @@
+[Unit]
+Description=Docker Authorization Proxy (per-user container isolation)
+Documentation=https://github.com/your-org/docker-authz-plugin
+# 必须在 docker.service 之前启动，确保 socket 就绪
+After=network.target
+Before=docker.service
+
+[Service]
+Type=simple
+PIDFile=/run/docker-authz-proxy.pid
+ExecStart=/usr/local/bin/docker-authz-proxy \
+    --socket-dir=/run/docker-authz \
+    --upstream=/var/run/docker.sock \
+    --policy=/etc/docker-authz/policy.yaml \
+    --db=/var/lib/docker-authz/owners.db \
+    --log-level=info \
+    --log-format=json \
+    --log-file=/var/log/docker-authz/authz.log
+
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=3
+
+# 安全加固
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/run/docker-authz /var/lib/docker-authz /var/log/docker-authz /var/run/docker.sock
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

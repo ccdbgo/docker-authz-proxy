@@ -1,0 +1,26 @@
+构建完成                                                                                                                                                                                                     
+  完整部署包：dist/docker-authz-proxy-deploy-linux-amd64.tar.gz 
+  Windows 端构建脚本（生成上面的包）：build-release.sh    
+  一键传输+部署脚本（已升级）：deploy-from-windows.sh 
+
+
+
+使用方式
+
+方式一：一键从 Windows 部署（推荐）
+bash deploy-from-windows.sh -h 192.168.1.100
+bash deploy-from-windows.sh -h 192.168.1.100 --upgrade  # 升级
+
+方式二：手动传包部署
+scp dist/docker-authz-proxy-deploy-linux-amd64.tar.gz root@server:/tmp/
+ssh root@server
+tar xzf /tmp/docker-authz-proxy-deploy-linux-amd64.tar.gz -C /tmp/
+sudo bash /tmp/docker-authz-proxy-deploy-linux-amd64/install.sh
+
+install.sh 功能：
+- 自动检查系统要求（Linux x86_64、systemd）
+- 安装二进制到 /usr/local/bin/
+- 安装配置文件（已有则跳过，--upgrade 覆盖并备份）
+- 启动 systemd 服务并验证
+- 自动配置所有用户的 DOCKER_HOST 环境变量
+- 支持 --uninstall 一键卸载

@@ -1,0 +1,55 @@
+# docker-authz-proxy 资源配额配置
+# 版本：1
+#
+# 配额说明：
+#   cpu_cores: 0 = 不限制，1.0 = 1核，4.0 = 400%
+#   mem_mb:    0 = 不限制，单位 MB
+#
+# 优先级：users > groups > defaults
+# 组配额取最宽松的组配额（避免因某个严格组限制了用户）
+
+version: 1
+
+# 默认配额（所有未单独配置的用户）
+defaults:
+  cpu_cores: 2.0    # 默认 2 核
+  mem_mb: 2048      # 默认 2GB
+
+# 按用户配置
+users:
+  # root：不限制资源
+  root:
+    cpu_cores: 0
+    mem_mb: 0
+
+  # test-sudo：sudo 组成员，给予较多资源
+  test-sudo:
+    cpu_cores: 4.0
+    mem_mb: 4096
+
+  # test-docker-g：docker 组成员，标准资源
+  test-docker-g:
+    cpu_cores: 2.0
+    mem_mb: 2048
+
+  # bob：普通开发者，标准资源
+  bob:
+    cpu_cores: 2.0
+    mem_mb: 2048
+
+  # alice：受限用户，较少资源
+  alice:
+    cpu_cores: 1.0
+    mem_mb: 1024
+
+# 按组配置
+groups:
+  # sudo 组：给予较多资源（test-sudo 属于此组）
+  sudo:
+    cpu_cores: 4.0
+    mem_mb: 4096
+
+  # docker 组：标准资源（test-docker-g 属于此组）
+  docker:
+    cpu_cores: 2.0
+    mem_mb: 2048

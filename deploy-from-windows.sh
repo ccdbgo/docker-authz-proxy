@@ -1,195 +1,178 @@
 #!/bin/bash
-# Windows 端自动部署脚本
-# 用途：从 Windows 开发环境自动传输代码到 Linux 服务器并部署
+# deploy-from-windows.sh - 从 Windows 一键部署到 Linux 服务器
+#
+# 两种模式（自动选择）：
+#   [推荐] 预编译包模式: 直接传输 dist/ 中的二进制包，无需目标机安装 Go
+#   [备用] 源码编译模式: 传输源码到目标机，由目标机编译（需要目标机安装 Go）
+#
+# 用法:
+#   bash deploy-from-windows.sh -h <server-ip>
+#   bash deploy-from-windows.sh -h <server-ip> --source  # 强制源码编译
+#   bash deploy-from-windows.sh -h <server-ip> --upgrade # 升级模式
 
 set -euo pipefail
 
-# 颜色输出
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
+log_info()  { echo -e "${GREEN}[INFO]${NC}  $1"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+log_step()  { echo -e "\n${BLUE}══ $1${NC}"; }
 
-log_info() {
-    echo -e "${GREEN}[INFO]${NC} $1"
-}
-
-log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
-}
-
-log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
-
-# 配置变量（请根据实际情况修改）
+# ── 参数默认值 ───────────────────────────────────────────────────────────────
 LINUX_SERVER="${LINUX_SERVER:-}"
 LINUX_USER="${LINUX_USER:-root}"
 LINUX_PORT="${LINUX_PORT:-22}"
-REMOTE_DIR="${REMOTE_DIR:-/tmp/docker-authz-proxy}"
+REMOTE_DIR="${REMOTE_DIR:-/tmp/docker-authz-deploy}"
+MODE="auto"        # auto | binary | source
+EXTRA_FLAGS=""     # 传给 install.sh 的额外参数
 
-# 显示使用说明
 show_usage() {
     cat << EOF
-用法: $0 [选项]
+用法: bash $0 -h <server> [选项]
 
-自动部署 docker-authz-proxy 到 Linux 服务器
+将 docker-authz-proxy 部署到 Linux 服务器
 
 选项:
-  -h, --host HOST       Linux 服务器地址（必需）
-  -u, --user USER       SSH 用户名（默认: root）
-  -p, --port PORT       SSH 端口（默认: 22）
-  -d, --dir DIR         远程目录（默认: /tmp/docker-authz-proxy）
-  --help                显示此帮助信息
+  -h, --host HOST    目标服务器地址（必需）
+  -u, --user USER    SSH 用户名（默认: root）
+  -p, --port PORT    SSH 端口（默认: 22）
+  -d, --dir  DIR     远程临时目录（默认: /tmp/docker-authz-deploy）
+  --upgrade          升级模式（覆盖已有配置文件）
+  --source           强制使用源码编译模式（目标机需安装 Go）
+  --help             显示此帮助
 
-环境变量:
-  LINUX_SERVER          Linux 服务器地址
-  LINUX_USER            SSH 用户名
-  LINUX_PORT            SSH 端口
-  REMOTE_DIR            远程目录
+环境变量: LINUX_SERVER / LINUX_USER / LINUX_PORT / REMOTE_DIR
 
 示例:
-  $0 -h 192.168.1.100 -u root
-  $0 --host myserver.com --user admin --port 2222
-
-  # 或使用环境变量
-  export LINUX_SERVER=192.168.1.100
-  export LINUX_USER=root
-  $0
+  bash $0 -h 192.168.1.100
+  bash $0 -h 192.168.1.100 -u admin -p 2222 --upgrade
+  LINUX_SERVER=192.168.1.100 bash $0
 EOF
 }
 
-# 解析命令行参数
+# ── 解析参数 ─────────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case $1 in
-        -h|--host)
-            LINUX_SERVER="$2"
-            shift 2
-            ;;
-        -u|--user)
-            LINUX_USER="$2"
-            shift 2
-            ;;
-        -p|--port)
-            LINUX_PORT="$2"
-            shift 2
-            ;;
-        -d|--dir)
-            REMOTE_DIR="$2"
-            shift 2
-            ;;
-        --help)
-            show_usage
-            exit 0
-            ;;
-        *)
-            log_error "未知选项: $1"
-            show_usage
-            exit 1
-            ;;
+        -h|--host)    LINUX_SERVER="$2"; shift 2 ;;
+        -u|--user)    LINUX_USER="$2";   shift 2 ;;
+        -p|--port)    LINUX_PORT="$2";   shift 2 ;;
+        -d|--dir)     REMOTE_DIR="$2";   shift 2 ;;
+        --upgrade)    EXTRA_FLAGS="--upgrade"; shift ;;
+        --source)     MODE="source"; shift ;;
+        --help)       show_usage; exit 0 ;;
+        *) log_error "未知选项: $1"; show_usage; exit 1 ;;
     esac
 done
 
-# 检查必需参数
 if [ -z "$LINUX_SERVER" ]; then
-    log_error "未指定 Linux 服务器地址"
+    log_error "未指定目标服务器地址"
     echo ""
     show_usage
     exit 1
 fi
 
-# 检查 SSH 连接
-log_info "检查 SSH 连接: $LINUX_USER@$LINUX_SERVER:$LINUX_PORT"
-if ! ssh -p "$LINUX_PORT" -o ConnectTimeout=5 -o BatchMode=yes "$LINUX_USER@$LINUX_SERVER" "echo 2>&1" &>/dev/null; then
-    log_warn "SSH 连接失败，请确保："
-    echo "  1. SSH 密钥已配置（或使用密码登录）"
-    echo "  2. 服务器地址和端口正确"
-    echo "  3. 用户名正确"
-    echo ""
-    read -p "是否继续？(y/N) " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        exit 1
-    fi
-fi
-
-# 获取当前目录
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-log_info "当前目录: $SCRIPT_DIR"
-log_info "目标服务器: $LINUX_USER@$LINUX_SERVER:$LINUX_PORT"
-log_info "远程目录: $REMOTE_DIR"
-echo ""
+SSH_OPTS="-p $LINUX_PORT -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
+SCP_OPTS="-P $LINUX_PORT -o StrictHostKeyChecking=accept-new"
+SSH="ssh $SSH_OPTS"
+SCP="scp $SCP_OPTS"
+TARGET="$LINUX_USER@$LINUX_SERVER"
 
-# 步骤 1: 打包代码
-log_info "步骤 1/4: 打包代码..."
-TEMP_TAR="/tmp/docker-authz-proxy-$(date +%s).tar.gz"
-tar czf "$TEMP_TAR" \
-    --exclude='.git' \
-    --exclude='*.exe' \
-    --exclude='docker-authz-proxy' \
-    --exclude='docker-authz-proxy-ctl' \
-    --exclude='docker-authz-proxy-linux' \
-    --exclude='docker-authz-proxy-new' \
-    --exclude='docker-authz-plugin' \
-    --exclude='ctl' \
-    --exclude='*.db' \
-    --exclude='*.log' \
-    --exclude='~$*' \
-    --exclude='node_modules' \
-    --exclude='vendor' \
-    . || {
-    log_error "打包失败"
-    exit 1
-}
-log_info "打包完成: $TEMP_TAR"
+# ── 检查 SSH 连通性 ──────────────────────────────────────────────────────────
+log_step "检查 SSH 连接"
+log_info "目标: $TARGET:$LINUX_PORT"
 
-# 步骤 2: 传输到 Linux 服务器
-log_info "步骤 2/4: 传输到 Linux 服务器..."
-ssh -p "$LINUX_PORT" "$LINUX_USER@$LINUX_SERVER" "mkdir -p $REMOTE_DIR" || {
-    log_error "创建远程目录失败"
+if ! $SSH -o BatchMode=yes "$TARGET" "echo ok" &>/dev/null; then
+    log_warn "SSH 免密登录未配置，部署过程将提示输入密码"
+    log_warn "建议先配置 SSH 密钥: ssh-copy-id -p $LINUX_PORT $TARGET"
+    echo ""
+fi
+log_info "SSH 连接正常"
+
+# ── 选择部署模式 ─────────────────────────────────────────────────────────────
+PKG_DIR="${SCRIPT_DIR}/dist/docker-authz-proxy-deploy-linux-amd64"
+PKG_TAR="${SCRIPT_DIR}/dist/docker-authz-proxy-deploy-linux-amd64.tar.gz"
+
+if [ "$MODE" = "auto" ]; then
+    if [ -f "$PKG_TAR" ]; then
+        MODE="binary"
+        log_info "检测到预编译包: dist/docker-authz-proxy-deploy-linux-amd64.tar.gz"
+        log_info "使用【预编译包模式】（无需目标机安装 Go）"
+    else
+        MODE="source"
+        log_warn "未找到预编译包 dist/docker-authz-proxy-deploy-linux-amd64.tar.gz"
+        log_warn "使用【源码编译模式】（目标机需安装 Go 1.21+）"
+        log_warn "提示：先运行 bash build-release.sh 生成预编译包可更快部署"
+    fi
+fi
+
+# ════════════════════════════════════════════════════════════════════════════
+# 模式A：预编译包模式
+# ════════════════════════════════════════════════════════════════════════════
+if [ "$MODE" = "binary" ]; then
+
+    log_step "步骤 1/3: 传输预编译包"
+    $SSH "$TARGET" "mkdir -p $REMOTE_DIR"
+    $SCP "$PKG_TAR" "$TARGET:$REMOTE_DIR/deploy.tar.gz"
+    log_info "传输完成"
+
+    log_step "步骤 2/3: 解压"
+    $SSH "$TARGET" "cd $REMOTE_DIR && tar xzf deploy.tar.gz && rm deploy.tar.gz"
+    log_info "解压完成"
+
+    log_step "步骤 3/3: 执行安装"
+    $SSH -t "$TARGET" \
+        "cd $REMOTE_DIR/docker-authz-proxy-deploy-linux-amd64 && bash install.sh $EXTRA_FLAGS"
+
+# ════════════════════════════════════════════════════════════════════════════
+# 模式B：源码编译模式
+# ════════════════════════════════════════════════════════════════════════════
+else
+
+    log_step "步骤 1/4: 打包源码"
+    TEMP_TAR="$(mktemp /tmp/docker-authz-XXXXXX.tar.gz)"
+    tar czf "$TEMP_TAR" \
+        --exclude='.git' \
+        --exclude='dist' \
+        --exclude='*.exe' \
+        --exclude='*.db' \
+        --exclude='*.log' \
+        --exclude='~$*' \
+        --exclude='node_modules' \
+        --exclude='vendor' \
+        .
+    SRC_SIZE=$(du -sh "$TEMP_TAR" | cut -f1)
+    log_info "打包完成 (${SRC_SIZE}): $TEMP_TAR"
+
+    log_step "步骤 2/4: 传输源码"
+    $SSH "$TARGET" "mkdir -p $REMOTE_DIR"
+    $SCP "$TEMP_TAR" "$TARGET:$REMOTE_DIR/source.tar.gz"
     rm -f "$TEMP_TAR"
-    exit 1
-}
+    log_info "传输完成"
 
-scp -P "$LINUX_PORT" "$TEMP_TAR" "$LINUX_USER@$LINUX_SERVER:$REMOTE_DIR/code.tar.gz" || {
-    log_error "传输失败"
-    rm -f "$TEMP_TAR"
-    exit 1
-}
-log_info "传输完成"
+    log_step "步骤 3/4: 解压"
+    $SSH "$TARGET" "cd $REMOTE_DIR && tar xzf source.tar.gz && rm source.tar.gz"
+    log_info "解压完成"
 
-# 清理本地临时文件
-rm -f "$TEMP_TAR"
+    log_step "步骤 4/4: 编译并安装"
+    $SSH -t "$TARGET" "cd $REMOTE_DIR && bash deploy-to-linux.sh"
 
-# 步骤 3: 在 Linux 服务器上解压
-log_info "步骤 3/4: 在服务器上解压..."
-ssh -p "$LINUX_PORT" "$LINUX_USER@$LINUX_SERVER" "cd $REMOTE_DIR && tar xzf code.tar.gz && rm code.tar.gz" || {
-    log_error "解压失败"
-    exit 1
-}
-log_info "解压完成"
+fi
 
-# 步骤 4: 在 Linux 服务器上执行部署脚本
-log_info "步骤 4/4: 执行部署脚本..."
-ssh -p "$LINUX_PORT" "$LINUX_USER@$LINUX_SERVER" "cd $REMOTE_DIR && chmod +x deploy-to-linux.sh && ./deploy-to-linux.sh" || {
-    log_error "部署失败"
-    exit 1
-}
-
+# ── 完成 ─────────────────────────────────────────────────────────────────────
 echo ""
-log_info "========================================="
-log_info "部署完成！服务已自动启动"
-log_info "========================================="
+log_info "═══════════════════════════════════════════════════"
+log_info "  部署完成！"
+log_info "═══════════════════════════════════════════════════"
 echo ""
-echo "查看状态："
-echo "  ssh -p $LINUX_PORT $LINUX_USER@$LINUX_SERVER 'systemctl status docker-authz'"
+echo "  查看服务状态:"
+echo "    ssh -p $LINUX_PORT $TARGET 'systemctl status docker-authz'"
 echo ""
-echo "查看日志："
-echo "  ssh -p $LINUX_PORT $LINUX_USER@$LINUX_SERVER 'journalctl -u docker-authz -f'"
+echo "  查看实时日志:"
+echo "    ssh -p $LINUX_PORT $TARGET 'journalctl -u docker-authz -f'"
 echo ""
-echo "运行测试："
-echo "  ssh -p $LINUX_PORT $LINUX_USER@$LINUX_SERVER 'cd $REMOTE_DIR && chmod +x test-on-linux.sh && ./test-on-linux.sh'"
+echo "  管理工具帮助:"
+echo "    ssh -p $LINUX_PORT $TARGET 'docker-authz-proxy-ctl --help'"
 echo ""
