@@ -553,43 +553,6 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		zap.String("action", action),
 	)
 
-	if action == authz.ActionRemoveImage {
-		imageRef := authz.ExtractImageID(r.URL.Path)
-		if imageRef != "" {
-			// 解析为真实 content ID（digest），确保引用计数操作的一致性
-			resolvedID := p.resolveImageIDByRef(imageRef)
-			if resolvedID == "" {
-				resolvedID = imageRef
-			}
-			shouldDelete, err := p.db.RemoveUserImageAccess(resolvedID, identity.RealUID)
-			if err != nil {
-				p.logger.Error("remove_image_access_failed",
-					zap.Error(err),
-					zap.String("real_username", identity.RealUsername),
-					zap.Int("real_uid", identity.RealUID),
-					zap.String("image_id", resolvedID),
-				)
-				http.Error(w, "internal error", http.StatusInternalServerError)
-				return
-			}
-
-			if !shouldDelete {
-				// 引用计数 > 0：其他用户仍在引用，仅解除当前用户引用，不物理删除
-				auditID := toAuditIdentity(identity)
-				p.logger.Info("AUTHZ_ALLOW",
-					append(audit.LogIdentityShortFields(auditID),
-						zap.String("action", "rmi"),
-						zap.String("image_id", truncID(resolvedID)),
-						zap.String("note", "virtual_delete_only"),
-					)...)
-				p.auditLog.WriteEntry(makeAuditEntry(identity, r, action, "allow", "virtual_delete", resolvedID, http.StatusNoContent))
-				w.WriteHeader(http.StatusNoContent)
-				return
-			}
-			// shouldDelete=true：引用计数降为 0，继续转发物理删除请求
-		}
-	}
-
 	p.logger.Debug("forward_request_start",
 		zap.String("user", fmt.Sprintf("%s(uid=%d)", identity.RealUsername, identity.RealUID)),
 		zap.String("action", action),
@@ -840,7 +803,17 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 				_ = p.db.SetManagedNetworkOwner(networkID, bridgeName, id.RealUID, id.RealUsername)
 			}
 
-			injected, err := isolation.InjectUserNetwork(body, id.RealUID)
+			// 查出该用户的用户级 peer 网络 ID，在创建时一并注入，避免异步 connect 的竞态
+			var peerNetIDs []string
+			if peers, err := p.db.GetNetworkPeersByUID(id.RealUID); err == nil {
+				for _, peer := range peers {
+					if peer.IsUserLevel() {
+						peerNetIDs = append(peerNetIDs, peer.PeerNetworkID)
+					}
+				}
+			}
+
+			injected, err := isolation.InjectUserNetwork(body, id.RealUID, peerNetIDs)
 			if err == nil {
 				r.Body = io.NopCloser(bytes.NewReader(injected))
 			} else {
@@ -994,13 +967,15 @@ func (p *ProxyServer) checkImageRemovePermission(w http.ResponseWriter, r *http.
 
 	auditID := toAuditIdentity(id)
 
-	// 非 root：只有属主才能 rmi（非属主用户即使有 image_access 也不能删除）
+	// 非 root：只有属主才能 rmi
 	if id.RealUID != 0 {
 		isImageOwner := owner.UID == id.RealUID
 		if !isImageOwner {
 			auditOwner := &audit.OwnerInfo{Username: owner.Username, UID: owner.UID, GID: owner.GID}
 			audit.LogAuthzDeniedOwnership(p.logger, auditID, auditOwner, "image", truncID(resolvedID), authz.ActionRemoveImage)
-			writeDockerNotFound(w, "image", resolvedID)
+			http.Error(w,
+				fmt.Sprintf("image '%s' belongs to user '%s', only the owner can remove it", truncID(resolvedID), owner.Username),
+				http.StatusForbidden)
 			return false
 		}
 	}
@@ -2774,8 +2749,25 @@ func (p *ProxyServer) AllowNetworkPeer(uidA, uidB int, opts PeerOptions) error {
 		}
 	}
 
-	// 创建共享辅助网络（用户级和容器级各自独立的辅助网络）
-	peerNetworkID, err := p.bridge.CreatePeerNetwork(uidA, uidB)
+	// 创建共享辅助网络
+	// 容器级互通使用独立网络（名称含容器 ID 短串），与用户级 peer 网络严格隔离
+	var (
+		peerNetworkID string
+		err           error
+	)
+	if containerLevel {
+		shortA := opts.ContainerIDA
+		if len(shortA) > 12 {
+			shortA = shortA[:12]
+		}
+		shortB := opts.ContainerIDB
+		if len(shortB) > 12 {
+			shortB = shortB[:12]
+		}
+		peerNetworkID, err = p.bridge.CreateContainerPeerNetwork(uidA, uidB, shortA, shortB)
+	} else {
+		peerNetworkID, err = p.bridge.CreatePeerNetwork(uidA, uidB)
+	}
 	if err != nil {
 		return fmt.Errorf("create peer network: %w", err)
 	}

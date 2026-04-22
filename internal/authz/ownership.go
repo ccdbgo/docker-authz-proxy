@@ -377,7 +377,16 @@ func (o *OwnershipDB) CanSeeImage(realUID int, imageID string) bool {
 	if isPublic != 0 {
 		return true
 	}
-	return ownerUID == realUID
+	if ownerUID == realUID {
+		return true
+	}
+	// 用户曾经 pull 过（image_access 有记录）也可见
+	var count int
+	_ = o.DB.QueryRow(
+		`SELECT COUNT(*) FROM image_access WHERE image_id = ? AND user_uid = ?`,
+		resolvedID, realUID,
+	).Scan(&count)
+	return count > 0
 }
 
 // MarkImagePublic 将镜像标记为公共
@@ -396,6 +405,7 @@ func (o *OwnershipDB) MarkImagePublic(imageID string, isPublic bool) error {
 // RemoveUserImageAccess 移除用户对镜像的访问权限（引用计数 -1）。
 // shouldDelete=true 表示引用计数降为 0，调用方应物理删除镜像。
 func (o *OwnershipDB) RemoveUserImageAccess(imageID string, uid int) (shouldDelete bool, err error) {
+	imageID = normalizeImageID(imageID)
 	_, err = o.DB.Exec(`DELETE FROM image_access WHERE image_id = ? AND user_uid = ?`, imageID, uid)
 	if err != nil {
 		return false, err

@@ -113,8 +113,16 @@ func (m *BridgeManager) GetBridgeInterface(networkID string) (string, error) {
 // CreatePeerNetwork 创建两个用户之间的共享辅助网络
 // 返回辅助网络 ID
 func (m *BridgeManager) CreatePeerNetwork(uidA, uidB int) (string, error) {
-	name := PeerNetworkName(uidA, uidB)
+	return m.createPeerNetworkWithName(PeerNetworkName(uidA, uidB), uidA, uidB)
+}
 
+// CreateContainerPeerNetwork 创建容器级互通专用网络，名称含容器 ID 短串，与用户级 peer 网络严格隔离
+func (m *BridgeManager) CreateContainerPeerNetwork(uidA, uidB int, shortContA, shortContB string) (string, error) {
+	name := fmt.Sprintf("cpeer-%d-%d-%s-%s", uidA, uidB, shortContA, shortContB)
+	return m.createPeerNetworkWithName(name, uidA, uidB)
+}
+
+func (m *BridgeManager) createPeerNetworkWithName(name string, uidA, uidB int) (string, error) {
 	// 幂等：已存在则直接返回
 	if id, err := m.client.findNetworkByName(name); err == nil && id != "" {
 		return id, nil
@@ -137,13 +145,8 @@ func (m *BridgeManager) CreatePeerNetwork(uidA, uidB int) (string, error) {
 
 	networkID, err := m.client.createNetwork(body)
 	if err != nil {
-		return "", fmt.Errorf("create peer network for uid=%d,uid=%d: %w", uidA, uidB, err)
+		return "", fmt.Errorf("create peer network %s: %w", name, err)
 	}
-
-	// 辅助网络不需要 DROP 规则，但需要允许其网桥流量通过
-	// Docker 默认 FORWARD 策略为 ACCEPT，辅助网络的流量会被 DOCKER 链处理
-	// 只需确保 DOCKER-USER 链中没有阻断辅助网络的规则即可
-
 	return networkID, nil
 }
 
@@ -261,9 +264,10 @@ func ExtractPortMappings(body []byte) []PortMapping {
 
 // ── 网络注入 ──────────────────────────────────────────────────
 
-// InjectUserNetwork 向容器创建请求体注入用户专属网络
-// 强制覆盖任何 --net 参数，用户无法绕过
-func InjectUserNetwork(body []byte, uid int) ([]byte, error) {
+// InjectUserNetwork 向容器创建请求体注入用户专属网络及所有用户级 peer 网络。
+// 强制覆盖任何 --net 参数，用户无法绕过。
+// peerNetworkIDs 为该用户已配置的用户级互通网络 ID 列表，可为空。
+func InjectUserNetwork(body []byte, uid int, peerNetworkIDs []string) ([]byte, error) {
 	var req map[string]json.RawMessage
 	if err := json.Unmarshal(body, &req); err != nil {
 		return body, nil
@@ -280,12 +284,16 @@ func InjectUserNetwork(body []byte, uid int) ([]byte, error) {
 	b, _ := json.Marshal(bridgeName)
 	hostConfig["NetworkMode"] = b
 
-	// 同步更新顶层 NetworkingConfig
-	networkingConfig := map[string]any{
-		"EndpointsConfig": map[string]any{
-			bridgeName: map[string]any{},
-		},
+	// EndpointsConfig：私有网络 + 所有用户级 peer 网络
+	endpoints := map[string]any{
+		bridgeName: map[string]any{},
 	}
+	for _, netID := range peerNetworkIDs {
+		if netID != "" {
+			endpoints[netID] = map[string]any{}
+		}
+	}
+	networkingConfig := map[string]any{"EndpointsConfig": endpoints}
 	if raw, err := json.Marshal(networkingConfig); err == nil {
 		req["NetworkingConfig"] = raw
 	}

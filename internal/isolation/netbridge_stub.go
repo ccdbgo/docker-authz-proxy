@@ -30,13 +30,16 @@ func (m *BridgeManager) GetBridgeInterface(_ string) (string, error) {
 func (m *BridgeManager) CreatePeerNetwork(_, _ int) (string, error) {
 	return "", fmt.Errorf("not supported")
 }
+func (m *BridgeManager) CreateContainerPeerNetwork(_, _ int, _, _ string) (string, error) {
+	return "", fmt.Errorf("not supported")
+}
 func (m *BridgeManager) DeletePeerNetwork(_ string) error { return nil }
 func (m *BridgeManager) ConnectContainerToPeerNetwork(_, _ string) error { return nil }
 func (m *BridgeManager) DisconnectContainerFromPeerNetwork(_, _ string) error { return nil }
 func (m *BridgeManager) GetContainersByOwner(_ int) ([]string, error) { return nil, nil }
 
 func ExtractPortMappings(_ []byte) []PortMapping { return nil }
-func InjectUserNetwork(body []byte, _ int) ([]byte, error) { return body, nil }
+func InjectUserNetwork(body []byte, _ int, _ []string) ([]byte, error) { return body, nil }
 
 type PortMapping struct {
 	HostPort      int
