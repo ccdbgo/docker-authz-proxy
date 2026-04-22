@@ -130,8 +130,14 @@ tar czf "$TEMP_TAR" \
     --exclude='.git' \
     --exclude='*.exe' \
     --exclude='docker-authz-proxy' \
+    --exclude='docker-authz-proxy-ctl' \
+    --exclude='docker-authz-proxy-linux' \
+    --exclude='docker-authz-proxy-new' \
+    --exclude='docker-authz-plugin' \
+    --exclude='ctl' \
     --exclude='*.db' \
     --exclude='*.log' \
+    --exclude='~$*' \
     --exclude='node_modules' \
     --exclude='vendor' \
     . || {
