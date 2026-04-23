@@ -26,3 +26,7 @@ docker images      # 只显示自己的镜像
 docker-authz-proxy-ctl --help  # 管理工具
 
 socket 路径: /run/docker-authz/<username>/docker.sock
+
+
+问题1：部署后docker-authz-proxy日志报错
+"level":"WARN","caller":"proxy.go:2906","msg":"docker_event_listener_error","error":"EOF"

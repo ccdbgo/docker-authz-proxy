@@ -1863,9 +1863,7 @@ func isAuxiliaryCall(dockerCmd, action, method, path string) bool {
 	}
 
 	if dockerCmd == "" {
-		if action == authz.ActionSystemInfo {
-			return true
-		}
+		// 无法识别命令来源时，只放行 _ping（健康检查），其余走正常策略检查
 		return false
 	}
 
@@ -1906,12 +1904,9 @@ func isAuxiliaryCall(dockerCmd, action, method, path string) bool {
 		"prune":   {authz.ActionPrune},
 	}
 
+	// 其他命令（如 docker run、docker ps 等）附带触发的 info/version 请求
+	// 属于辅助调用，跳过策略检查；用户直接执行 docker info/version 则走正常检查
 	if action == authz.ActionSystemInfo && dockerCmd != "info" && dockerCmd != "version" {
-		return true
-	}
-
-	// docker info / docker version 是只读系统调用，始终允许（不受策略限制）
-	if action == authz.ActionSystemInfo && (dockerCmd == "info" || dockerCmd == "version") {
 		return true
 	}
 
