@@ -2898,17 +2898,30 @@ func (p *ProxyServer) StartDockerEventListener(ctx context.Context) {
 	ch := make(chan isolation.DockerEvent, 32)
 
 	go func() {
+		backoff := 2 * time.Second
+		const maxBackoff = 60 * time.Second
 		for {
 			if err := listener.Listen(ctx, ch); err != nil {
 				if ctx.Err() != nil {
 					return // 正常退出
 				}
 				p.logger.Warn("docker_event_listener_error", zap.Error(err))
-				// 重连等待
+				// 指数退避重连，避免 Docker daemon 重启期间狂刷日志
 				select {
 				case <-ctx.Done():
 					return
-				case <-time.After(5 * time.Second):
+				case <-time.After(backoff):
+				}
+				if backoff < maxBackoff {
+					backoff *= 2
+				}
+			} else {
+				// Listen 返回 nil 表示正常断连（EOF），短暂等待后重连，重置退避
+				backoff = 2 * time.Second
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(time.Second):
 				}
 			}
 		}

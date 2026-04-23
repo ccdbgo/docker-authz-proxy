@@ -551,6 +551,11 @@ func (l *DockerEventListener) Listen(ctx context.Context, ch chan<- DockerEvent)
 			if ctx.Err() != nil {
 				return nil // 正常退出
 			}
+			// EOF / ErrUnexpectedEOF 是 Docker daemon 断开长连接的正常现象
+			// （daemon 重启、空闲超时等），返回 nil 让调用方静默重连
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				return nil
+			}
 			return err
 		}
 		select {
