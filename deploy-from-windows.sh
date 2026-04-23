@@ -20,7 +20,7 @@ log_step()  { echo -e "\n${BLUE}══ $1${NC}"; }
 
 # ── 参数默认值 ───────────────────────────────────────────────────────────────
 LINUX_SERVER="${LINUX_SERVER:-}"
-LINUX_USER="${LINUX_USER:-root}"
+LINUX_USER="${LINUX_USER:-ywyh}"
 LINUX_PORT="${LINUX_PORT:-22}"
 REMOTE_DIR="${REMOTE_DIR:-/tmp/docker-authz-deploy}"
 MODE="auto"        # auto | binary | source

@@ -1,0 +1,28 @@
+在arm上执行bash build-and-install.sh 报错docker-authz.service: Failed to set up mount namespacing: /run/systemd/unit-root/run/docker.sock: No such file or directory
+docker-authz.service: Failed at step   NAMESPACE spawning /usr/local/bin/docker-authz-proxy: No such file or directory 
+																																										 
+																																																		   
+● 问题很清楚：                                                                                                                                                                                                 
+																																																		   
+1. ProtectSystem=strict — 启用了文件系统命名空间隔离，ARM 上某些内核（尤其是树莓派 32 位内核、老版本 4.x）不完整支持 BindMount，导致 /run/docker.sock 挂载失败       	  
+2. PrivateTmp=yes — 同样依赖 mount namespace，ARM 低版本内核可能不支持 
+3. ReadWritePaths 包含 /var/run/docker.sock — 但实际路径是 /var/run/docker.sock，而 systemd 在 ProtectSystem=strict 下会尝试 bind mount 这个路径，如果父目录不存在就报 No such file or directory             
+																																																		   
+解决方案：去掉这些在 ARM 上不稳定的沙箱选项，保留真正有用的安全配置：
+根本原因是 ProtectSystem=strict 和 PrivateTmp=yes 都依赖 Linux mount namespace，ARM 上的低版本内核（树莓派 4.x/5.x 32位、部分嵌入式发行版）对这两个特性支持不完整，systemd
+尝试创建隔离挂载点时找不到路径就报那两个错。去掉这两项后服务可以正常启动，安全性由程序自身的 socket 权限（600）和 loginuid 身份验证保证，不依赖内核 namespace。
+
+
+服务状态:  systemctl status docker-authz
+实时日志:  journalctl -u docker-authz -f
+审计日志:  tail -f /var/log/docker-authz/authz.log | jq .
+
+配置文件:  /etc/docker-authz/policy.yaml
+数据库:    /var/lib/docker-authz/owners.db
+
+用户使用（重新登录后生效）:
+docker ps          # 只显示自己的容器
+docker images      # 只显示自己的镜像
+docker-authz-proxy-ctl --help  # 管理工具
+
+socket 路径: /run/docker-authz/<username>/docker.sock

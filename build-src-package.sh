@@ -137,18 +137,51 @@ if ! command -v systemctl &>/dev/null; then
 fi
 
 if ! command -v go &>/dev/null; then
-    log_error "未找到 Go 编译器，请先安装 Go 1.21+"
-    echo ""
-    echo "  ARM64 安装 Go 参考："
-    echo "    wget https://go.dev/dl/go1.21.13.linux-arm64.tar.gz"
-    echo "    tar -C /usr/local -xzf go1.21.13.linux-arm64.tar.gz"
-    echo "    export PATH=\$PATH:/usr/local/go/bin"
-    echo ""
-    echo "  ARMv7 安装 Go 参考："
-    echo "    wget https://go.dev/dl/go1.21.13.linux-armv6l.tar.gz"
-    echo "    tar -C /usr/local -xzf go1.21.13.linux-armv6l.tar.gz"
-    echo "    export PATH=\$PATH:/usr/local/go/bin"
-    exit 1
+    # sudo 会重置 PATH，尝试自动找到 go
+    # 优先从 SUDO_USER 的 home 查找（最常见：用户把 go 装在自己 home 下）
+    GO_SEARCH_PATHS=(
+        /usr/local/go/bin
+        /usr/go/bin
+        /opt/go/bin
+        /snap/bin
+    )
+    if [ -n "${SUDO_USER:-}" ]; then
+        SUDO_USER_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+        if [ -n "$SUDO_USER_HOME" ]; then
+            # 把调用者 home 下的常见路径排在最前面
+            GO_SEARCH_PATHS=(
+                "${SUDO_USER_HOME}/go/bin"
+                "${SUDO_USER_HOME}/.local/go/bin"
+                "${GO_SEARCH_PATHS[@]}"
+            )
+        fi
+    fi
+
+    GO_BIN=""
+    for p in "${GO_SEARCH_PATHS[@]}"; do
+        if [ -x "${p}/go" ]; then
+            GO_BIN="$p"
+            break
+        fi
+    done
+
+    if [ -n "$GO_BIN" ]; then
+        export PATH="${GO_BIN}:${PATH}"
+        log_info "自动找到 Go: ${GO_BIN}/go，已加入 PATH"
+    else
+        log_error "未找到 Go 编译器，请先安装 Go 1.21+"
+        echo ""
+        echo "  ARM64 安装 Go（推荐，安装到 /usr/local，sudo 下可直接找到）："
+        echo "    wget https://go.dev/dl/go1.21.13.linux-arm64.tar.gz"
+        echo "    sudo tar -C /usr/local -xzf go1.21.13.linux-arm64.tar.gz"
+        echo ""
+        echo "  ARMv7 安装 Go："
+        echo "    wget https://go.dev/dl/go1.21.13.linux-armv6l.tar.gz"
+        echo "    sudo tar -C /usr/local -xzf go1.21.13.linux-armv6l.tar.gz"
+        echo ""
+        echo "  安装后重新运行本脚本即可，无需手动 export PATH"
+        exit 1
+    fi
 fi
 
 GO_VERSION=$(go version | awk '{print $3}')
@@ -159,6 +192,24 @@ if ! command -v docker &>/dev/null; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ── 复用原始用户的 Go 模块缓存，避免 sudo 下重新下载依赖 ──────────────────────
+if [ -n "${SUDO_USER:-}" ]; then
+    SUDO_USER_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+    if [ -n "$SUDO_USER_HOME" ]; then
+        if [ -d "${SUDO_USER_HOME}/go/pkg/mod" ]; then
+            export GOMODCACHE="${SUDO_USER_HOME}/go/pkg/mod"
+            log_info "复用 Go 模块缓存: ${GOMODCACHE}"
+        fi
+        # build cache 不复用（避免 root 写入污染用户目录文件归属）
+        export GOCACHE="/tmp/_docker-authz-gobuild-cache"
+    fi
+fi
+
+# 禁用 checksum 数据库校验（目标机可能无法访问 sum.golang.org）
+export GONOSUMDB="*"
+export GOFLAGS="-mod=mod"
+
 log_ok "环境检查通过 (Linux ${ARCH}, systemd, Go)"
 
 # ── 路径变量 ──────────────────────────────────────────────────────────────────
@@ -302,6 +353,7 @@ done < /etc/passwd
 
 # ── 清理编译临时目录 ──────────────────────────────────────────────────────────
 rm -rf "$BUILD_DIR"
+rm -rf /tmp/_docker-authz-gobuild-cache
 
 # ── 完成 ──────────────────────────────────────────────────────────────────────
 echo ""
