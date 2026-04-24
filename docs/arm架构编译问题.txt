@@ -30,3 +30,21 @@ socket 路径: /run/docker-authz/<username>/docker.sock
 
 问题1：部署后docker-authz-proxy日志报错
 "level":"WARN","caller":"proxy.go:2906","msg":"docker_event_listener_error","error":"EOF"
+
+═══════════════════════════════════════════════
+  部署完成！docker-authz-proxy 已启动运行      
+═══════════════════════════════════════════════
+
+  服务状态:  systemctl status docker-authz
+  实时日志:  journalctl -u docker-authz -f
+  审计日志:  tail -f /var/log/docker-authz/authz.log | jq .
+
+  配置文件:  /etc/docker-authz/policy.yaml
+  数据库:    /var/lib/docker-authz/owners.db
+
+  用户使用（重新登录后生效）:
+    docker ps          # 只显示自己的容器
+    docker images      # 只显示自己的镜像
+    docker-authz-proxy-ctl --help  # 管理工具
+
+  socket 路径: /run/docker-authz/<username>/docker.sock
