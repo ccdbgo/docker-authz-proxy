@@ -331,7 +331,7 @@ func newDockerClient(sockPath string) *dockerClient {
 }
 
 func (c *dockerClient) findNetworkByName(name string) (string, error) {
-	resp, err := c.http.Get(fmt.Sprintf("http://docker/v1.41/networks/%s", name))
+	resp, err := c.http.Get(fmt.Sprintf("http://docker/networks/%s", name))
 	if err != nil {
 		return "", err
 	}
@@ -356,7 +356,7 @@ func (c *dockerClient) createNetwork(body any) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	resp, err := c.http.Post("http://docker/v1.41/networks/create",
+	resp, err := c.http.Post("http://docker/networks/create",
 		"application/json", bytes.NewReader(data))
 	if err != nil {
 		return "", err
@@ -377,7 +377,7 @@ func (c *dockerClient) createNetwork(body any) (string, error) {
 
 func (c *dockerClient) deleteNetwork(id string) error {
 	req, err := http.NewRequest(http.MethodDelete,
-		fmt.Sprintf("http://docker/v1.41/networks/%s", id), nil)
+		fmt.Sprintf("http://docker/networks/%s", id), nil)
 	if err != nil {
 		return err
 	}
@@ -394,7 +394,7 @@ func (c *dockerClient) deleteNetwork(id string) error {
 }
 
 func (c *dockerClient) getBridgeInterface(networkID string) (string, error) {
-	resp, err := c.http.Get(fmt.Sprintf("http://docker/v1.41/networks/%s", networkID))
+	resp, err := c.http.Get(fmt.Sprintf("http://docker/networks/%s", networkID))
 	if err != nil {
 		return "", err
 	}
@@ -421,7 +421,7 @@ func (c *dockerClient) connectContainerToNetwork(containerID, networkID string) 
 	body := map[string]string{"Container": containerID}
 	data, _ := json.Marshal(body)
 	resp, err := c.http.Post(
-		fmt.Sprintf("http://docker/v1.41/networks/%s/connect", networkID),
+		fmt.Sprintf("http://docker/networks/%s/connect", networkID),
 		"application/json", bytes.NewReader(data))
 	if err != nil {
 		return err
@@ -439,7 +439,7 @@ func (c *dockerClient) disconnectContainerFromNetwork(containerID, networkID str
 	body := map[string]any{"Container": containerID, "Force": false}
 	data, _ := json.Marshal(body)
 	resp, err := c.http.Post(
-		fmt.Sprintf("http://docker/v1.41/networks/%s/disconnect", networkID),
+		fmt.Sprintf("http://docker/networks/%s/disconnect", networkID),
 		"application/json", bytes.NewReader(data))
 	if err != nil {
 		return err
@@ -458,7 +458,7 @@ func (c *dockerClient) listContainersByLabel(labelFilter string) ([]string, erro
 		"label": {labelFilter},
 	})
 	resp, err := c.http.Get(
-		fmt.Sprintf("http://docker/v1.41/containers/json?all=true&filters=%s",
+		fmt.Sprintf("http://docker/containers/json?all=true&filters=%s",
 			url.QueryEscape(string(filterJSON))))
 	if err != nil {
 		return nil, err
@@ -478,7 +478,7 @@ func (c *dockerClient) listContainersByLabel(labelFilter string) ([]string, erro
 }
 
 func (c *dockerClient) listNetworkContainers(networkID string) ([]string, error) {
-	resp, err := c.http.Get(fmt.Sprintf("http://docker/v1.41/networks/%s", networkID))
+	resp, err := c.http.Get(fmt.Sprintf("http://docker/networks/%s", networkID))
 	if err != nil {
 		return nil, err
 	}
@@ -534,7 +534,7 @@ type DockerEvent struct {
 // 调用方应在 goroutine 中运行，ctx 取消时退出
 func (l *DockerEventListener) Listen(ctx context.Context, ch chan<- DockerEvent) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		"http://docker/v1.41/events?filters=%7B%22type%22%3A%5B%22container%22%5D%7D", nil)
+		"http://docker/events?filters=%7B%22type%22%3A%5B%22container%22%5D%7D", nil)
 	if err != nil {
 		return err
 	}
