@@ -159,10 +159,11 @@ const (
 	ActionVolumeCreate  = "volume_create"
 	ActionVolumeRemove  = "volume_rm"
 
-	ActionSystemInfo   = "info"
-	ActionSystemDF     = "df"
-	ActionSystemEvents = "events"
-	ActionSystemLogin  = "login"
+	ActionSystemInfo    = "info"
+	ActionSystemVersion = "version"
+	ActionSystemDF      = "df"
+	ActionSystemEvents  = "events"
+	ActionSystemLogin   = "login"
 
 	ActionSwarm  = "swarm"
 	ActionPlugin = "plugin"
@@ -290,8 +291,10 @@ func ClassifyAction(method, uri string) string {
 
 	case (method == "GET" || method == "HEAD") && pathMatches(path, "/_ping"):
 		return ActionSystemInfo
-	case method == "GET" && (pathMatches(path, "/info") || pathMatches(path, "/version")):
+	case method == "GET" && pathMatches(path, "/info"):
 		return ActionSystemInfo
+	case method == "GET" && pathMatches(path, "/version"):
+		return ActionSystemVersion
 	case method == "GET" && pathMatches(path, "/system/df"):
 		return ActionSystemDF
 	case method == "GET" && pathMatches(path, "/events"):

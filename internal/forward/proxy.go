@@ -1896,7 +1896,7 @@ func isAuxiliaryCall(dockerCmd, action, method, path string) bool {
 		"load":    {authz.ActionLoad},
 		"search":  {authz.ActionSearch},
 		"info":    {authz.ActionSystemInfo},
-		"version": {authz.ActionSystemInfo},
+		"version": {authz.ActionSystemVersion},
 		"events":  {authz.ActionSystemEvents},
 		"login":   {authz.ActionSystemLogin},
 		"logout":  {authz.ActionSystemLogin},
@@ -1906,7 +1906,8 @@ func isAuxiliaryCall(dockerCmd, action, method, path string) bool {
 
 	// 其他命令（如 docker run、docker ps 等）附带触发的 info/version 请求
 	// 属于辅助调用，跳过策略检查；用户直接执行 docker info/version 则走正常检查
-	if action == authz.ActionSystemInfo && dockerCmd != "info" && dockerCmd != "version" {
+	if (action == authz.ActionSystemInfo || action == authz.ActionSystemVersion) &&
+		dockerCmd != "info" && dockerCmd != "version" {
 		return true
 	}
 
