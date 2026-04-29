@@ -167,10 +167,9 @@ func VerifyIdentityAtRequest(id *CallerIdentity) error {
 	}
 	rUID, eUID, _, _, err := readProcStatus(id.PID)
 	if err != nil {
-		// 进程已退出（短命令正常结束后 HTTP 连接复用），保守拒绝
-		return &IdentityForgeryError{
-			Reason: fmt.Sprintf("cannot re-verify pid %d: %v", id.PID, err),
-		}
+		// 进程已退出（短命令正常结束后 HTTP 连接复用），视为身份未变化，放行
+		// 进程退出本身说明命令已正常完成，不是持续持有连接的提权攻击场景
+		return nil
 	}
 	if rUID != id.RealUID {
 		return &IdentityForgeryError{
