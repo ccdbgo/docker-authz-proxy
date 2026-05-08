@@ -68,10 +68,14 @@ func (p *Policy) resolve() {
 			Actions: make(map[string]bool),
 		}
 		for _, a := range rule.Actions {
-			if a == "run" {
+			switch a {
+			case "run":
 				r.Actions[ActionCreateContainer] = true
 				r.Actions[ActionStartContainer] = true
-			} else {
+			case "history":
+				// docker image history → GET /images/{id}/history → ActionHistory
+				r.Actions[ActionHistory] = true
+			default:
 				r.Actions[a] = true
 			}
 		}
@@ -143,6 +147,7 @@ const (
 	ActionPush        = "push"
 	ActionRemoveImage = "rmi"
 	ActionTag         = "tag"
+	ActionHistory     = "history"
 	ActionSearch      = "search"
 
 	ActionPrune = "prune"
@@ -253,8 +258,9 @@ func ClassifyAction(method, uri string) string {
 		return ActionPush
 	case method == "DELETE" && pathHasPrefix(path, "/images/"):
 		return ActionRemoveImage
-	case method == "GET" && (pathMatchesN(path, "/images/", "/json") ||
-		pathMatchesN(path, "/images/", "/history")):
+	case method == "GET" && pathMatchesN(path, "/images/", "/history"):
+		return ActionHistory
+	case method == "GET" && pathMatchesN(path, "/images/", "/json"):
 		return ActionInspect
 	case method == "POST" && pathMatchesN(path, "/images/", "/tag"):
 		return ActionTag
