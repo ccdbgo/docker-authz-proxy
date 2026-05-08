@@ -17,6 +17,16 @@ ssh root@server
 tar xzf /tmp/docker-authz-proxy-deploy-linux-amd64.tar.gz -C /tmp/
 sudo bash /tmp/docker-authz-proxy-deploy-linux-amd64/install.sh
 
+生成了 dist/docker-authz-proxy-src.tar.gz（120KB），包含完整源码和一键编译安装脚本。
+
+部署流程：                                                                                                                                                                                                     1. 开发机运行 bash build-src-package.sh 生成源码包
+2. scp 传到 ARM 机器                                                                                                                                                                                         
+3. ARM 机器上 sudo bash docker-authz-proxy-src/build-and-install.sh
+
+build-and-install.sh 会自动检测架构（arm64/armv7/x86_64 均可），在目标机上编译后完成全套安装（systemd 服务、配置文件、DOCKER_HOST 环境变量）。
+  
+  
+  
 install.sh 功能：
 - 自动检查系统要求（Linux x86_64、systemd）
 - 安装二进制到 /usr/local/bin/
