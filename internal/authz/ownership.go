@@ -214,6 +214,18 @@ func (o *OwnershipDB) CountContainersByOwner(uid int) (int, error) {
 	return count, err
 }
 
+// CountAccessibleImages 返回用户可访问的镜像总数（自己拥有 + 有访问权限 + 公共镜像，去重）
+func (o *OwnershipDB) CountAccessibleImages(uid int) (int, error) {
+	var count int
+	err := o.DB.QueryRow(`
+		SELECT COUNT(*) FROM (
+			SELECT image_id FROM images WHERE owner_uid = ? OR is_public = 1
+			UNION
+			SELECT image_id FROM image_access WHERE user_uid = ?
+		)`, uid, uid).Scan(&count)
+	return count, err
+}
+
 // GetContainerIDsByOwner 返回某用户拥有的所有容器 ID
 func (o *OwnershipDB) GetContainerIDsByOwner(uid int) ([]string, error) {
 	rows, err := o.DB.Query(`SELECT id FROM containers WHERE owner_uid = ?`, uid)

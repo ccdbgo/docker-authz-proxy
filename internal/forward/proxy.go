@@ -1794,6 +1794,58 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 		w.WriteHeader(resp.StatusCode)
 		_, _ = io.Copy(w, resp.Body)
 
+	case authz.ActionSystemInfo:
+		body, err := isolation.ReadFullBody(resp.Body)
+		if err != nil {
+			p.logger.Error("read_response_body_failed", zap.String("action", "info"), zap.Error(err))
+			writeDockerError(w, http.StatusBadGateway, "read upstream response failed")
+			return
+		}
+
+		// root 用户直接透传，不做过滤
+		if id.RealUID == 0 || resp.StatusCode != http.StatusOK {
+			isolation.CopyHeaders(w, resp.Header)
+			w.WriteHeader(resp.StatusCode)
+			_, _ = w.Write(body)
+			return
+		}
+
+		// 查询用户容器 ID 列表，再查实际运行状态
+		containerIDs, _ := p.db.GetContainerIDsByOwner(id.RealUID)
+		states := p.queryUserContainerStates(containerIDs)
+
+		// 查询用户可访问的镜像数量
+		imageCount, _ := p.db.CountAccessibleImages(id.RealUID)
+
+		// 将响应 JSON 解析为 map，替换计数字段后返回
+		var info map[string]json.RawMessage
+		if err := json.Unmarshal(body, &info); err != nil {
+			// 解析失败则透传原始响应
+			isolation.CopyHeaders(w, resp.Header)
+			w.WriteHeader(resp.StatusCode)
+			_, _ = w.Write(body)
+			return
+		}
+
+		info["Containers"] = json.RawMessage(strconv.Itoa(states.Total))
+		info["ContainersRunning"] = json.RawMessage(strconv.Itoa(states.Running))
+		info["ContainersPaused"] = json.RawMessage(strconv.Itoa(states.Paused))
+		info["ContainersStopped"] = json.RawMessage(strconv.Itoa(states.Stopped))
+		info["Images"] = json.RawMessage(strconv.Itoa(imageCount))
+
+		filtered, err := json.Marshal(info)
+		if err != nil {
+			isolation.CopyHeaders(w, resp.Header)
+			w.WriteHeader(resp.StatusCode)
+			_, _ = w.Write(body)
+			return
+		}
+
+		isolation.CopyHeaders(w, resp.Header)
+		w.Header().Set("Content-Length", strconv.Itoa(len(filtered)))
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(filtered)
+
 	default:
 		isolation.CopyHeaders(w, resp.Header)
 		w.WriteHeader(resp.StatusCode)
@@ -2463,6 +2515,69 @@ func (p *ProxyServer) resolveImageIDByRef(imageRef string) string {
 		return ""
 	}
 	return img.ID
+}
+
+// containerStateCounts 查询用户容器的运行状态统计
+type containerStateCounts struct {
+	Total   int
+	Running int
+	Paused  int
+	Stopped int
+}
+
+// queryUserContainerStates 通过 Docker API 查询用户容器的实际运行状态
+func (p *ProxyServer) queryUserContainerStates(containerIDs []string) containerStateCounts {
+	if len(containerIDs) == 0 {
+		return containerStateCounts{}
+	}
+
+	upstreamURL := &url.URL{
+		Scheme:   "http",
+		Host:     "docker",
+		Path:     "/containers/json",
+		RawQuery: "all=1",
+	}
+	req, err := http.NewRequest("GET", upstreamURL.String(), nil)
+	if err != nil {
+		return containerStateCounts{Total: len(containerIDs)}
+	}
+	resp, err := p.transport.RoundTrip(req)
+	if err != nil {
+		return containerStateCounts{Total: len(containerIDs)}
+	}
+	defer resp.Body.Close()
+
+	var containers []struct {
+		ID    string `json:"Id"`
+		State string `json:"State"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&containers); err != nil {
+		return containerStateCounts{Total: len(containerIDs)}
+	}
+
+	// 构建用户容器 ID 集合（支持短 ID 匹配）
+	idSet := make(map[string]bool, len(containerIDs))
+	for _, id := range containerIDs {
+		idSet[id] = true
+	}
+
+	var counts containerStateCounts
+	for _, c := range containers {
+		// 全 ID 或短 ID（12位）匹配
+		if !idSet[c.ID] && !idSet[c.ID[:min(12, len(c.ID))]] {
+			continue
+		}
+		counts.Total++
+		switch c.State {
+		case "running":
+			counts.Running++
+		case "paused":
+			counts.Paused++
+		default:
+			counts.Stopped++
+		}
+	}
+	return counts
 }
 
 // resolveContainerDockerID 通过容器名称（或短 ID）查询 dockerd 获取容器的真实 Docker ID
