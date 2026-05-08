@@ -496,7 +496,7 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		zap.String("connection", r.Header.Get("Connection")),
 	)
 
-	action := authz.ClassifyAction(r.Method, r.URL.Path)
+	action := authz.ClassifyAction(r.Method, r.URL.RequestURI())
 	policy := p.getPolicy()
 
 	isAuxiliary := isAuxiliaryCall(identity.DockerCommand, action, r.Method, r.URL.Path)
@@ -1577,20 +1577,12 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 		w.WriteHeader(resp.StatusCode)
 		_, _ = io.Copy(w, resp.Body)
 
-	case authz.ActionPull:
+	case authz.ActionImport:
 		isolation.CopyHeaders(w, resp.Header)
 		w.WriteHeader(resp.StatusCode)
-		if resp.StatusCode != http.StatusOK {
-			_, _ = io.Copy(w, resp.Body)
-			break
-		}
-		// docker import 使用 fromSrc 参数，响应体是纯文本 "sha256:..."
-		// docker pull  使用 fromImage 参数，响应体是 JSON 流
-		parsedURI, _ := url.ParseRequestURI(requestURI)
-		isImport := parsedURI != nil && parsedURI.Query().Get("fromSrc") != ""
-		if isImport {
-			body, _ := io.ReadAll(resp.Body)
-			_, _ = w.Write(body)
+		body, _ := io.ReadAll(resp.Body)
+		_, _ = w.Write(body)
+		if resp.StatusCode == http.StatusOK {
 			// 响应格式：{"status":"sha256:..."} 或纯文本 "sha256:..."
 			var statusMsg struct {
 				Status string `json:"status"`
@@ -1623,41 +1615,48 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 						)...)
 				}
 			}
-		} else {
-			streamAndCaptureImageID(w, resp, "pull")
-			imageRef := parseImageRefFromURI(requestURI)
-			if imageRef != "" {
-				if imageID := p.resolveImageIDByRef(imageRef); imageID != "" {
-					if err := p.db.SetImageOwner(imageID, id, false, "pull"); err != nil {
-						p.logger.Error("save_image_owner_failed",
-							zap.String("image_id", imageID),
-							zap.String("real_username", id.RealUsername),
-							zap.Int("real_uid", id.RealUID),
-							zap.Error(err))
-					}
-					if err := p.db.EnsureImageAccess(imageID, id.RealUID); err != nil {
-						p.logger.Error("ensure_image_access_failed",
-							zap.String("image_id", imageID),
-							zap.String("real_username", id.RealUsername),
-							zap.Int("real_uid", id.RealUID),
-							zap.Error(err))
-					} else {
-						p.logger.Info("image_pulled",
-							append(audit.LogIdentityFields(auditID),
-								zap.String("image_id", truncID(imageID)),
-								zap.String("image_ref", imageRef),
-							)...)
-					}
-					if id.RealUID == 0 {
-						if strings.Contains(requestURI, "authz.public=true") {
-							if err := p.db.SetImagePublic(imageID, true); err != nil {
-								p.logger.Error("set_image_public_failed", zap.Error(err))
-							} else {
-								p.logger.Info("image_marked_public",
-									append(audit.LogIdentityFields(auditID),
-										zap.String("image_id", truncID(imageID)),
-									)...)
-							}
+		}
+
+	case authz.ActionPull:
+		isolation.CopyHeaders(w, resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		if resp.StatusCode != http.StatusOK {
+			_, _ = io.Copy(w, resp.Body)
+			break
+		}
+		streamAndCaptureImageID(w, resp, "pull")
+		imageRef := parseImageRefFromURI(requestURI)
+		if imageRef != "" {
+			if imageID := p.resolveImageIDByRef(imageRef); imageID != "" {
+				if err := p.db.SetImageOwner(imageID, id, false, "pull"); err != nil {
+					p.logger.Error("save_image_owner_failed",
+						zap.String("image_id", imageID),
+						zap.String("real_username", id.RealUsername),
+						zap.Int("real_uid", id.RealUID),
+						zap.Error(err))
+				}
+				if err := p.db.EnsureImageAccess(imageID, id.RealUID); err != nil {
+					p.logger.Error("ensure_image_access_failed",
+						zap.String("image_id", imageID),
+						zap.String("real_username", id.RealUsername),
+						zap.Int("real_uid", id.RealUID),
+						zap.Error(err))
+				} else {
+					p.logger.Info("image_pulled",
+						append(audit.LogIdentityFields(auditID),
+							zap.String("image_id", truncID(imageID)),
+							zap.String("image_ref", imageRef),
+						)...)
+				}
+				if id.RealUID == 0 {
+					if strings.Contains(requestURI, "authz.public=true") {
+						if err := p.db.SetImagePublic(imageID, true); err != nil {
+							p.logger.Error("set_image_public_failed", zap.Error(err))
+						} else {
+							p.logger.Info("image_marked_public",
+								append(audit.LogIdentityFields(auditID),
+									zap.String("image_id", truncID(imageID)),
+								)...)
 						}
 					}
 				}
@@ -1982,6 +1981,7 @@ func isAuxiliaryCall(dockerCmd, action, method, path string) bool {
 		"pause":   {authz.ActionStop},
 		"unpause": {authz.ActionStop},
 		"pull":    {authz.ActionPull},
+		"import":  {authz.ActionImport},
 		"push":    {authz.ActionPush},
 		"build":   {authz.ActionBuild},
 		"images":  {authz.ActionImages},
@@ -2043,7 +2043,7 @@ func isHijackRequest(r *http.Request) bool {
 
 // handleHijack 处理需要双向流的请求（attach/exec-start 等）
 func (p *ProxyServer) handleHijack(w http.ResponseWriter, r *http.Request, id *auth.CallerIdentity) {
-	action := authz.ClassifyAction(r.Method, r.URL.Path)
+	action := authz.ClassifyAction(r.Method, r.URL.RequestURI())
 	p.logger.Debug("hijack_request",
 		zap.String("user", fmt.Sprintf("%s(uid=%d)", id.RealUsername, id.RealUID)),
 		zap.String("action", action),

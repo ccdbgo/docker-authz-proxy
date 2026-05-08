@@ -142,6 +142,7 @@ const (
 
 	ActionImages      = "images"
 	ActionPull        = "pull"
+	ActionImport      = "import"
 	ActionLoad        = "load"
 	ActionSave        = "save"
 	ActionBuild       = "build"
@@ -182,7 +183,9 @@ const (
 // ClassifyAction 将 HTTP method + URI 映射为操作名
 func ClassifyAction(method, uri string) string {
 	path := StripAPIVersion(uri)
+	query := ""
 	if idx := strings.Index(path, "?"); idx >= 0 {
+		query = path[idx+1:]
 		path = path[:idx]
 	}
 
@@ -247,6 +250,10 @@ func ClassifyAction(method, uri string) string {
 	case method == "POST" && pathMatches(path, "/images/prune"):
 		return ActionPrune
 	case method == "POST" && pathMatches(path, "/images/create"):
+		// docker import 使用 fromSrc 参数，docker pull 使用 fromImage 参数
+		if strings.Contains(query, "fromSrc=") {
+			return ActionImport
+		}
 		return ActionPull
 	case method == "POST" && pathMatches(path, "/images/load"):
 		return ActionLoad
