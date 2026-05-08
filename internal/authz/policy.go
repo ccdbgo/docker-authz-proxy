@@ -139,6 +139,7 @@ const (
 	ActionCp              = "cp"
 	ActionExport          = "export"
 	ActionCommit          = "commit"
+	ActionWait            = "wait"
 
 	ActionImages      = "images"
 	ActionPull        = "pull"
@@ -209,7 +210,7 @@ func ClassifyAction(method, uri string) string {
 		pathMatchesN(path, "/containers/", "/update")):
 		return ActionStop
 	case method == "POST" && pathMatchesN(path, "/containers/", "/wait"):
-		return ActionOther
+		return ActionWait
 	case method == "DELETE" && pathHasPrefix(path, "/containers/"):
 		return ActionRemoveContainer
 	case method == "POST" && (pathMatchesN(path, "/containers/", "/exec") ||
