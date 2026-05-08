@@ -1985,7 +1985,7 @@ func isAuxiliaryCall(dockerCmd, action, method, path string) bool {
 		"kill":    {authz.ActionStop},
 		"rm":      {authz.ActionRemoveContainer},
 		"exec":    {authz.ActionExec},
-		"attach":  {authz.ActionExec},
+		"attach":  {authz.ActionAttach},
 		"logs":    {authz.ActionLogs},
 		"stats":   {authz.ActionLogs},
 		"top":     {authz.ActionLogs},
@@ -2068,20 +2068,34 @@ func (p *ProxyServer) handleHijack(w http.ResponseWriter, r *http.Request, id *a
 
 	policy := p.getPolicy()
 	isAuxiliary := isAuxiliaryCall(id.DockerCommand, action, r.Method, r.URL.Path)
-	if !isAuxiliary && policy.IsDenied(id, action) {
-		auditID := toAuditIdentity(id)
-		audit.LogAuthzDeniedCommand(p.logger, auditID, action, r.URL.RequestURI())
-		writeDockerError(w, http.StatusForbidden, fmt.Sprintf("user '%s'(uid=%d) not permitted to perform: %s",
-			id.RealUsername, id.RealUID, action))
-		return
-	}
-	if _, ok := p.checkOwnershipPreRequest(w, r, id, action); !ok {
-		return
-	}
+	isDenied := !isAuxiliary && policy.IsDenied(id, action)
+
+	// 对于升级请求（Connection: Upgrade），ResponseWriter.WriteHeader 可能不会立即
+	// 发给客户端；需要先 hijack 连接，再通过原始 TCP 写拒绝响应并关闭。
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
 		p.logger.Error("hijack_not_supported")
 		writeDockerError(w, http.StatusInternalServerError, "hijack not supported")
+		return
+	}
+
+	if isDenied {
+		auditID := toAuditIdentity(id)
+		audit.LogAuthzDeniedCommand(p.logger, auditID, action, r.URL.RequestURI())
+		errMsg := fmt.Sprintf("user '%s'(uid=%d) not permitted to perform: %s", id.RealUsername, id.RealUID, action)
+		// hijack 后写拒绝响应，确保客户端能立即收到并退出
+		conn, _, hijackErr := hijacker.Hijack()
+		if hijackErr != nil {
+			writeDockerError(w, http.StatusForbidden, errMsg)
+			return
+		}
+		body := fmt.Sprintf(`{"message":%q}`, errMsg)
+		resp := fmt.Sprintf("HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
+		_, _ = conn.Write([]byte(resp))
+		conn.Close()
+		return
+	}
+	if _, ok := p.checkOwnershipPreRequest(w, r, id, action); !ok {
 		return
 	}
 	clientConn, clientBuf, err := hijacker.Hijack()

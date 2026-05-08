@@ -134,6 +134,7 @@ const (
 	ActionStop            = "stop"
 	ActionRemoveContainer = "rm"
 	ActionExec            = "exec"
+	ActionAttach          = "attach"
 	ActionInspect         = "inspect"
 	ActionLogs            = "logs"
 	ActionCp              = "cp"
@@ -214,12 +215,13 @@ func ClassifyAction(method, uri string) string {
 	case method == "DELETE" && pathHasPrefix(path, "/containers/"):
 		return ActionRemoveContainer
 	case method == "POST" && (pathMatchesN(path, "/containers/", "/exec") ||
-		pathMatchesN(path, "/containers/", "/attach") ||
 		pathMatchesN(path, "/containers/", "/resize")):
 		return ActionExec
+	case method == "POST" && pathMatchesN(path, "/containers/", "/attach"):
+		return ActionAttach
 	case method == "GET" && pathHasPrefix(path, "/containers/") &&
 		strings.Contains(path, "/attach"):
-		return ActionExec
+		return ActionAttach
 	case method == "POST" && (pathMatchesN(path, "/exec/", "/start") ||
 		pathMatchesN(path, "/exec/", "/resize")):
 		return ActionExec
