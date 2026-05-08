@@ -1580,8 +1580,51 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 	case authz.ActionPull:
 		isolation.CopyHeaders(w, resp.Header)
 		w.WriteHeader(resp.StatusCode)
-		streamAndCaptureImageID(w, resp, "pull")
-		if resp.StatusCode == http.StatusOK {
+		if resp.StatusCode != http.StatusOK {
+			_, _ = io.Copy(w, resp.Body)
+			break
+		}
+		// docker import 使用 fromSrc 参数，响应体是纯文本 "sha256:..."
+		// docker pull  使用 fromImage 参数，响应体是 JSON 流
+		parsedURI, _ := url.ParseRequestURI(requestURI)
+		isImport := parsedURI != nil && parsedURI.Query().Get("fromSrc") != ""
+		if isImport {
+			body, _ := io.ReadAll(resp.Body)
+			_, _ = w.Write(body)
+			// 响应格式：{"status":"sha256:..."} 或纯文本 "sha256:..."
+			var statusMsg struct {
+				Status string `json:"status"`
+			}
+			imageID := ""
+			if json.Unmarshal(body, &statusMsg) == nil && statusMsg.Status != "" {
+				imageID = strings.TrimPrefix(strings.TrimSpace(statusMsg.Status), "sha256:")
+			} else {
+				imageID = strings.TrimPrefix(strings.TrimSpace(string(body)), "sha256:")
+				imageID = strings.TrimRight(imageID, "\r\n")
+			}
+			if imageID != "" {
+				if err := p.db.SetImageOwner(imageID, id, false, "import"); err != nil {
+					p.logger.Error("save_image_owner_failed",
+						zap.String("image_id", truncID(imageID)),
+						zap.String("real_username", id.RealUsername),
+						zap.Int("real_uid", id.RealUID),
+						zap.Error(err))
+				}
+				if err := p.db.EnsureImageAccess(imageID, id.RealUID); err != nil {
+					p.logger.Error("ensure_image_access_failed",
+						zap.String("image_id", truncID(imageID)),
+						zap.String("real_username", id.RealUsername),
+						zap.Int("real_uid", id.RealUID),
+						zap.Error(err))
+				} else {
+					p.logger.Info("image_imported",
+						append(audit.LogIdentityFields(auditID),
+							zap.String("image_id", truncID(imageID)),
+						)...)
+				}
+			}
+		} else {
+			streamAndCaptureImageID(w, resp, "pull")
 			imageRef := parseImageRefFromURI(requestURI)
 			if imageRef != "" {
 				if imageID := p.resolveImageIDByRef(imageRef); imageID != "" {
