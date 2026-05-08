@@ -486,6 +486,19 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			zap.String("upgrade", r.Header.Get("Upgrade")),
 			zap.String("connection", r.Header.Get("Connection")),
 		)
+		// 在进入 hijack 之前先做策略检查：此时连接尚未升级，ResponseWriter 仍可
+		// 写普通 HTTP 响应，Docker CLI 能正确解析并显示 "Error response from daemon: ..."
+		hijackAction := authz.ClassifyAction(r.Method, r.URL.RequestURI())
+		hijackPolicy := p.getPolicy()
+		if !isAuxiliaryCall(identity.DockerCommand, hijackAction, r.Method, r.URL.Path) &&
+			hijackPolicy.IsDenied(identity, hijackAction) {
+			auditID := toAuditIdentity(identity)
+			audit.LogAuthzDeniedCommand(p.logger, auditID, hijackAction, r.URL.RequestURI())
+			p.auditLog.WriteEntry(makeAuditEntry(identity, r, hijackAction, "deny", "command_not_permitted", hijackAction, http.StatusForbidden))
+			writeDockerError(w, http.StatusForbidden, fmt.Sprintf("user '%s'(uid=%d) not permitted to perform: %s",
+				identity.RealUsername, identity.RealUID, hijackAction))
+			return
+		}
 		p.handleHijack(w, r, identity)
 		return
 	}
