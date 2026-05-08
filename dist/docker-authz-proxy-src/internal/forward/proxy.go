@@ -413,7 +413,7 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				zap.Int("limit", cap(p.semaphore)),
 				zap.String("uri", r.URL.RequestURI()),
 			)
-			http.Error(w, "server busy, please retry later", http.StatusServiceUnavailable)
+			writeDockerError(w, http.StatusServiceUnavailable, "server busy, please retry later")
 			return
 		}
 	}
@@ -461,7 +461,7 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			DenyReason: "authentication_required",
 			StatusCode: http.StatusUnauthorized,
 		})
-		http.Error(w, "authentication required", http.StatusUnauthorized)
+		writeDockerError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
 
@@ -474,7 +474,7 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			zap.Error(err))
 		e := makeAuditEntry(identity, r, "unknown", "deny", "identity_mutation", err.Error(), http.StatusForbidden)
 		p.auditLog.WriteEntry(e)
-		http.Error(w, "identity verification failed", http.StatusForbidden)
+		writeDockerError(w, http.StatusForbidden, "identity verification failed")
 		return
 	}
 
@@ -519,10 +519,9 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		auditID := toAuditIdentity(identity)
 		audit.LogAuthzDeniedCommand(p.logger, auditID, action, r.URL.RequestURI())
 		p.auditLog.WriteEntry(makeAuditEntry(identity, r, action, "deny", "command_not_permitted", "", http.StatusForbidden))
-		http.Error(w,
+		writeDockerError(w, http.StatusForbidden,
 			fmt.Sprintf("user '%s'(uid=%d) not permitted to perform: %s",
-				identity.RealUsername, identity.RealUID, action),
-			http.StatusForbidden)
+				identity.RealUsername, identity.RealUID, action))
 		return
 	}
 
@@ -545,7 +544,7 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			zap.String("real_username", identity.RealUsername),
 			zap.Int("real_uid", identity.RealUID),
 		)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		writeDockerError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	p.logger.Debug("preprocess_request_done",
@@ -572,7 +571,7 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			zap.String("action", action),
 			zap.Int("status_code", statusCode),
 			zap.Error(err))
-		http.Error(w, "upstream error: "+err.Error(), statusCode)
+		writeDockerError(w, statusCode, "upstream error: "+err.Error())
 		return
 	}
 	defer resp.Body.Close()
@@ -676,7 +675,7 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 							append(audit.LogIdentityFields(auditID),
 								zap.String("image_ref", imageRef),
 							)...)
-						http.Error(w, fmt.Sprintf("No such image: %s", imageRef), http.StatusNotFound)
+						writeDockerError(w, http.StatusNotFound, fmt.Sprintf("No such image: %s", imageRef))
 						return false
 					}
 				} else if isPublic {
@@ -689,7 +688,7 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 								zap.String("image_ref", imageRef),
 								zap.String("image_id", truncID(resolvedID)),
 							)...)
-						http.Error(w, fmt.Sprintf("No such image: %s", imageRef), http.StatusNotFound)
+						writeDockerError(w, http.StatusNotFound, fmt.Sprintf("No such image: %s", imageRef))
 						return false
 					}
 				}
@@ -734,7 +733,7 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 						zap.String("excess", qr.DeniedExcess),
 					)...)
 				p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "quota_exceeded", qErr.Error(), http.StatusForbidden))
-				http.Error(w, qErr.Error(), http.StatusForbidden)
+				writeDockerError(w, http.StatusForbidden, qErr.Error())
 				return false
 			}
 
@@ -755,7 +754,7 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 						zap.String("detail", mountErr.Error()),
 					)...)
 				p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "bind_mount_not_allowed", mountErr.Error(), http.StatusForbidden))
-				http.Error(w, mountErr.Error(), http.StatusForbidden)
+				writeDockerError(w, http.StatusForbidden, mountErr.Error())
 				return false
 			}
 
@@ -796,7 +795,7 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 					append(audit.LogIdentityFields(auditID),
 						zap.Error(bridgeErr),
 					)...)
-				http.Error(w, "failed to initialize user network: "+bridgeErr.Error(), http.StatusInternalServerError)
+				writeDockerError(w, http.StatusInternalServerError, "failed to initialize user network: "+bridgeErr.Error())
 				return false
 			} else if networkID != "" {
 				bridgeName := isolation.UserBridgeName(id.RealUID)
@@ -842,10 +841,9 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 				!p.db.CanUseImage(id.RealUID, "sha256:"+imageRef) {
 				auditID := toAuditIdentity(id)
 				audit.LogAuthzDeniedImageAccess(p.logger, auditID, truncID(imageRef), action, "image_not_permitted")
-				http.Error(w,
+				writeDockerError(w, http.StatusForbidden,
 					fmt.Sprintf("user '%s'(uid=%d) not permitted to access image '%s'",
-						id.RealUsername, id.RealUID, truncID(imageRef)),
-					http.StatusForbidden)
+						id.RealUsername, id.RealUID, truncID(imageRef)))
 				return false
 			}
 		}
@@ -977,7 +975,7 @@ func (p *ProxyServer) checkImageRemovePermission(w http.ResponseWriter, r *http.
 			if isPublic {
 				msg = fmt.Sprintf("image '%s' is public and belongs to user '%s', only the owner can remove it", truncID(resolvedID), owner.Username)
 			}
-			http.Error(w, msg, http.StatusForbidden)
+			writeDockerError(w, http.StatusForbidden, msg)
 			return false
 		}
 	}
@@ -986,9 +984,8 @@ func (p *ProxyServer) checkImageRemovePermission(w http.ResponseWriter, r *http.
 	inUse, err := p.db.HasContainerUsingImage(id.RealUID, resolvedID)
 	if err != nil || inUse {
 		audit.LogAuthzDeniedImageAccess(p.logger, auditID, truncID(resolvedID), authz.ActionRemoveImage, "image_in_use_by_user_containers")
-		http.Error(w,
-			fmt.Sprintf("image '%s' is still used by your containers, remove them first", truncID(resolvedID)),
-			http.StatusConflict)
+		writeDockerError(w, http.StatusConflict,
+			fmt.Sprintf("image '%s' is still used by your containers, remove them first", truncID(resolvedID)))
 		return false
 	}
 
@@ -997,7 +994,7 @@ func (p *ProxyServer) checkImageRemovePermission(w http.ResponseWriter, r *http.
 	if isOwner && isPublic {
 		refCount, err := p.db.GetImageRefCount(resolvedID)
 		if err != nil {
-			http.Error(w, "internal error", http.StatusInternalServerError)
+			writeDockerError(w, http.StatusInternalServerError, "internal error")
 			return false
 		}
 		if refCount > 1 {
@@ -1008,10 +1005,9 @@ func (p *ProxyServer) checkImageRemovePermission(w http.ResponseWriter, r *http.
 					zap.Int("ref_count", refCount),
 					zap.Ints("ref_uids", refUsers),
 				)...)
-			http.Error(w,
+			writeDockerError(w, http.StatusConflict,
 				fmt.Sprintf("image '%s' is still referenced by %d other user(s); cannot delete until all references are removed",
-					truncID(resolvedID), refCount-1),
-				http.StatusConflict)
+					truncID(resolvedID), refCount-1))
 			return false
 		}
 	}
@@ -1027,7 +1023,7 @@ func (p *ProxyServer) checkImagePullPermission(w http.ResponseWriter, r *http.Re
 		return true
 	}
 	if r.URL.Query().Get("authz.public") == "true" {
-		http.Error(w, "only root can mark images as public", http.StatusForbidden)
+		writeDockerError(w, http.StatusForbidden, "only root can mark images as public")
 		return false
 	}
 
@@ -1056,7 +1052,7 @@ func (p *ProxyServer) checkImagePullPermission(w http.ResponseWriter, r *http.Re
 					zap.String("real_username", id.RealUsername),
 					zap.Int("real_uid", id.RealUID),
 					zap.Error(err))
-				http.Error(w, "internal error", http.StatusInternalServerError)
+				writeDockerError(w, http.StatusInternalServerError, "internal error")
 				return false
 			}
 			p.logger.Info("image_pull_virtual",
@@ -1083,7 +1079,7 @@ func (p *ProxyServer) checkImagePullPermission(w http.ResponseWriter, r *http.Re
 				zap.String("real_username", id.RealUsername),
 				zap.Int("real_uid", id.RealUID),
 				zap.Error(err))
-			http.Error(w, "internal error", http.StatusInternalServerError)
+			writeDockerError(w, http.StatusInternalServerError, "internal error")
 			return false
 		}
 		p.logger.Info("image_pull_virtual",
@@ -1150,9 +1146,8 @@ func (p *ProxyServer) checkImagePushPermission(w http.ResponseWriter, r *http.Re
 	if !found {
 		auditID := toAuditIdentity(id)
 		audit.LogAuthzDeniedNotTracked(p.logger, auditID, "image", truncID(resolvedID), authz.ActionPush)
-		http.Error(w,
-			fmt.Sprintf("image '%s' not tracked by proxy (only root can push untracked images)", truncID(resolvedID)),
-			http.StatusForbidden)
+		writeDockerError(w, http.StatusForbidden,
+			fmt.Sprintf("image '%s' not tracked by proxy (only root can push untracked images)", truncID(resolvedID)))
 		return false
 	}
 	if owner.UID != id.RealUID {
@@ -1358,7 +1353,7 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 		body, err := isolation.ReadFullBody(resp.Body)
 		if err != nil {
 			p.logger.Error("read_response_body_failed", zap.String("action", "ps"), zap.Error(err))
-			http.Error(w, "read upstream response failed", http.StatusBadGateway)
+			writeDockerError(w, http.StatusBadGateway, "read upstream response failed")
 			return
 		}
 		totalCount = isolation.CountJSONArray(body)
@@ -1379,7 +1374,7 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 	case authz.ActionImages:
 		body, err := isolation.ReadFullBody(resp.Body)
 		if err != nil {
-			http.Error(w, "read upstream response failed", http.StatusBadGateway)
+			writeDockerError(w, http.StatusBadGateway, "read upstream response failed")
 			return
 		}
 		totalCount = isolation.CountJSONArray(body)
@@ -1401,7 +1396,7 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 		body, err := isolation.ReadFullBody(resp.Body)
 		if err != nil {
 			p.logger.Error("read_response_body_failed", zap.String("action", "create"), zap.Error(err))
-			http.Error(w, "read upstream response failed", http.StatusBadGateway)
+			writeDockerError(w, http.StatusBadGateway, "read upstream response failed")
 			return
 		}
 		if resp.StatusCode == http.StatusCreated {
@@ -1492,7 +1487,7 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 	case authz.ActionCommit:
 		body, err := isolation.ReadFullBody(resp.Body)
 		if err != nil {
-			http.Error(w, "read upstream response failed", http.StatusBadGateway)
+			writeDockerError(w, http.StatusBadGateway, "read upstream response failed")
 			return
 		}
 		if resp.StatusCode == http.StatusCreated {
@@ -1524,7 +1519,7 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 	case authz.ActionPrune:
 		body, err := isolation.ReadFullBody(resp.Body)
 		if err != nil {
-			http.Error(w, "read upstream response failed", http.StatusBadGateway)
+			writeDockerError(w, http.StatusBadGateway, "read upstream response failed")
 			return
 		}
 		if resp.StatusCode == http.StatusOK {
@@ -1680,7 +1675,7 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 	case authz.ActionNetworkCreate:
 		body, err := isolation.ReadFullBody(resp.Body)
 		if err != nil {
-			http.Error(w, "read upstream response failed", http.StatusBadGateway)
+			writeDockerError(w, http.StatusBadGateway, "read upstream response failed")
 			return
 		}
 		if resp.StatusCode == http.StatusCreated {
@@ -1709,7 +1704,7 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 	case authz.ActionNetworkList:
 		body, err := isolation.ReadFullBody(resp.Body)
 		if err != nil {
-			http.Error(w, "read upstream response failed", http.StatusBadGateway)
+			writeDockerError(w, http.StatusBadGateway, "read upstream response failed")
 			return
 		}
 		totalCount = isolation.CountJSONArray(body)
@@ -1743,7 +1738,7 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 	case authz.ActionVolumeCreate:
 		body, err := isolation.ReadFullBody(resp.Body)
 		if err != nil {
-			http.Error(w, "read upstream response failed", http.StatusBadGateway)
+			writeDockerError(w, http.StatusBadGateway, "read upstream response failed")
 			return
 		}
 		if resp.StatusCode == http.StatusCreated {
@@ -1767,7 +1762,7 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 	case authz.ActionVolumeList:
 		body, err := isolation.ReadFullBody(resp.Body)
 		if err != nil {
-			http.Error(w, "read upstream response failed", http.StatusBadGateway)
+			writeDockerError(w, http.StatusBadGateway, "read upstream response failed")
 			return
 		}
 		totalCount = isolation.CountVolumeList(body)
@@ -1960,8 +1955,8 @@ func (p *ProxyServer) handleHijack(w http.ResponseWriter, r *http.Request, id *a
 	if !isAuxiliary && policy.IsDenied(id, action) {
 		auditID := toAuditIdentity(id)
 		audit.LogAuthzDeniedCommand(p.logger, auditID, action, r.URL.RequestURI())
-		http.Error(w, fmt.Sprintf("user '%s'(uid=%d) not permitted to perform: %s",
-			id.RealUsername, id.RealUID, action), http.StatusForbidden)
+		writeDockerError(w, http.StatusForbidden, fmt.Sprintf("user '%s'(uid=%d) not permitted to perform: %s",
+			id.RealUsername, id.RealUID, action))
 		return
 	}
 	if !p.checkOwnershipPreRequest(w, r, id, action) {
@@ -1971,13 +1966,13 @@ func (p *ProxyServer) handleHijack(w http.ResponseWriter, r *http.Request, id *a
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
 		p.logger.Error("hijack_not_supported")
-		http.Error(w, "hijack not supported", http.StatusInternalServerError)
+		writeDockerError(w, http.StatusInternalServerError, "hijack not supported")
 		return
 	}
 	clientConn, clientBuf, err := hijacker.Hijack()
 	if err != nil {
 		p.logger.Error("hijack_failed", zap.Error(err))
-		http.Error(w, "hijack failed: "+err.Error(), http.StatusInternalServerError)
+		writeDockerError(w, http.StatusInternalServerError, "hijack failed: "+err.Error())
 		return
 	}
 	defer clientConn.Close()
@@ -2414,6 +2409,14 @@ func writeDockerNotFound(w http.ResponseWriter, kind, name string) {
 	_, _ = fmt.Fprintf(w, `{"message":%q}`, msg)
 }
 
+// writeDockerError 以 Docker daemon 标准 JSON 错误格式响应，
+// 确保 Docker CLI 能正确解析错误信息而不产生冗余输出。
+func writeDockerError(w http.ResponseWriter, statusCode int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	_, _ = fmt.Fprintf(w, `{"message":%q}`, msg)
+}
+
 // resolveImageIDByRef 查询 dockerd 获取镜像的真实内容 ID
 func (p *ProxyServer) resolveImageIDByRef(imageRef string) string {
 	upstreamURL := &url.URL{
@@ -2707,7 +2710,7 @@ func (p *ProxyServer) checkPortConflict(w http.ResponseWriter, r *http.Request,
 				m.HostPort, m.Protocol, existing.ContainerID[:min(12, len(existing.ContainerID))],
 				existing.OwnerUsername)
 			p.auditLog.WriteEntry(makeAuditEntry(id, r, "container_create", "deny", "port_conflict", msg, http.StatusConflict))
-			http.Error(w, msg, http.StatusConflict)
+			writeDockerError(w, http.StatusConflict, msg)
 			return false
 		}
 	}
