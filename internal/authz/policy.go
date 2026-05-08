@@ -137,6 +137,7 @@ const (
 	ActionInspect         = "inspect"
 	ActionLogs            = "logs"
 	ActionCp              = "cp"
+	ActionExport          = "export"
 	ActionCommit          = "commit"
 
 	ActionImages      = "images"
@@ -233,7 +234,7 @@ func ClassifyAction(method, uri string) string {
 	case method == "PUT" && pathMatchesN(path, "/containers/", "/archive"):
 		return ActionCp
 	case method == "GET" && pathMatchesN(path, "/containers/", "/export"):
-		return ActionCp
+		return ActionExport
 	case method == "POST" && pathMatches(path, "/commit"):
 		return ActionCommit
 
