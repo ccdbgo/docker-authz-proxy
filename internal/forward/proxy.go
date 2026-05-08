@@ -1285,6 +1285,10 @@ func (p *ProxyServer) forward(r *http.Request) (*http.Response, error) {
 		outReq.ContentLength = r.ContentLength
 		if len(bodyBytes) > 0 {
 			outReq.ContentLength = int64(len(bodyBytes))
+		} else if body == nil && outReq.ContentLength < 0 {
+			// body 为 nil 时 ContentLength 不能为 -1，否则 http.Transport 会报错
+			// （docker import <url> 场景：fromSrc 作为 query 参数，body 为空）
+			outReq.ContentLength = 0
 		}
 
 		resp, err = p.transport.RoundTrip(outReq)
