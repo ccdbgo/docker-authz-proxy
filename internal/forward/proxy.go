@@ -813,7 +813,22 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 				}
 			}
 
-			injected, err := isolation.InjectUserNetwork(body, id.RealUID, peerNetIDs)
+			// 收集用户显式指定的网络名（加前缀后的真实名称），传给 InjectUserNetwork 保留
+			var userRequestedNets []string
+			prefix := isolation.UserResourcePrefix(id)
+			bridgeName := isolation.UserBridgeName(id.RealUID)
+			for _, netName := range isolation.ExtractRequestedNetworks(body) {
+				if netName == "default" || netName == "bridge" || netName == "host" || netName == "none" || netName == bridgeName {
+					continue
+				}
+				if strings.HasPrefix(netName, prefix) {
+					userRequestedNets = append(userRequestedNets, netName)
+				} else {
+					userRequestedNets = append(userRequestedNets, prefix+netName)
+				}
+			}
+
+			injected, err := isolation.InjectUserNetwork(body, id.RealUID, peerNetIDs, userRequestedNets)
 			if err == nil {
 				r.Body = io.NopCloser(bytes.NewReader(injected))
 			} else {
