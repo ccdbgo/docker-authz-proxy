@@ -2010,6 +2010,7 @@ func isAuxiliaryCall(dockerCmd, action, method, path string) bool {
 		"unpause": {authz.ActionStop},
 		"wait":    {authz.ActionWait},
 		"rename":  {authz.ActionRename},
+		"diff":    {authz.ActionDiff},
 		"pull":    {authz.ActionPull},
 		"import":  {authz.ActionImport},
 		"push":    {authz.ActionPush},

@@ -138,6 +138,7 @@ const (
 	ActionAttach          = "attach"
 	ActionInspect         = "inspect"
 	ActionLogs            = "logs"
+	ActionDiff            = "diff"
 	ActionCp              = "cp"
 	ActionExport          = "export"
 	ActionCommit          = "commit"
@@ -234,9 +235,10 @@ func ClassifyAction(method, uri string) string {
 		return ActionInspect
 	case method == "GET" && (pathMatchesN(path, "/containers/", "/logs") ||
 		pathMatchesN(path, "/containers/", "/stats") ||
-		pathMatchesN(path, "/containers/", "/top") ||
-		pathMatchesN(path, "/containers/", "/changes")):
+		pathMatchesN(path, "/containers/", "/top")):
 		return ActionLogs
+	case method == "GET" && pathMatchesN(path, "/containers/", "/changes"):
+		return ActionDiff
 	case (method == "GET" || method == "HEAD") && pathMatchesN(path, "/containers/", "/archive"):
 		return ActionCp
 	case method == "PUT" && pathMatchesN(path, "/containers/", "/archive"):
