@@ -81,6 +81,13 @@ type CallerIdentity struct {
 	ClientAddr string
 }
 
+// IsPrivileged 返回 true 表示该调用方拥有 root 级别权限：
+// 直接 root 用户，或通过 sudo/su 获得 root 的用户。
+// 这类用户跳过资源隔离、配额检查和 ownership 过滤。
+func (id *CallerIdentity) IsPrivileged() bool {
+	return id.RealUID == 0 || id.UserType == UserTypeSudo
+}
+
 // parseDockerCommand 从命令行中解析用户主动执行的 docker 子命令
 func parseDockerCommand(cmdline string) string {
 	if cmdline == "" {

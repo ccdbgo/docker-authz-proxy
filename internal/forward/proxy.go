@@ -633,13 +633,13 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 	if containerID != "" && !nonContainerIDs[containerID] {
 		owner, found := p.db.GetContainerOwner(containerID)
 		if !found {
-			if id.RealUID != 0 {
+			if !id.IsPrivileged() {
 				// 数据库中未找到 → 通过 Docker API 读取容器标签，进行标签归属核验
 				if !p.checkContainerOwnershipByLabel(w, id, containerID, action) {
 					return r, false
 				}
 			}
-		} else if owner.UID != id.RealUID && id.RealUID != 0 {
+		} else if owner.UID != id.RealUID && !id.IsPrivileged() {
 			// root (uid=0) 可访问所有容器，普通用户只能访问自己的容器
 			auditID := toAuditIdentity(id)
 			auditOwner := &audit.OwnerInfo{Username: owner.Username, UID: owner.UID, GID: owner.GID}
@@ -662,13 +662,13 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 			}
 			owner, found := p.db.GetContainerOwner(dockerID)
 			if !found {
-				if id.RealUID != 0 {
+				if !id.IsPrivileged() {
 					// DB 中未找到 → 回退到标签归属核验（容器可能在代理重启前创建）
 					if !p.checkContainerOwnershipByLabel(w, id, qContainerID, action) {
 						return r, false
 					}
 				}
-			} else if owner.UID != id.RealUID && id.RealUID != 0 {
+			} else if owner.UID != id.RealUID && !id.IsPrivileged() {
 				auditID := toAuditIdentity(id)
 				auditOwner := &audit.OwnerInfo{Username: owner.Username, UID: owner.UID, GID: owner.GID}
 				audit.LogAuthzDeniedOwnership(p.logger, auditID, auditOwner, "container", truncID(qContainerID), action)
@@ -687,7 +687,7 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 			} else {
 				_, isPublic, found := p.db.GetImageOwner(resolvedID)
 				if !found {
-					if id.RealUID != 0 {
+					if !id.IsPrivileged() {
 						auditID := toAuditIdentity(id)
 						p.logger.Info("image_not_tracked_trigger_pull",
 							append(audit.LogIdentityFields(auditID),
@@ -716,14 +716,14 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 		// 检查容器创建请求中显式指定的网络权限（非 root 用户）
 		// 防止 docker run --network alice-net 或 docker network connect alice-net $(docker run -d ...)
 		// 在容器创建阶段就拒绝，避免先 pull 镜像/创建容器再失败
-		if id.RealUID != 0 {
+		if !id.IsPrivileged() {
 			if err := p.checkCreateContainerNetworks(w, r, id, action); err != nil {
 				return r, false
 			}
 		}
 
 		// 步骤3+4：查询配额，校验请求参数，记录详细审计日志
-		if p.quota != nil && id.RealUID != 0 {
+		if p.quota != nil && !id.IsPrivileged() {
 			quota := p.quota.GetQuota(id)
 			auditID := toAuditIdentity(id)
 			p.logger.Info("quota_resolved",
@@ -760,7 +760,7 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 		}
 
 		// 网络注入：强制容器接入用户专属桥接网络（root 用户跳过）
-		if id.RealUID != 0 {
+		if !id.IsPrivileged() {
 			body, _ := io.ReadAll(r.Body)
 			r.Body.Close()
 
@@ -905,7 +905,7 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 	switch action {
 	case authz.ActionNetworkInspect, authz.ActionNetworkConnect, authz.ActionNetworkDisconnect, authz.ActionNetworkRemove:
 		networkName := isolation.ExtractNetworkID(r.URL.Path)
-		if networkName != "" && id.RealUID != 0 {
+		if networkName != "" && !id.IsPrivileged() {
 			// 尝试按用户前缀名查找真实 Docker 网络 ID
 			prefix := isolation.UserResourcePrefix(id)
 			lookupName := networkName
@@ -934,7 +934,7 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 
 	if action == authz.ActionVolumeRemove {
 		volName := isolation.ExtractVolumeName(r.URL.Path)
-		if volName != "" && id.RealUID != 0 {
+		if volName != "" && !id.IsPrivileged() {
 			// 补全用户前缀以匹配 DB 中存储的卷名
 			prefix := isolation.UserVolumePrefix(id.RealUID)
 			if !strings.HasPrefix(volName, prefix) {
@@ -987,7 +987,7 @@ func (p *ProxyServer) checkImageRemovePermission(w http.ResponseWriter, r *http.
 	}
 	owner, isPublic, found := p.db.GetImageOwner(resolvedID)
 	if !found {
-		if id.RealUID != 0 {
+		if !id.IsPrivileged() {
 			auditID := toAuditIdentity(id)
 			audit.LogAuthzDeniedNotTracked(p.logger, auditID, "image", truncID(resolvedID), authz.ActionRemoveImage)
 			writeDockerNotFound(w, "image", resolvedID)
@@ -999,7 +999,7 @@ func (p *ProxyServer) checkImageRemovePermission(w http.ResponseWriter, r *http.
 	auditID := toAuditIdentity(id)
 
 	// 非 root：只有属主才能 rmi
-	if id.RealUID != 0 {
+	if !id.IsPrivileged() {
 		isImageOwner := owner.UID == id.RealUID
 		if !isImageOwner {
 			auditOwner := &audit.OwnerInfo{Username: owner.Username, UID: owner.UID, GID: owner.GID}
@@ -1023,7 +1023,7 @@ func (p *ProxyServer) checkImageRemovePermission(w http.ResponseWriter, r *http.
 	}
 
 	// 属主或 root 尝试物理删除时，若其他用户还有引用则阻止
-	isOwner := id.RealUID == 0 || owner.UID == id.RealUID
+	isOwner := id.IsPrivileged() || owner.UID == id.RealUID
 	if isOwner && isPublic {
 		refCount, err := p.db.GetImageRefCount(resolvedID)
 		if err != nil {
@@ -1052,7 +1052,7 @@ func (p *ProxyServer) checkImageRemovePermission(w http.ResponseWriter, r *http.
 // - 公共镜像：所有用户可拉取；覆盖公共镜像只有属主或 root 可操作
 // - 私有镜像：只有属主或 root 可拉取
 func (p *ProxyServer) checkImagePullPermission(w http.ResponseWriter, r *http.Request, id *auth.CallerIdentity) bool {
-	if id.RealUID == 0 {
+	if id.IsPrivileged() {
 		return true
 	}
 	if r.URL.Query().Get("authz.public") == "true" {
@@ -1132,7 +1132,7 @@ func (p *ProxyServer) checkImagePullPermission(w http.ResponseWriter, r *http.Re
 
 // checkImageTagPermission 校验 docker tag 权限：属主、有访问权限的用户或 root 可打标签
 func (p *ProxyServer) checkImageTagPermission(w http.ResponseWriter, r *http.Request, id *auth.CallerIdentity) bool {
-	if id.RealUID == 0 {
+	if id.IsPrivileged() {
 		return true
 	}
 	imageRef := authz.ExtractImageID(r.URL.Path)
@@ -1164,7 +1164,7 @@ func (p *ProxyServer) checkImageTagPermission(w http.ResponseWriter, r *http.Req
 
 // checkImagePushPermission 校验 docker push 权限：只有属主或 root 可推送
 func (p *ProxyServer) checkImagePushPermission(w http.ResponseWriter, r *http.Request, id *auth.CallerIdentity) bool {
-	if id.RealUID == 0 {
+	if id.IsPrivileged() {
 		return true
 	}
 	imageRef := authz.ExtractImageID(r.URL.Path)
@@ -1199,11 +1199,11 @@ func (p *ProxyServer) preprocessRequest(r *http.Request, id *auth.CallerIdentity
 	switch action {
 	case authz.ActionNetworkInspect, authz.ActionNetworkConnect,
 		authz.ActionNetworkDisconnect, authz.ActionNetworkRemove:
-		if id.RealUID != 0 {
+		if !id.IsPrivileged() {
 			r = isolation.RewriteNetworkURL(r, id)
 		}
 	case authz.ActionVolumeInspect, authz.ActionVolumeRemove:
-		if id.RealUID != 0 {
+		if !id.IsPrivileged() {
 			r = isolation.RewriteVolumeURL(r, id.RealUID)
 		}
 	}
@@ -1224,7 +1224,7 @@ func (p *ProxyServer) preprocessRequest(r *http.Request, id *auth.CallerIdentity
 	switch action {
 	case authz.ActionCreateContainer:
 		// 注入容器名称前缀（user-{uid}-），并将改写后名称存入 context 供审计使用
-		if id.RealUID != 0 {
+		if !id.IsPrivileged() {
 			rewritten, rewrittenName, _ := isolation.InjectContainerNamePrefix(body, id)
 			if rewrittenName != "" {
 				body = rewritten
@@ -1241,7 +1241,7 @@ func (p *ProxyServer) preprocessRequest(r *http.Request, id *auth.CallerIdentity
 		}
 
 	case authz.ActionNetworkCreate:
-		if id.RealUID != 0 {
+		if !id.IsPrivileged() {
 			modified, actualName, _ := isolation.InjectNetworkNamePrefixWithName(body, id)
 			body = modified
 			if actualName != "" {
@@ -1251,7 +1251,7 @@ func (p *ProxyServer) preprocessRequest(r *http.Request, id *auth.CallerIdentity
 		}
 
 	case authz.ActionVolumeCreate:
-		if id.RealUID != 0 {
+		if !id.IsPrivileged() {
 			body, _ = isolation.InjectVolumeNamePrefix(body, id)
 		}
 	}
@@ -1460,7 +1460,7 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 						)...)
 				}
 				// 写入端口映射记录（容器创建成功后才写入，避免失败时留下脏数据）
-				if id.RealUID != 0 {
+				if !id.IsPrivileged() {
 					if portMappings, ok := r.Context().Value(portMappingsCtxKey).([]isolation.PortMapping); ok && len(portMappings) > 0 {
 						dbMappings := make([]authz.PortMappingInfo, 0, len(portMappings))
 						for _, m := range portMappings {
@@ -1680,7 +1680,7 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 							zap.String("image_ref", imageRef),
 						)...)
 				}
-				if id.RealUID == 0 {
+				if id.IsPrivileged() {
 					if strings.Contains(requestURI, "authz.public=true") {
 						if err := p.db.SetImagePublic(imageID, true); err != nil {
 							p.logger.Error("set_image_public_failed", zap.Error(err))
@@ -1881,7 +1881,7 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 		}
 
 		// root 用户直接透传，不做过滤
-		if id.RealUID == 0 || resp.StatusCode != http.StatusOK {
+		if id.IsPrivileged() || resp.StatusCode != http.StatusOK {
 			isolation.CopyHeaders(w, resp.Header)
 			w.WriteHeader(resp.StatusCode)
 			_, _ = w.Write(body)
