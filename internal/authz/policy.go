@@ -137,6 +137,7 @@ const (
 	ActionExec            = "exec"
 	ActionAttach          = "attach"
 	ActionInspect         = "inspect"
+	ActionPort            = "port"
 	ActionLogs            = "logs"
 	ActionDiff            = "diff"
 	ActionCp              = "cp"
@@ -183,6 +184,22 @@ const (
 
 	ActionOther = "other"
 )
+
+// cmdActionOverrides 记录"同一 API、不同命令"需要覆盖 action 的映射。
+// 当 DockerCommand 在此表中时，用对应的 action 替换 ClassifyAction 的结果。
+var cmdActionOverrides = map[string]string{
+	"port": ActionPort,
+}
+
+// OverrideActionByCommand 根据 DockerCommand 将通用 action 替换为更具体的 action。
+// 例如 docker port 和 docker inspect 都调用 GET /containers/{id}/json（ActionInspect），
+// 但通过命令名可以区分，使 policy 能独立控制它们。
+func OverrideActionByCommand(dockerCmd, action string) string {
+	if override, ok := cmdActionOverrides[dockerCmd]; ok {
+		return override
+	}
+	return action
+}
 
 // ClassifyAction 将 HTTP method + URI 映射为操作名
 func ClassifyAction(method, uri string) string {

@@ -512,6 +512,10 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	action := authz.ClassifyAction(r.Method, r.URL.RequestURI())
 	policy := p.getPolicy()
 
+	// 某些 Docker 命令共用同一个 API（如 port/inspect 都调用 GET /containers/{id}/json）
+	// 用 DockerCommand 推导出更具体的 action，使 policy 可以独立控制它们
+	action = authz.OverrideActionByCommand(identity.DockerCommand, action)
+
 	isAuxiliary := isAuxiliaryCall(identity.DockerCommand, action, r.Method, r.URL.Path)
 
 	p.logger.Debug("authz_trace",
@@ -2006,6 +2010,7 @@ func isAuxiliaryCall(dockerCmd, action, method, path string) bool {
 		"commit":  {authz.ActionCommit},
 		"ps":      {authz.ActionPS},
 		"inspect": {authz.ActionInspect},
+		"port":    {authz.ActionPort},
 		"pause":   {authz.ActionStop},
 		"unpause": {authz.ActionStop},
 		"wait":    {authz.ActionWait},
@@ -2074,7 +2079,7 @@ func isHijackRequest(r *http.Request) bool {
 
 // handleHijack 处理需要双向流的请求（attach/exec-start 等）
 func (p *ProxyServer) handleHijack(w http.ResponseWriter, r *http.Request, id *auth.CallerIdentity) {
-	action := authz.ClassifyAction(r.Method, r.URL.RequestURI())
+	action := authz.OverrideActionByCommand(id.DockerCommand, authz.ClassifyAction(r.Method, r.URL.RequestURI()))
 	p.logger.Debug("hijack_request",
 		zap.String("user", fmt.Sprintf("%s(uid=%d)", id.RealUsername, id.RealUID)),
 		zap.String("action", action),
