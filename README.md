@@ -276,6 +276,59 @@ docker-authz-proxy/
 └── deploy-to-linux.sh      # Linux 端编译部署脚本
 ```
 
+## Sudo 用户处理逻辑
+
+### 身份识别
+
+连接建立时，代理通过三个内核数据源确定调用方身份：
+
+```
+SO_PEERCRED       →  eUID = 0（sudo 提权后的有效 UID）
+/proc/PID/loginuid →  loginUID = 1001（原始登录用户，内核 audit 维护，不可伪造）
+/etc/passwd        →  loginUsername = "alice"
+```
+
+判断规则：
+
+| eUID | loginUID | 结论 | UserType |
+|------|----------|------|----------|
+| != 0 | 任意 | 普通用户（或 su 到普通用户） | `UserTypeRegular` |
+| 0 | > 0 | 普通用户通过 sudo/su 获得 root | `UserTypeSudo` |
+| 0 | 0 或未设置 | 直接以 root 身份登录 | `UserTypeRoot` |
+
+sudo 用户的 `RealUID` 保持原始登录 UID（如 1001），**不会**改为 0。
+
+### 权限判断
+
+```go
+func (id *CallerIdentity) IsPrivileged() bool {
+    return id.RealUID == 0 || id.UserType == UserTypeSudo
+}
+```
+
+代理中所有权限判断均调用 `IsPrivileged()`，sudo 用户与直接 root 享有相同的资源访问权限。
+
+### 实际效果
+
+| 检查项 | 普通用户 | sudo 用户 | root |
+|--------|----------|-----------|------|
+| `docker ps/images/network ls/volume ls` 列表过滤 | 只看自己的 | 看全部 | 看全部 |
+| 容器 / 镜像 ownership 检查 | 只能操作自己的 | 跳过 | 跳过 |
+| 资源配额（CPU / 内存 / 容器数） | 受限 | 跳过 | 跳过 |
+| 网络注入（强制接入私有桥） | 强制注入 | 跳过 | 跳过 |
+| bind mount / volume 路径校验 | 受限 | 跳过 | 跳过 |
+| policy deny 规则 | 受限 | **受限** | **受限** |
+
+> **注意**：policy deny 规则对 sudo 用户仍然生效。`IsDenied()` 使用 `RealUID`（原始登录 UID），若 policy 中禁止了该用户的某个操作，sudo 后依然被拒绝。sudo 只绕过资源隔离，不绕过显式的 deny 规则。
+
+### 审计追踪
+
+审计日志中记录的始终是 `RealUID` 和 `RealUsername`（原始登录用户），而非 root，确保操作可追溯到具体执行人。
+
+```json
+{"user": "alice", "uid": 1001, "user_type": "sudo", "action": "ps", "result": "allow"}
+```
+
 ## 安全说明
 
 - **Socket 权限**：每用户 socket 权限 `600`，仅所有者可访问
