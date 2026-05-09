@@ -1394,7 +1394,7 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 			return
 		}
 		totalCount = isolation.CountJSONArray(body)
-		filtered, err := isolation.FilterContainerListResponse(body, id.RealUID, id.RealUsername, p.db)
+		filtered, err := isolation.FilterContainerListResponse(body, id.RealUID, id.RealUsername, id.IsPrivileged(), p.db)
 		if err != nil {
 			p.logger.Error("filter_containers_failed",
 				zap.String("user", fmt.Sprintf("%s(uid=%d)", id.RealUsername, id.RealUID)),
@@ -1415,7 +1415,7 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 			return
 		}
 		totalCount = isolation.CountJSONArray(body)
-		filtered, err := isolation.FilterImageListResponse(body, id.RealUID, p.db)
+		filtered, err := isolation.FilterImageListResponse(body, id.RealUID, id.IsPrivileged(), p.db)
 		if err != nil {
 			p.logger.Error("filter_images_failed",
 				zap.String("user", fmt.Sprintf("%s(uid=%d)", id.RealUsername, id.RealUID)),
@@ -1787,7 +1787,7 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 			return
 		}
 		totalCount = isolation.CountJSONArray(body)
-		filtered, err := isolation.FilterNetworkListResponse(body, id.RealUID, p.db)
+		filtered, err := isolation.FilterNetworkListResponse(body, id.RealUID, id.IsPrivileged(), p.db)
 		if err != nil {
 			p.logger.Error("filter_networks_failed", zap.Error(err))
 			filtered = emptyJSONArray
@@ -1845,7 +1845,7 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 			return
 		}
 		totalCount = isolation.CountVolumeList(body)
-		filtered, err := isolation.FilterVolumeListResponse(body, id.RealUID, p.db)
+		filtered, err := isolation.FilterVolumeListResponse(body, id.RealUID, id.IsPrivileged(), p.db)
 		if err != nil {
 			p.logger.Error("filter_volumes_failed", zap.Error(err))
 			emptyBody, _ := json.Marshal(struct {

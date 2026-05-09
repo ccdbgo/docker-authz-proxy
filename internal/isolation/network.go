@@ -102,8 +102,8 @@ func RewriteNetworkURL(r *http.Request, identity *auth.CallerIdentity) *http.Req
 }
 
 // FilterNetworkListResponse 过滤网络列表，只返回用户可访问的网络
-func FilterNetworkListResponse(body []byte, realUID int, db OwnershipReader) ([]byte, error) {
-	if realUID == 0 {
+func FilterNetworkListResponse(body []byte, realUID int, privileged bool, db OwnershipReader) ([]byte, error) {
+	if privileged {
 		return body, nil
 	}
 

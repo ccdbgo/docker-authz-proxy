@@ -34,8 +34,8 @@ var emptyJSONArray = []byte("[]")
 
 // FilterContainerListResponse 过滤容器列表响应，只返回用户自己的容器。
 // 归属判定顺序：① 归属数据库 → ② system.authz.owner.uid 标签 → ③ owner 标签（用户名）。
-func FilterContainerListResponse(body []byte, realUID int, realUsername string, db OwnershipReader) ([]byte, error) {
-	if realUID == 0 {
+func FilterContainerListResponse(body []byte, realUID int, realUsername string, privileged bool, db OwnershipReader) ([]byte, error) {
+	if privileged {
 		return body, nil
 	}
 
@@ -111,8 +111,8 @@ func parseUID(s string) int {
 }
 
 // FilterImageListResponse 过滤镜像列表响应，只返回用户可见的镜像
-func FilterImageListResponse(body []byte, realUID int, db OwnershipReader) ([]byte, error) {
-	if realUID == 0 {
+func FilterImageListResponse(body []byte, realUID int, privileged bool, db OwnershipReader) ([]byte, error) {
+	if privileged {
 		return body, nil
 	}
 

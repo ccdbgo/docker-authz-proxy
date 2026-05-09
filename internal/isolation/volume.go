@@ -167,7 +167,7 @@ func InjectVolumeNamePrefix(body []byte, identity *auth.CallerIdentity) ([]byte,
 
 // FilterVolumeListResponse 过滤 Volume 列表，只返回用户自己的 Volume，
 // 并去除名称中的用户前缀（还原为用户创建时的原始名称）
-func FilterVolumeListResponse(body []byte, realUID int, db OwnershipReader) ([]byte, error) {
+func FilterVolumeListResponse(body []byte, realUID int, privileged bool, db OwnershipReader) ([]byte, error) {
 	emptyResp := func() ([]byte, error) {
 		return json.Marshal(struct {
 			Volumes  []json.RawMessage `json:"Volumes"`
@@ -175,7 +175,7 @@ func FilterVolumeListResponse(body []byte, realUID int, db OwnershipReader) ([]b
 		}{Volumes: []json.RawMessage{}, Warnings: nil})
 	}
 
-	if realUID == 0 {
+	if privileged {
 		return body, nil
 	}
 

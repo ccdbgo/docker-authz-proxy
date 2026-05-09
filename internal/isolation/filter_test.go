@@ -47,7 +47,7 @@ func TestFilterContainerListResponse_OwnedContainers(t *testing.T) {
 		{"Id": "cont-bob-1", "Labels": nil},
 	})
 
-	filtered, err := FilterContainerListResponse(body, alice.RealUID, alice.RealUsername, db)
+	filtered, err := FilterContainerListResponse(body, alice.RealUID, alice.RealUsername, false, db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +73,7 @@ func TestFilterContainerListResponse_Empty(t *testing.T) {
 		{"Id": "cont-bob-1", "Labels": nil},
 	})
 
-	filtered, err := FilterContainerListResponse(body, 1001, "alice", db)
+	filtered, err := FilterContainerListResponse(body, 1001, "alice", false, db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +97,7 @@ func TestFilterContainerListResponse_LabelFallback(t *testing.T) {
 		},
 	})
 
-	filtered, err := FilterContainerListResponse(body, 1001, "alice", db)
+	filtered, err := FilterContainerListResponse(body, 1001, "alice", false, db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +121,7 @@ func TestFilterContainerListResponse_LabelForgery(t *testing.T) {
 		},
 	})
 
-	filtered, err := FilterContainerListResponse(body, 1001, "alice", db)
+	filtered, err := FilterContainerListResponse(body, 1001, "alice", false, db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +137,7 @@ func TestFilterContainerListResponse_LabelForgery(t *testing.T) {
 func TestFilterContainerListResponse_InvalidJSON(t *testing.T) {
 	db := newFilterTestDB(t)
 	body := []byte(`not json`)
-	result, err := FilterContainerListResponse(body, 1001, "alice", db)
+	result, err := FilterContainerListResponse(body, 1001, "alice", false, db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,7 +158,7 @@ func TestFilterContainerListResponse_OwnerLabelFallback(t *testing.T) {
 		},
 	})
 
-	filtered, err := FilterContainerListResponse(body, 1001, "alice", db)
+	filtered, err := FilterContainerListResponse(body, 1001, "alice", false, db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,7 +184,7 @@ func TestFilterContainerListResponse_OwnerLabelForgery(t *testing.T) {
 	})
 
 	// bob 尝试访问：末位值是 alice，bob 不匹配
-	filtered, err := FilterContainerListResponse(body, 1002, "bob", db)
+	filtered, err := FilterContainerListResponse(body, 1002, "bob", false, db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +208,7 @@ func TestFilterContainerListResponse_RootSeesAll(t *testing.T) {
 	})
 
 	// root (uid=0) 应看到所有容器
-	filtered, err := FilterContainerListResponse(body, 0, "root", db)
+	filtered, err := FilterContainerListResponse(body, 0, "root", true, db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,7 +236,7 @@ func TestFilterImageListResponse_PrivateImages(t *testing.T) {
 		{"Id": "sha256:bob-img"},
 	})
 
-	filtered, err := FilterImageListResponse(body, alice.RealUID, db)
+	filtered, err := FilterImageListResponse(body, alice.RealUID, false, db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -262,7 +262,7 @@ func TestFilterImageListResponse_PublicImages(t *testing.T) {
 		{"Id": "sha256:public-img"},
 	})
 
-	filtered, err := FilterImageListResponse(body, 1001, db)
+	filtered, err := FilterImageListResponse(body, 1001, false, db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -280,7 +280,7 @@ func TestFilterImageListResponse_NotInDB(t *testing.T) {
 	body := mustMarshalFilter(t, []map[string]interface{}{
 		{"Id": "sha256:legacy-img"},
 	})
-	filtered, err := FilterImageListResponse(body, 1001, db)
+	filtered, err := FilterImageListResponse(body, 1001, false, db)
 	if err != nil {
 		t.Fatal(err)
 	}
