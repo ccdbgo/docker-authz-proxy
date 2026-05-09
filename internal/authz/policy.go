@@ -133,6 +133,7 @@ const (
 	ActionRestart         = "restart"
 	ActionStop            = "stop"
 	ActionRename          = "rename"
+	ActionUpdate          = "update"
 	ActionRemoveContainer = "rm"
 	ActionExec            = "exec"
 	ActionAttach          = "attach"
@@ -229,7 +230,7 @@ func ClassifyAction(method, uri string) string {
 	case method == "POST" && pathMatchesN(path, "/containers/", "/rename"):
 		return ActionRename
 	case method == "POST" && pathMatchesN(path, "/containers/", "/update"):
-		return ActionStop
+		return ActionUpdate
 	case method == "POST" && pathMatchesN(path, "/containers/", "/wait"):
 		return ActionWait
 	case method == "DELETE" && pathHasPrefix(path, "/containers/"):
