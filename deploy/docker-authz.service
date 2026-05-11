@@ -12,6 +12,7 @@ ExecStart=/usr/local/bin/docker-authz-proxy \
     --socket-dir=/run/docker-authz \
     --upstream=/var/run/docker.sock \
     --policy=/etc/docker-authz/policy.yaml \
+    --quota-file=/etc/docker-authz/quota.yaml \
     --db=/var/lib/docker-authz/owners.db \
     --log-level=info \
     --log-format=json \

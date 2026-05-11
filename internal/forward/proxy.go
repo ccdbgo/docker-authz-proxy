@@ -776,6 +776,50 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 				return r, false
 			}
 
+			// tmpfs 大小限制：校验并注入上限
+			if p.quota != nil {
+				quota := p.quota.GetQuota(id)
+				var tmpfsErr error
+				body, tmpfsErr = isolation.ValidateAndInjectTmpfs(body, quota.TmpfsSizeMB)
+				if tmpfsErr != nil {
+					auditID := toAuditIdentity(id)
+					p.logger.Warn("tmpfs_size_violation",
+						append(audit.LogIdentityFields(auditID),
+							zap.String("detail", tmpfsErr.Error()),
+						)...)
+					p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "tmpfs_size_exceeded", tmpfsErr.Error(), http.StatusForbidden))
+					writeDockerError(w, http.StatusForbidden, tmpfsErr.Error())
+					return r, false
+				}
+			}
+
+			// device mount 白名单校验
+			if p.quota != nil {
+				quota := p.quota.GetQuota(id)
+				if devErr := isolation.ValidateDeviceMounts(body, quota.AllowedDevices, id.RealUID); devErr != nil {
+					auditID := toAuditIdentity(id)
+					p.logger.Warn("device_mount_violation",
+						append(audit.LogIdentityFields(auditID),
+							zap.String("detail", devErr.Error()),
+						)...)
+					p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "device_not_allowed", devErr.Error(), http.StatusForbidden))
+					writeDockerError(w, http.StatusForbidden, devErr.Error())
+					return r, false
+				}
+			}
+
+			// volumes-from 归属校验：只能引用自己的容器（root/sudo 用户跳过）
+			if vfErr := isolation.ValidateVolumesFrom(body, id.RealUID, id.IsPrivileged(), p.db, p.resolveContainerDockerID); vfErr != nil {
+				auditID := toAuditIdentity(id)
+				p.logger.Warn("volumes_from_violation",
+					append(audit.LogIdentityFields(auditID),
+						zap.String("detail", vfErr.Error()),
+					)...)
+				p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "volumes_from_not_allowed", vfErr.Error(), http.StatusForbidden))
+				writeDockerError(w, http.StatusForbidden, vfErr.Error())
+				return r, false
+			}
+
 			// named volume 校验与重写：确保用户只能挂载自己的 volume，并补全前缀
 			var volViolation *isolation.NamedVolumeViolation
 			body, volViolation = isolation.ValidateAndRewriteNamedVolumes(body, id.RealUID, p.db)

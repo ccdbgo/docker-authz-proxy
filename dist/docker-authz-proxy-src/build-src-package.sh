@@ -1,4 +1,65 @@
 #!/bin/bash
+# build-src-package.sh - 构建源码部署包（适用于 ARM 等非 amd64 架构）
+#
+# 输出：dist/docker-authz-proxy-src.tar.gz
+# 目标机器需要：Go 1.21+、systemd、root 权限
+#
+# 用法：
+#   bash build-src-package.sh
+#
+# 部署到 ARM 机器：
+#   scp dist/docker-authz-proxy-src.tar.gz root@arm-server:/tmp/
+#   ssh root@arm-server
+#   cd /tmp && tar xzf docker-authz-proxy-src.tar.gz
+#   sudo bash docker-authz-proxy-src/build-and-install.sh
+
+set -euo pipefail
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+log_info()  { echo -e "${GREEN}[INFO]${NC}  $1"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+log_step()  { echo -e "\n${BLUE}══ $1${NC}"; }
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+VERSION="${VERSION:-v1.0}"
+DIST_DIR="dist"
+PKG_NAME="docker-authz-proxy-src"
+PKG_DIR="${DIST_DIR}/${PKG_NAME}"
+OUTPUT_TAR="${DIST_DIR}/${PKG_NAME}.tar.gz"
+
+# ── 准备输出目录 ──────────────────────────────────────────────────────────────
+log_step "准备输出目录"
+rm -rf "$PKG_DIR"
+mkdir -p "$PKG_DIR"
+log_info "输出目录: $PKG_DIR"
+
+# ── 复制源码 ──────────────────────────────────────────────────────────────────
+log_step "复制源码"
+
+# 复制 Go 源码目录
+cp -r cmd         "$PKG_DIR/"
+cp -r internal    "$PKG_DIR/"
+cp -r config      "$PKG_DIR/"
+cp -r deploy      "$PKG_DIR/"
+cp    go.mod      "$PKG_DIR/"
+cp    go.sum      "$PKG_DIR/"
+cp    main.go     "$PKG_DIR/"
+
+SRC_SIZE=$(du -sh "$PKG_DIR" | cut -f1)
+log_info "源码已复制 (${SRC_SIZE})"
+
+# ── 生成 build-and-install.sh ─────────────────────────────────────────────────
+log_step "生成一键编译安装脚本"
+cat > "${PKG_DIR}/build-and-install.sh" << 'BUILD_INSTALL_SCRIPT'
+#!/bin/bash
 # docker-authz-proxy 源码编译安装脚本
 # 适用于 ARM64 / ARMv7 / x86_64 等任意 Linux 架构
 #
@@ -313,4 +374,70 @@ echo "    docker images      # 只显示自己的镜像"
 echo "    docker-authz-proxy-ctl --help  # 管理工具"
 echo ""
 echo "  socket 路径: /run/docker-authz/<username>/docker.sock"
+echo ""
+BUILD_INSTALL_SCRIPT
+
+chmod +x "${PKG_DIR}/build-and-install.sh"
+log_info "build-and-install.sh 已生成"
+
+# ── 生成 README.txt ───────────────────────────────────────────────────────────
+cat > "${PKG_DIR}/README.txt" << 'README_EOF'
+docker-authz-proxy 源码部署包
+==============================
+适用于 ARM64 / ARMv7 / x86_64 等任意 Linux 架构
+
+系统要求：
+  - Linux（任意架构）
+  - Go 1.21+（目标机器上需要）
+  - systemd
+  - root 权限
+
+使用方式：
+  sudo bash build-and-install.sh           # 编译并安装
+  sudo bash build-and-install.sh --upgrade # 升级（保留数据，覆盖配置）
+  sudo bash build-and-install.sh --uninstall # 卸载
+
+安装 Go（ARM64）：
+  wget https://go.dev/dl/go1.21.13.linux-arm64.tar.gz
+  tar -C /usr/local -xzf go1.21.13.linux-arm64.tar.gz
+  export PATH=$PATH:/usr/local/go/bin
+
+安装 Go（ARMv7）：
+  wget https://go.dev/dl/go1.21.13.linux-armv6l.tar.gz
+  tar -C /usr/local -xzf go1.21.13.linux-armv6l.tar.gz
+  export PATH=$PATH:/usr/local/go/bin
+
+安装后路径：
+  /usr/local/bin/docker-authz-proxy
+  /usr/local/bin/docker-authz-proxy-ctl
+  /etc/docker-authz/policy.yaml
+  /etc/docker-authz/quota.yaml
+  /var/lib/docker-authz/owners.db  (运行时生成)
+  /var/log/docker-authz/authz.log  (运行时生成)
+  /run/docker-authz/<user>/docker.sock (运行时生成)
+README_EOF
+
+# ── 打包 ──────────────────────────────────────────────────────────────────────
+log_step "打包为 tar.gz"
+cd "$DIST_DIR"
+tar czf "${PKG_NAME}.tar.gz" "$PKG_NAME"
+cd ..
+
+PKG_SIZE=$(du -sh "${OUTPUT_TAR}" | cut -f1)
+
+echo ""
+echo -e "${GREEN}════════════════════════════════════════════════${NC}"
+echo -e "${GREEN}  构建完成！${NC}"
+echo -e "${GREEN}════════════════════════════════════════════════${NC}"
+echo ""
+echo "  输出包: ${OUTPUT_TAR}  (${PKG_SIZE})"
+echo ""
+echo "  部署到 ARM 机器："
+echo "    scp ${OUTPUT_TAR} root@arm-server:/tmp/"
+echo "    ssh root@arm-server"
+echo "    cd /tmp && tar xzf ${PKG_NAME}.tar.gz"
+echo "    sudo bash ${PKG_NAME}/build-and-install.sh"
+echo ""
+echo "  或通过 deploy-from-windows.sh 一键传输+部署："
+echo "    bash deploy-from-windows.sh -h <arm-server-ip> --source"
 echo ""

@@ -331,3 +331,302 @@ func removeEmptySubDirs(dir string, logger *zap.Logger) int {
 	}
 	return removed
 }
+
+// ── tmpfs 限制 ────────────────────────────────────────────────────────────────
+
+// TmpfsViolation 描述一次 tmpfs 超限违规
+type TmpfsViolation struct {
+	RequestedMB int
+	LimitMB     int
+}
+
+func (e *TmpfsViolation) Error() string {
+	return fmt.Sprintf("tmpfs size %dMB exceeds limit %dMB", e.RequestedMB, e.LimitMB)
+}
+
+// ValidateAndInjectTmpfs 校验并强制注入 tmpfs 大小上限。
+// limitMB == 0 表示不限制，直接返回原 body。
+// 对 HostConfig.Mounts 中 type=tmpfs 的条目：
+//   - 若未指定 SizeBytes，注入上限
+//   - 若已指定且超限，拒绝
+//
+// 对 HostConfig.Tmpfs（旧式 map 格式）：注入 size= 选项。
+func ValidateAndInjectTmpfs(body []byte, limitMB int) ([]byte, error) {
+	if limitMB == 0 {
+		return body, nil
+	}
+	limitBytes := int64(limitMB) * 1024 * 1024
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return body, nil
+	}
+	hcRaw, ok := raw["HostConfig"]
+	if !ok {
+		return body, nil
+	}
+	var hostConfig map[string]json.RawMessage
+	if err := json.Unmarshal(hcRaw, &hostConfig); err != nil {
+		return body, nil
+	}
+
+	modified := false
+
+	// 新式 Mounts API
+	if mountsRaw, ok := hostConfig["Mounts"]; ok {
+		var mounts []json.RawMessage
+		if err := json.Unmarshal(mountsRaw, &mounts); err == nil {
+			for i, m := range mounts {
+				var mount map[string]json.RawMessage
+				if err := json.Unmarshal(m, &mount); err != nil {
+					continue
+				}
+				var mountType string
+				if t, ok := mount["Type"]; ok {
+					_ = json.Unmarshal(t, &mountType)
+				}
+				if !strings.EqualFold(mountType, "tmpfs") {
+					continue
+				}
+				// 读取 TmpfsOptions.SizeBytes
+				var sizeBytes int64
+				if optsRaw, ok := mount["TmpfsOptions"]; ok {
+					var opts map[string]json.RawMessage
+					if err := json.Unmarshal(optsRaw, &opts); err == nil {
+						if sb, ok := opts["SizeBytes"]; ok {
+							_ = json.Unmarshal(sb, &sizeBytes)
+						}
+					}
+				}
+				if sizeBytes > limitBytes {
+					return body, &TmpfsViolation{
+						RequestedMB: int(sizeBytes / 1024 / 1024),
+						LimitMB:     limitMB,
+					}
+				}
+				// 未指定或为 0：注入上限
+				if sizeBytes == 0 {
+					var opts map[string]json.RawMessage
+					if optsRaw, ok := mount["TmpfsOptions"]; ok {
+						_ = json.Unmarshal(optsRaw, &opts)
+					}
+					if opts == nil {
+						opts = make(map[string]json.RawMessage)
+					}
+					sb, _ := json.Marshal(limitBytes)
+					opts["SizeBytes"] = sb
+					optsB, _ := json.Marshal(opts)
+					mount["TmpfsOptions"] = optsB
+					newMount, _ := json.Marshal(mount)
+					mounts[i] = newMount
+					modified = true
+				}
+			}
+			if modified {
+				newMounts, _ := json.Marshal(mounts)
+				hostConfig["Mounts"] = newMounts
+			}
+		}
+	}
+
+	// 旧式 Tmpfs map API：{"HostConfig":{"Tmpfs":{"/tmp":"rw,size=64m"}}}
+	if tmpfsRaw, ok := hostConfig["Tmpfs"]; ok {
+		var tmpfsMap map[string]string
+		if err := json.Unmarshal(tmpfsRaw, &tmpfsMap); err == nil {
+			tmpfsModified := false
+			for target, opts := range tmpfsMap {
+				// 解析 size= 选项
+				reqBytes := parseTmpfsSize(opts)
+				if reqBytes > limitBytes {
+					return body, &TmpfsViolation{
+						RequestedMB: int(reqBytes / 1024 / 1024),
+						LimitMB:     limitMB,
+					}
+				}
+				if reqBytes == 0 {
+					// 注入 size 选项
+					sizeOpt := fmt.Sprintf("size=%d", limitBytes)
+					if opts == "" {
+						tmpfsMap[target] = sizeOpt
+					} else {
+						tmpfsMap[target] = opts + "," + sizeOpt
+					}
+					tmpfsModified = true
+				}
+			}
+			if tmpfsModified {
+				newTmpfs, _ := json.Marshal(tmpfsMap)
+				hostConfig["Tmpfs"] = newTmpfs
+				modified = true
+			}
+		}
+	}
+
+	if !modified {
+		return body, nil
+	}
+
+	newHC, _ := json.Marshal(hostConfig)
+	raw["HostConfig"] = newHC
+	out, _ := json.Marshal(raw)
+	return out, nil
+}
+
+// parseTmpfsSize 从 tmpfs 选项字符串（如 "rw,size=64m,exec"）解析 size 字节数
+func parseTmpfsSize(opts string) int64 {
+	for _, part := range strings.Split(opts, ",") {
+		part = strings.TrimSpace(part)
+		if !strings.HasPrefix(part, "size=") {
+			continue
+		}
+		val := part[len("size="):]
+		if len(val) == 0 {
+			return 0
+		}
+		unit := val[len(val)-1]
+		numStr := val[:len(val)-1]
+		var n int64
+		fmt.Sscanf(numStr, "%d", &n)
+		switch unit {
+		case 'k', 'K':
+			return n * 1024
+		case 'm', 'M':
+			return n * 1024 * 1024
+		case 'g', 'G':
+			return n * 1024 * 1024 * 1024
+		default:
+			// 纯数字（字节）
+			fmt.Sscanf(val, "%d", &n)
+			return n
+		}
+	}
+	return 0
+}
+
+// ── device mount 白名单 ───────────────────────────────────────────────────────
+
+// DeviceViolation 描述一次设备挂载违规
+type DeviceViolation struct {
+	Device string
+}
+
+func (e *DeviceViolation) Error() string {
+	return fmt.Sprintf("device '%s' is not allowed: not in the permitted device list", e.Device)
+}
+
+// ValidateDeviceMounts 校验容器创建请求中的设备挂载。
+// allowedPatterns 为 glob 模式列表（已包含内置白名单）。
+// uid == 0（root）跳过校验。
+func ValidateDeviceMounts(body []byte, allowedPatterns []string, uid int) error {
+	if uid == 0 {
+		return nil
+	}
+
+	var req struct {
+		HostConfig struct {
+			Devices []struct {
+				PathOnHost string `json:"PathOnHost"`
+			} `json:"Devices"`
+		} `json:"HostConfig"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return nil
+	}
+	if len(req.HostConfig.Devices) == 0 {
+		return nil
+	}
+
+	for _, dev := range req.HostConfig.Devices {
+		path := dev.PathOnHost
+		if path == "" {
+			continue
+		}
+		if !deviceAllowed(path, allowedPatterns) {
+			return &DeviceViolation{Device: path}
+		}
+	}
+	return nil
+}
+
+// deviceAllowed 检查设备路径是否匹配任意一个允许的 glob 模式
+func deviceAllowed(path string, patterns []string) bool {
+	for _, pattern := range patterns {
+		matched, err := filepath.Match(pattern, path)
+		if err == nil && matched {
+			return true
+		}
+	}
+	return false
+}
+
+// ── volumes-from 归属校验 ─────────────────────────────────────────────────────
+
+// VolumesFromViolation 描述一次 volumes-from 越权违规
+type VolumesFromViolation struct {
+	ContainerRef string
+}
+
+func (e *VolumesFromViolation) Error() string {
+	return fmt.Sprintf("volumes-from container '%s' is not owned by you", e.ContainerRef)
+}
+
+// ContainerOwnerReader 供 ValidateVolumesFrom 查询容器归属和授权
+type ContainerOwnerReader interface {
+	GetContainerOwner(id string) (*authz.OwnerInfo, bool)
+	CanVolumesFrom(containerID string, uid int) (bool, error)
+}
+
+// ValidateVolumesFrom 校验 HostConfig.VolumesFrom 中的容器归属。
+// privileged（root 或 sudo）用户跳过校验，可引用任意容器。
+// resolver 将容器名/短 ID 解析为完整 Docker ID（可为 nil，此时直接使用原始引用）。
+// 普通用户只能引用自己的容器，否则返回 *VolumesFromViolation。
+func ValidateVolumesFrom(body []byte, uid int, privileged bool, db ContainerOwnerReader, resolver func(string) string) error {
+	if uid == 0 || privileged {
+		return nil
+	}
+
+	var req struct {
+		HostConfig struct {
+			VolumesFrom []string `json:"VolumesFrom"`
+		} `json:"HostConfig"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return nil
+	}
+	if len(req.HostConfig.VolumesFrom) == 0 {
+		return nil
+	}
+
+	for _, ref := range req.HostConfig.VolumesFrom {
+		// VolumesFrom 格式：<container>[:<mode>]，mode 为 ro/rw
+		containerRef := ref
+		if idx := strings.LastIndex(ref, ":"); idx >= 0 {
+			mode := ref[idx+1:]
+			if mode == "ro" || mode == "rw" {
+				containerRef = ref[:idx]
+			}
+		}
+		// 将容器名/短 ID 解析为完整 Docker ID
+		resolvedID := containerRef
+		if resolver != nil {
+			if id := resolver(containerRef); id != "" {
+				resolvedID = id
+			}
+		}
+		owner, found := db.GetContainerOwner(resolvedID)
+		if !found {
+			// DB 中未找到：拒绝（未知容器不允许引用）
+			return &VolumesFromViolation{ContainerRef: containerRef}
+		}
+		// 属主自己：允许
+		if owner.UID == uid {
+			continue
+		}
+		// 检查是否有管理员授权（用完整 ID 查询）
+		granted, err := db.CanVolumesFrom(resolvedID, uid)
+		if err != nil || !granted {
+			return &VolumesFromViolation{ContainerRef: containerRef}
+		}
+	}
+	return nil
+}

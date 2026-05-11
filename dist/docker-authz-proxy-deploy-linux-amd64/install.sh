@@ -44,6 +44,7 @@ if [ "$UNINSTALL" = true ]; then
     rm -f /usr/local/bin/docker-authz-proxy-ctl
     rm -f /etc/profile.d/docker-authz.sh
     rm -f /etc/logrotate.d/docker-authz
+    rm -f /etc/sudoers.d/docker-authz-env
     echo ""
     echo -e "${YELLOW}[NOTE]${NC} 以下目录包含数据，已保留（如需彻底清除请手动删除）："
     echo "  /etc/docker-authz/      (配置文件)"
@@ -218,6 +219,16 @@ while IFS=: read -r uname _ uid gid _ homedir shell; do
     CONFIGURED=$((CONFIGURED + 1))
 done < /etc/passwd
 [ "$CONFIGURED" -eq 0 ] && log_ok "所有用户已配置（或无需配置）"
+
+# 配置 sudo 保留 DOCKER_HOST 环境变量（使 sudo docker 通过代理）
+SUDOERS_ENV_FILE="/etc/sudoers.d/docker-authz-env"
+if [ ! -f "$SUDOERS_ENV_FILE" ]; then
+    echo 'Defaults env_keep += "DOCKER_HOST"' > "$SUDOERS_ENV_FILE"
+    chmod 440 "$SUDOERS_ENV_FILE"
+    log_ok "已配置 sudo 保留 DOCKER_HOST（$SUDOERS_ENV_FILE）"
+else
+    log_ok "sudo DOCKER_HOST 配置已存在，跳过"
+fi
 
 # ── 完成 ─────────────────────────────────────────────────────────────────────
 echo ""

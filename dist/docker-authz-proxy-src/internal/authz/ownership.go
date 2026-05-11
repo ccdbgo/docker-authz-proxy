@@ -122,6 +122,17 @@ func initSchema(db *sql.DB) error {
 		CREATE INDEX IF NOT EXISTS idx_volumes_owner_uid     ON volumes(owner_uid);
 		CREATE INDEX IF NOT EXISTS idx_port_mappings_container ON port_mappings(container_id);
 		CREATE INDEX IF NOT EXISTS idx_port_mappings_owner   ON port_mappings(owner_uid);
+
+		-- volumes-from 授权表：管理员授权某容器可被其他用户 --volumes-from 引用
+		-- grantee_uid = -1 表示授权给所有用户
+		CREATE TABLE IF NOT EXISTS volumes_from_access (
+			container_id TEXT NOT NULL,
+			grantee_uid  INT  NOT NULL,
+			granted_by   INT  NOT NULL DEFAULT 0,
+			created_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (container_id, grantee_uid)
+		);
+		CREATE INDEX IF NOT EXISTS idx_volumes_from_container ON volumes_from_access(container_id);
 	`)
 	if err != nil {
 		return err
@@ -155,6 +166,15 @@ func initSchema(db *sql.DB) error {
 	_, _ = db.Exec(`ALTER TABLE network_peers ADD COLUMN container_id_b TEXT NOT NULL DEFAULT ''`)
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_port_mappings_container ON port_mappings(container_id)`)
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_port_mappings_owner ON port_mappings(owner_uid)`)
+	// 迁移：volumes_from_access 表
+	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS volumes_from_access (
+		container_id TEXT NOT NULL,
+		grantee_uid  INT  NOT NULL,
+		granted_by   INT  NOT NULL DEFAULT 0,
+		created_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (container_id, grantee_uid)
+	)`)
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_volumes_from_container ON volumes_from_access(container_id)`)
 	return nil
 }
 
@@ -211,6 +231,18 @@ func (o *OwnershipDB) DeleteContainer(id string) error {
 func (o *OwnershipDB) CountContainersByOwner(uid int) (int, error) {
 	var count int
 	err := o.DB.QueryRow(`SELECT COUNT(*) FROM containers WHERE owner_uid = ?`, uid).Scan(&count)
+	return count, err
+}
+
+// CountAccessibleImages 返回用户可访问的镜像总数（自己拥有 + 有访问权限 + 公共镜像，去重）
+func (o *OwnershipDB) CountAccessibleImages(uid int) (int, error) {
+	var count int
+	err := o.DB.QueryRow(`
+		SELECT COUNT(*) FROM (
+			SELECT image_id FROM images WHERE owner_uid = ? OR is_public = 1
+			UNION
+			SELECT image_id FROM image_access WHERE user_uid = ?
+		)`, uid, uid).Scan(&count)
 	return count, err
 }
 
@@ -998,6 +1030,85 @@ func (o *OwnershipDB) GetNetworkPeersByUID(uid int) ([]NetworkPeerInfo, error) {
 			return nil, err
 		}
 		result = append(result, info)
+	}
+	return result, rows.Err()
+}
+
+// ── volumes-from 授权 ────────────────────────────────────────
+
+// VolumesFromGrant 描述一条 volumes-from 授权记录
+type VolumesFromGrant struct {
+	ContainerID string
+	GranteeUID  int    // -1 = 所有用户
+	GrantedBy   int
+	CreatedAt   string
+}
+
+// GrantVolumesFrom 授权容器可被指定用户（或所有用户）--volumes-from 引用。
+// granteeUID = -1 表示授权给所有用户。
+func (o *OwnershipDB) GrantVolumesFrom(containerID string, granteeUID int, grantedBy int) error {
+	_, err := o.DB.Exec(
+		`INSERT OR REPLACE INTO volumes_from_access(container_id, grantee_uid, granted_by, created_at)
+		 VALUES (?, ?, ?, datetime('now'))`,
+		containerID, granteeUID, grantedBy,
+	)
+	return err
+}
+
+// RevokeVolumesFrom 撤销容器的 volumes-from 授权。
+// granteeUID = -1 撤销"所有用户"授权；其他值撤销指定用户授权。
+// granteeUID = -999 撤销该容器的所有授权。
+func (o *OwnershipDB) RevokeVolumesFrom(containerID string, granteeUID int) error {
+	var err error
+	if granteeUID == -999 {
+		_, err = o.DB.Exec(`DELETE FROM volumes_from_access WHERE container_id = ?`, containerID)
+	} else {
+		_, err = o.DB.Exec(
+			`DELETE FROM volumes_from_access WHERE container_id = ? AND grantee_uid = ?`,
+			containerID, granteeUID,
+		)
+	}
+	return err
+}
+
+// CanVolumesFrom 检查 uid 是否被授权引用 containerID。
+// 满足以下任一条件返回 true：
+//   - 存在 grantee_uid = uid 的记录
+//   - 存在 grantee_uid = -1（所有用户）的记录
+func (o *OwnershipDB) CanVolumesFrom(containerID string, uid int) (bool, error) {
+	var count int
+	err := o.DB.QueryRow(
+		`SELECT COUNT(*) FROM volumes_from_access
+		 WHERE container_id = ? AND (grantee_uid = ? OR grantee_uid = -1)`,
+		containerID, uid,
+	).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// ListVolumesFromGrants 列出所有（或指定容器的）volumes-from 授权记录
+func (o *OwnershipDB) ListVolumesFromGrants(containerID string) ([]VolumesFromGrant, error) {
+	query := `SELECT container_id, grantee_uid, granted_by, created_at FROM volumes_from_access`
+	args := []interface{}{}
+	if containerID != "" {
+		query += ` WHERE container_id = ?`
+		args = append(args, containerID)
+	}
+	query += ` ORDER BY created_at DESC`
+	rows, err := o.DB.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []VolumesFromGrant
+	for rows.Next() {
+		var g VolumesFromGrant
+		if err := rows.Scan(&g.ContainerID, &g.GranteeUID, &g.GrantedBy, &g.CreatedAt); err != nil {
+			continue
+		}
+		result = append(result, g)
 	}
 	return result, rows.Err()
 }

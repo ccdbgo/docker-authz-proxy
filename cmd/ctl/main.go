@@ -62,6 +62,11 @@ func main() {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
+	case "volumes-from":
+		if err := volumesFromCmd(args[1:]); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", args[0])
 		usage()
@@ -82,6 +87,9 @@ func usage() {
   peer list    查看互通列表（支持过滤）
   image set-public  设置镜像是否为公共镜像（仅 root 可用）
   image list        列出镜像信息（无参数=管理员视角按 owner 列出全部；--user/--uid=用户视角，含该用户可访问的 public 镜像）
+  volumes-from allow  授权容器可被其他用户 --volumes-from 引用（仅 root/sudo）
+  volumes-from deny   撤销授权（仅 root/sudo）
+  volumes-from list   查看授权列表（仅 root/sudo）
 
 peer allow / deny 选项（deny 使用与 allow 相同的参数精确撤销）:
   --uid-a UID|NAME   用户 A 的 uid 或用户名
@@ -138,11 +146,38 @@ image set-public 选项:
 // ── peer 子命令 ───────────────────────────────────────────────────────────────
 
 func peerCmd(args []string) error {
-	if len(args) == 0 {
-		return fmt.Errorf("peer 需要子命令: allow / deny / list")
+	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+		fmt.Fprintf(os.Stderr, `用法: docker-authz-proxy-ctl peer <子命令> [选项]
+
+子命令:
+  allow   允许两个用户的容器互通网络
+  deny    撤销两个用户的容器互通授权
+  list    查看已配置的互通规则
+
+示例:
+  docker-authz-proxy-ctl peer allow --uid-a alice --uid-b bob
+  docker-authz-proxy-ctl peer deny  --uid-a alice --uid-b bob
+  docker-authz-proxy-ctl peer list
+  docker-authz-proxy-ctl peer list --user alice
+
+使用 -h 查看子命令详细选项:
+  docker-authz-proxy-ctl peer allow -h
+  docker-authz-proxy-ctl peer list -h
+`)
+		return nil
 	}
 	sub := args[0]
 	rest := args[1:]
+
+	// peer allow/deny/list 仅限 root 或 sudo 用户（eUID=0）
+	if os.Geteuid() != 0 {
+		u, _ := user.Current()
+		username := "unknown"
+		if u != nil {
+			username = u.Username
+		}
+		return fmt.Errorf("peer %s 仅限 root 或 sudo 用户执行（当前用户: %s, uid=%d）", sub, username, os.Getuid())
+	}
 
 	db, err := authz.NewOwnershipDB(dbPath)
 	if err != nil {
@@ -169,6 +204,9 @@ func peerMutate(cmd string, args []string, db *authz.OwnershipDB) error {
 	contA := fs.String("container-a", "", "用户 A 的容器名或 ID（容器级互通）")
 	contB := fs.String("container-b", "", "用户 B 的容器名或 ID（容器级互通）")
 	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return nil
+		}
 		return err
 	}
 
@@ -251,6 +289,9 @@ func peerList(args []string, db *authz.OwnershipDB) error {
 	filterUser := fs.String("user", "", "按用户名过滤")
 	filterCont := fs.String("container", "", "按容器名或 ID 过滤")
 	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return nil
+		}
 		return err
 	}
 
@@ -404,20 +445,37 @@ func min(a, b int) int {
 // ── image 子命令 ──────────────────────────────────────────────────────────────
 
 func imageCmd(args []string) error {
-	if len(args) == 0 {
-		return fmt.Errorf("image 需要子命令: set-public / list")
+	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+		fmt.Fprintf(os.Stderr, `用法: docker-authz-proxy-ctl image <子命令> [选项]
+
+子命令:
+  list        管理员视角查看所有镜像归属信息
+  set-public  设置镜像为公共或私有
+
+示例:
+  docker-authz-proxy-ctl image list
+  docker-authz-proxy-ctl image list --user alice
+  docker-authz-proxy-ctl image set-public alpine:latest
+  docker-authz-proxy-ctl image set-public --public=false alpine:latest
+  docker-authz-proxy-ctl image set-public --public=false --force alpine:latest
+
+使用 -h 查看子命令详细选项:
+  docker-authz-proxy-ctl image set-public -h
+  docker-authz-proxy-ctl image list -h
+`)
+		return nil
 	}
 	sub := args[0]
 	rest := args[1:]
 
-	// set-public 仅限 root
-	if sub == "set-public" && os.Getuid() != 0 {
+	// image list/set-public 均仅限 root 或 sudo 用户（eUID=0）
+	if os.Geteuid() != 0 {
 		u, _ := user.Current()
 		username := "unknown"
 		if u != nil {
 			username = u.Username
 		}
-		return fmt.Errorf("image set-public 仅限 root 执行（当前用户: %s, uid=%d）", username, os.Getuid())
+		return fmt.Errorf("image %s 仅限 root 或 sudo 用户执行（当前用户: %s, uid=%d）", sub, username, os.Getuid())
 	}
 
 	db, err := authz.NewOwnershipDB(dbPath)
@@ -439,11 +497,19 @@ func imageCmd(args []string) error {
 func imageSetPublic(args []string, db *authz.OwnershipDB) error {
 	fs := flag.NewFlagSet("image set-public", flag.ContinueOnError)
 	public := fs.Bool("public", true, "true=公共镜像，false=私有镜像")
+	force  := fs.Bool("force", false, "强制改为私有，忽略其他用户引用检查")
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "用法: image set-public [--public=true|false] [--force] <镜像名或ID>\n\n")
+		fs.PrintDefaults()
+	}
 	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return nil
+		}
 		return err
 	}
 	if fs.NArg() == 0 {
-		return fmt.Errorf("用法: image set-public [--public=true|false] <镜像名或ID>")
+		return fmt.Errorf("用法: image set-public [--public=true|false] [--force] <镜像名或ID>")
 	}
 	ref := fs.Arg(0)
 
@@ -460,7 +526,7 @@ func imageSetPublic(args []string, db *authz.OwnershipDB) error {
 	}
 
 	// 改为 private 时，检查是否有其他用户引用
-	if !*public {
+	if !*public && !*force {
 		refUIDs, err := db.GetImageRefUsers(resolvedID)
 		if err != nil {
 			return fmt.Errorf("查询引用用户失败: %w", err)
@@ -480,7 +546,9 @@ func imageSetPublic(args []string, db *authz.OwnershipDB) error {
 			}
 		}
 		if len(others) > 0 {
-			return fmt.Errorf("镜像 %q 仍被其他用户引用（%s），无法改为私有", ref, strings.Join(others, ", "))
+			fmt.Fprintf(os.Stderr, "warn: 镜像 %q 仍被其他用户引用（%s），无法改为私有\n", ref, strings.Join(others, ", "))
+			fmt.Fprintf(os.Stderr, "      如需强制改为私有，请使用 --force 参数\n")
+			return nil
 		}
 	}
 
@@ -594,6 +662,9 @@ func imageList(args []string, db *authz.OwnershipDB) error {
 	filterUID  := fs.Int("uid", 0, "按 uid 过滤（显示该用户可见的镜像）")
 	filterUser := fs.String("user", "", "按用户名过滤")
 	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return nil
+		}
 		return err
 	}
 
@@ -779,3 +850,248 @@ func resolveImageID(ref string) (string, error) {
 	}
 	return id, nil
 }
+
+// ── volumes-from 子命令 ───────────────────────────────────────────────────────
+
+func volumesFromCmd(args []string) error {
+	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+		fmt.Fprintf(os.Stderr, `用法: docker-authz-proxy-ctl volumes-from <子命令> [选项]
+
+子命令:
+  allow  授权容器可被其他用户 --volumes-from 引用
+  deny   撤销授权
+  list   查看授权列表
+
+选项（allow/deny）:
+  --container NAME|ID  目标容器名或 ID（必填）
+  --user NAME          授权给指定用户（不填=授权给所有用户）
+  --uid INT            授权给指定 uid（与 --user 二选一）
+  --all                撤销该容器的所有授权（仅 deny 可用）
+
+示例:
+  # 授权所有用户可引用 shared-data 容器
+  sudo docker-authz-proxy-ctl volumes-from allow --container shared-data
+
+  # 仅授权 alice 可引用
+  sudo docker-authz-proxy-ctl volumes-from allow --container shared-data --user alice
+
+  # 撤销 alice 的授权
+  sudo docker-authz-proxy-ctl volumes-from deny --container shared-data --user alice
+
+  # 撤销该容器的所有授权
+  sudo docker-authz-proxy-ctl volumes-from deny --container shared-data --all
+
+  # 查看所有授权
+  sudo docker-authz-proxy-ctl volumes-from list
+
+  # 查看指定容器的授权
+  sudo docker-authz-proxy-ctl volumes-from list --container shared-data
+`)
+		return nil
+	}
+
+	sub := args[0]
+	rest := args[1:]
+
+	// 仅限 root 或 sudo
+	if os.Geteuid() != 0 {
+		u, _ := user.Current()
+		username := "unknown"
+		if u != nil {
+			username = u.Username
+		}
+		return fmt.Errorf("volumes-from %s 仅限 root 或 sudo 用户执行（当前用户: %s, uid=%d）", sub, username, os.Getuid())
+	}
+
+	db, err := authz.NewOwnershipDB(dbPath)
+	if err != nil {
+		return fmt.Errorf("open db: %w", err)
+	}
+	defer db.DB.Close()
+
+	switch sub {
+	case "allow":
+		return volumesFromAllow(rest, db)
+	case "deny":
+		return volumesFromDeny(rest, db)
+	case "list":
+		return volumesFromList(rest, db)
+	default:
+		return fmt.Errorf("unknown volumes-from subcommand %q, use allow/deny/list", sub)
+	}
+}
+
+func volumesFromAllow(args []string, db *authz.OwnershipDB) error {
+	fs := flag.NewFlagSet("volumes-from allow", flag.ContinueOnError)
+	container := fs.String("container", "", "目标容器名或 ID（必填）")
+	userName  := fs.String("user", "", "授权给指定用户名（不填=所有用户）")
+	uid       := fs.Int("uid", -2, "授权给指定 uid（与 --user 二选一）")
+	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return nil
+		}
+		return err
+	}
+	if *container == "" {
+		return fmt.Errorf("--container 为必填参数")
+	}
+
+	// 解析容器 ID（支持名称）
+	containerID, err := resolveContainerID(*container)
+	if err != nil {
+		containerID = *container
+	}
+
+	granteeUID := -1 // 默认授权给所有用户
+	if *uid != -2 {
+		granteeUID = *uid
+	} else if *userName != "" {
+		granteeUID, err = resolveIdent(*userName, "")
+		if err != nil {
+			return fmt.Errorf("resolve user: %w", err)
+		}
+	}
+
+	// sudo 下 os.Getuid() 返回 0，用 SUDO_UID 还原真实调用者
+	grantedBy := os.Getuid()
+	if grantedBy == 0 {
+		if sudoUID := os.Getenv("SUDO_UID"); sudoUID != "" {
+			if n, err2 := strconv.Atoi(sudoUID); err2 == nil {
+				grantedBy = n
+			}
+		}
+	}
+	if err := db.GrantVolumesFrom(containerID, granteeUID, grantedBy); err != nil {
+		return fmt.Errorf("grant failed: %w", err)
+	}
+
+	target := "所有用户"
+	if granteeUID >= 0 {
+		u, _ := user.LookupId(strconv.Itoa(granteeUID))
+		if u != nil {
+			target = fmt.Sprintf("%s(uid=%d)", u.Username, granteeUID)
+		} else {
+			target = fmt.Sprintf("uid=%d", granteeUID)
+		}
+	}
+	fmt.Printf("已授权：容器 %s 可被 %s --volumes-from 引用\n", containerID, target)
+	return nil
+}
+
+func volumesFromDeny(args []string, db *authz.OwnershipDB) error {
+	fs := flag.NewFlagSet("volumes-from deny", flag.ContinueOnError)
+	container := fs.String("container", "", "目标容器名或 ID（必填）")
+	userName  := fs.String("user", "", "撤销指定用户名的授权")
+	uid       := fs.Int("uid", -2, "撤销指定 uid 的授权")
+	all       := fs.Bool("all", false, "撤销该容器的所有授权")
+	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return nil
+		}
+		return err
+	}
+	if *container == "" {
+		return fmt.Errorf("--container 为必填参数")
+	}
+
+	containerID, err := resolveContainerID(*container)
+	if err != nil {
+		containerID = *container
+	}
+
+	if *all {
+		if err := db.RevokeVolumesFrom(containerID, -999); err != nil {
+			return fmt.Errorf("revoke all failed: %w", err)
+		}
+		fmt.Printf("已撤销：容器 %s 的所有 volumes-from 授权\n", containerID)
+		return nil
+	}
+
+	granteeUID := -1 // 默认撤销"所有用户"授权
+	if *uid != -2 {
+		granteeUID = *uid
+	} else if *userName != "" {
+		granteeUID, err = resolveIdent(*userName, "")
+		if err != nil {
+			return fmt.Errorf("resolve user: %w", err)
+		}
+	}
+
+	if err := db.RevokeVolumesFrom(containerID, granteeUID); err != nil {
+		return fmt.Errorf("revoke failed: %w", err)
+	}
+
+	target := "所有用户"
+	if granteeUID >= 0 {
+		u, _ := user.LookupId(strconv.Itoa(granteeUID))
+		if u != nil {
+			target = fmt.Sprintf("%s(uid=%d)", u.Username, granteeUID)
+		} else {
+			target = fmt.Sprintf("uid=%d", granteeUID)
+		}
+	}
+	fmt.Printf("已撤销：容器 %s 对 %s 的 volumes-from 授权\n", containerID, target)
+	return nil
+}
+
+func volumesFromList(args []string, db *authz.OwnershipDB) error {
+	fs := flag.NewFlagSet("volumes-from list", flag.ContinueOnError)
+	container := fs.String("container", "", "按容器过滤")
+	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return nil
+		}
+		return err
+	}
+
+	grants, err := db.ListVolumesFromGrants(*container)
+	if err != nil {
+		return fmt.Errorf("list failed: %w", err)
+	}
+	// 如果按容器过滤但无结果，尝试将容器名解析为完整 ID 再查
+	if len(grants) == 0 && *container != "" {
+		if fullID, resolveErr := resolveContainerID(*container); resolveErr == nil && fullID != *container {
+			grants, err = db.ListVolumesFromGrants(fullID)
+			if err != nil {
+				return fmt.Errorf("list failed: %w", err)
+			}
+		}
+	}
+	if len(grants) == 0 {
+		fmt.Println("（无授权记录）")
+		return nil
+	}
+
+	fmt.Printf("%-12s  %-22s  %-12s  %s\n", "容器ID", "被授权用户", "授权者", "授权时间")
+	fmt.Println(strings.Repeat("-", 72))
+	for _, g := range grants {
+		cid := g.ContainerID
+		if len(cid) > 12 {
+			cid = cid[:12]
+		}
+		grantee := "所有用户"
+		if g.GranteeUID >= 0 {
+			u, _ := user.LookupId(strconv.Itoa(g.GranteeUID))
+			if u != nil {
+				grantee = fmt.Sprintf("%s(uid=%d)", u.Username, g.GranteeUID)
+			} else {
+				grantee = fmt.Sprintf("uid=%d", g.GranteeUID)
+			}
+		}
+		// 授权者：优先显示用户名，root uid=0 显示 root
+		var grantor string
+		if g.GrantedBy == 0 {
+			grantor = "root"
+		} else {
+			u, _ := user.LookupId(strconv.Itoa(g.GrantedBy))
+			if u != nil {
+				grantor = u.Username
+			} else {
+				grantor = fmt.Sprintf("uid=%d", g.GrantedBy)
+			}
+		}
+		fmt.Printf("%-12s  %-22s  %-12s  %s\n", cid, grantee, grantor, g.CreatedAt)
+	}
+	return nil
+}
+

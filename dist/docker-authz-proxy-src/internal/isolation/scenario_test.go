@@ -205,7 +205,7 @@ func TestFilterNetworkListResponse_RootSeesAll(t *testing.T) {
 		{"Id": "net-2", "Name": "bridge"},
 	})
 
-	filtered, err := FilterNetworkListResponse(body, 0, db)
+	filtered, err := FilterNetworkListResponse(body, 0, true, db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +230,7 @@ func TestFilterNetworkListResponse_UserSeesOwnNetworks(t *testing.T) {
 		{"Id": "net-bob", "Name": "bob_u1002_mynet"},
 	})
 
-	filtered, err := FilterNetworkListResponse(body, 1001, db)
+	filtered, err := FilterNetworkListResponse(body, 1001, false, db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -260,7 +260,7 @@ func TestFilterNetworkListResponse_UserBridgeVisible(t *testing.T) {
 		{"Id": "other-net-id-000000000000000000000000000000000000000000000000000", "Name": "bob_u1002_mynet"},
 	})
 
-	filtered, err := FilterNetworkListResponse(body, 1001, db)
+	filtered, err := FilterNetworkListResponse(body, 1001, false, db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -288,7 +288,7 @@ func TestFilterNetworkListResponse_UserBridgeHiddenWithoutDB(t *testing.T) {
 		{"Id": bridgeID, "Name": bridgeName},
 	})
 
-	filtered, err := FilterNetworkListResponse(body, 1001, db)
+	filtered, err := FilterNetworkListResponse(body, 1001, false, db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -304,7 +304,7 @@ func TestFilterNetworkListResponse_UserBridgeHiddenWithoutDB(t *testing.T) {
 func TestFilterNetworkListResponse_InvalidJSON(t *testing.T) {
 	db := newFilterTestDB(t)
 	body := []byte(`not json`)
-	_, err := FilterNetworkListResponse(body, 1001, db)
+	_, err := FilterNetworkListResponse(body, 1001, false, db)
 	// 无效 JSON 应返回错误（与容器列表不同，网络列表解析失败返回 error）
 	if err == nil {
 		t.Error("expected error for invalid JSON")
@@ -374,7 +374,7 @@ func TestFilterContainerListResponse_ShortIDMatch(t *testing.T) {
 		{"Id": shortID, "Labels": nil},
 	})
 
-	filtered, err := FilterContainerListResponse(body, 1001, "alice", db)
+	filtered, err := FilterContainerListResponse(body, 1001, "alice", false, db)
 	if err != nil {
 		t.Fatal(err)
 	}

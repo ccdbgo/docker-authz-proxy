@@ -1,0 +1,85 @@
+构建完成                                                                                                                                                                                                     
+  完整部署包：dist/docker-authz-proxy-deploy-linux-amd64.tar.gz 
+  Windows 端构建脚本（生成上面的包）：build-release.sh    
+  一键传输+部署脚本（已升级）：deploy-from-windows.sh 
+
+
+
+使用方式
+
+方式一：一键从 Windows 部署（推荐）
+bash deploy-from-windows.sh -h 192.168.1.100
+bash deploy-from-windows.sh -h 192.168.1.100 --upgrade  # 升级
+
+方式二：手动传包部署
+scp dist/docker-authz-proxy-deploy-linux-amd64.tar.gz root@server:/tmp/
+ssh root@server
+tar xzf /tmp/docker-authz-proxy-deploy-linux-amd64.tar.gz -C /tmp/
+sudo bash /tmp/docker-authz-proxy-deploy-linux-amd64/install.sh
+
+生成了 dist/docker-authz-proxy-src.tar.gz（120KB），包含完整源码和一键编译安装脚本。
+
+部署流程：                                                                                                                                                                                                     1. 开发机运行 bash build-src-package.sh 生成源码包
+2. scp 传到 ARM 机器                                                                                                                                                                                         
+3. ARM 机器上 sudo bash docker-authz-proxy-src/build-and-install.sh
+
+build-and-install.sh 会自动检测架构（arm64/armv7/x86_64 均可），在目标机上编译后完成全套安装（systemd 服务、配置文件、DOCKER_HOST 环境变量）。
+  
+  
+  
+install.sh 功能：
+- 自动检查系统要求（Linux x86_64、systemd）
+- 安装二进制到 /usr/local/bin/
+- 安装配置文件（已有则跳过，--upgrade 覆盖并备份）
+- 启动 systemd 服务并验证
+- 自动配置所有用户的 DOCKER_HOST 环境变量
+- 支持 --uninstall 一键卸载
+
+
+该程序部署是不是必须要sudo权限                                                                                                                                                                               
+
+Searched for 2 patterns, read 3 files (ctrl+o to expand)                                                                                                                                                     
+
+● 答案很清楚了。是的，必须 root 权限运行，原因是代码里有几个硬性依赖：                                                                                                                                         
+						   
+---                                                                                                                                                                                                          
+必须 root 的原因                                                                                                                                                                                                                                                                                                                                                                                                            
+1. os.Chown() — 核心功能，无法绕过                                                                                                                                                                           
+
+// proxy.go:199
+os.Chown(userDir, u.UID, u.GID)   // 将 socket 目录归属设为对应用户
+
+// proxy.go:214
+os.Chown(sockPath, u.UID, u.GID)  // 将 socket 文件归属设为对应用户
+
+这是整个隔离机制的基础 —— 每个用户的 socket 必须 chown 给该用户，才能保证只有该用户能访问。chown 到其他用户是 Linux 的特权操作，只有 root 能做。
+
+2. /var/run/docker.sock — Docker daemon socket 只有 root 或 docker 组能访问
+
+代理需要连接上游 Docker daemon，默认 socket 权限是 srw-rw---- root docker，进程必须是 root 或 docker 组成员。
+
+3. /run/docker-authz/ 等系统目录的创建和权限设置
+
+os.MkdirAll(p.socketDir, 0711)   // 创建 /run/docker-authz/
+os.Chmod(p.socketDir, 0711)
+
+4. setUserDockerHost() 写入用户 ~/.bashrc
+
+os.Chown(bashrc, u.UID, u.GID)   // 修改其他用户的文件
+
+---
+结论
+
+┌────────────────────────────────────┬───────────────────────────────────────────────────┐
+│                场景                 │                   是否需要 root                   │
+├────────────────────────────────────┼───────────────────────────────────────────────────┤
+│ 安装（install.sh）                   │ 必须 root                                         │
+├────────────────────────────────────┼───────────────────────────────────────────────────┤
+│ 运行代理服务（docker-authz-proxy）    │ 必须 root（systemd 服务以 root 运行）             │
+├────────────────────────────────────┼───────────────────────────────────────────────────┤
+│ 普通用户使用 docker 命令              │ 不需要，通过专属 socket 访问                      │
+├────────────────────────────────────┼───────────────────────────────────────────────────┤
+│ docker-authz-proxy-ctl 管理工具      │ 需要 root（读写 /var/lib/docker-authz/owners.db） │
+└────────────────────────────────────┴───────────────────────────────────────────────────┘
+
+服务本身以 root 运行是设计上的必要条件，不是可以优化掉的限制。这也是为什么 systemd 服务文件里没有 User= 字段（默认 root），同时加了 NoNewPrivileges=yes 等安全加固来限制 root 的能力范围。

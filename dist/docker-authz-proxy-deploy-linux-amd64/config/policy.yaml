@@ -83,7 +83,8 @@ action_mapping:
   volume_rm:      ["DELETE /volumes/{name}"]
 
   # ── 系统操作 ──────────────────────────────────────────────────────────────
-  info:    ["GET /info", "GET /version", "GET /_ping"]
+  info:    ["GET /info"]
+  version: ["GET /version"]
   df:      ["GET /system/df"]
   events:  ["GET /events"]
   login:   ["POST /auth"]

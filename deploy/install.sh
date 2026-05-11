@@ -158,6 +158,16 @@ while IFS=: read -r username _ uid gid _ homedir shell; do
     setup_user_docker_host "$username" "$uid" "$gid" "$homedir"
 done < /etc/passwd
 
+# 配置 sudo 保留 DOCKER_HOST 环境变量（使 sudo docker 通过代理）
+SUDOERS_ENV_FILE="/etc/sudoers.d/docker-authz-env"
+if [ ! -f "$SUDOERS_ENV_FILE" ]; then
+    echo 'Defaults env_keep += "DOCKER_HOST"' > "$SUDOERS_ENV_FILE"
+    chmod 440 "$SUDOERS_ENV_FILE"
+    log_info "已配置 sudo 保留 DOCKER_HOST（$SUDOERS_ENV_FILE）"
+else
+    log_info "sudo DOCKER_HOST 配置已存在，跳过"
+fi
+
 echo ""
 log_info "========================================="
 log_info "安装完成！服务已自动启动"

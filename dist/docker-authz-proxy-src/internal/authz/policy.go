@@ -68,10 +68,14 @@ func (p *Policy) resolve() {
 			Actions: make(map[string]bool),
 		}
 		for _, a := range rule.Actions {
-			if a == "run" {
+			switch a {
+			case "run":
 				r.Actions[ActionCreateContainer] = true
 				r.Actions[ActionStartContainer] = true
-			} else {
+			case "history":
+				// docker image history → GET /images/{id}/history → ActionHistory
+				r.Actions[ActionHistory] = true
+			default:
 				r.Actions[a] = true
 			}
 		}
@@ -128,21 +132,30 @@ const (
 	ActionStartContainer  = "start"
 	ActionRestart         = "restart"
 	ActionStop            = "stop"
+	ActionRename          = "rename"
+	ActionUpdate          = "update"
 	ActionRemoveContainer = "rm"
 	ActionExec            = "exec"
+	ActionAttach          = "attach"
 	ActionInspect         = "inspect"
+	ActionPort            = "port"
 	ActionLogs            = "logs"
+	ActionDiff            = "diff"
 	ActionCp              = "cp"
+	ActionExport          = "export"
 	ActionCommit          = "commit"
+	ActionWait            = "wait"
 
 	ActionImages      = "images"
 	ActionPull        = "pull"
+	ActionImport      = "import"
 	ActionLoad        = "load"
 	ActionSave        = "save"
 	ActionBuild       = "build"
 	ActionPush        = "push"
 	ActionRemoveImage = "rmi"
 	ActionTag         = "tag"
+	ActionHistory     = "history"
 	ActionSearch      = "search"
 
 	ActionPrune = "prune"
@@ -173,10 +186,28 @@ const (
 	ActionOther = "other"
 )
 
+// cmdActionOverrides 记录"同一 API、不同命令"需要覆盖 action 的映射。
+// 当 DockerCommand 在此表中时，用对应的 action 替换 ClassifyAction 的结果。
+var cmdActionOverrides = map[string]string{
+	"port": ActionPort,
+}
+
+// OverrideActionByCommand 根据 DockerCommand 将通用 action 替换为更具体的 action。
+// 例如 docker port 和 docker inspect 都调用 GET /containers/{id}/json（ActionInspect），
+// 但通过命令名可以区分，使 policy 能独立控制它们。
+func OverrideActionByCommand(dockerCmd, action string) string {
+	if override, ok := cmdActionOverrides[dockerCmd]; ok {
+		return override
+	}
+	return action
+}
+
 // ClassifyAction 将 HTTP method + URI 映射为操作名
 func ClassifyAction(method, uri string) string {
 	path := StripAPIVersion(uri)
+	query := ""
 	if idx := strings.Index(path, "?"); idx >= 0 {
+		query = path[idx+1:]
 		path = path[:idx]
 	}
 
@@ -196,20 +227,22 @@ func ClassifyAction(method, uri string) string {
 		pathMatchesN(path, "/containers/", "/pause") ||
 		pathMatchesN(path, "/containers/", "/unpause")):
 		return ActionStop
-	case method == "POST" && (pathMatchesN(path, "/containers/", "/rename") ||
-		pathMatchesN(path, "/containers/", "/update")):
-		return ActionStop
+	case method == "POST" && pathMatchesN(path, "/containers/", "/rename"):
+		return ActionRename
+	case method == "POST" && pathMatchesN(path, "/containers/", "/update"):
+		return ActionUpdate
 	case method == "POST" && pathMatchesN(path, "/containers/", "/wait"):
-		return ActionOther
+		return ActionWait
 	case method == "DELETE" && pathHasPrefix(path, "/containers/"):
 		return ActionRemoveContainer
 	case method == "POST" && (pathMatchesN(path, "/containers/", "/exec") ||
-		pathMatchesN(path, "/containers/", "/attach") ||
 		pathMatchesN(path, "/containers/", "/resize")):
 		return ActionExec
+	case method == "POST" && pathMatchesN(path, "/containers/", "/attach"):
+		return ActionAttach
 	case method == "GET" && pathHasPrefix(path, "/containers/") &&
 		strings.Contains(path, "/attach"):
-		return ActionExec
+		return ActionAttach
 	case method == "POST" && (pathMatchesN(path, "/exec/", "/start") ||
 		pathMatchesN(path, "/exec/", "/resize")):
 		return ActionExec
@@ -220,15 +253,16 @@ func ClassifyAction(method, uri string) string {
 		return ActionInspect
 	case method == "GET" && (pathMatchesN(path, "/containers/", "/logs") ||
 		pathMatchesN(path, "/containers/", "/stats") ||
-		pathMatchesN(path, "/containers/", "/top") ||
-		pathMatchesN(path, "/containers/", "/changes")):
+		pathMatchesN(path, "/containers/", "/top")):
 		return ActionLogs
+	case method == "GET" && pathMatchesN(path, "/containers/", "/changes"):
+		return ActionDiff
 	case (method == "GET" || method == "HEAD") && pathMatchesN(path, "/containers/", "/archive"):
 		return ActionCp
 	case method == "PUT" && pathMatchesN(path, "/containers/", "/archive"):
 		return ActionCp
 	case method == "GET" && pathMatchesN(path, "/containers/", "/export"):
-		return ActionCp
+		return ActionExport
 	case method == "POST" && pathMatches(path, "/commit"):
 		return ActionCommit
 
@@ -241,6 +275,10 @@ func ClassifyAction(method, uri string) string {
 	case method == "POST" && pathMatches(path, "/images/prune"):
 		return ActionPrune
 	case method == "POST" && pathMatches(path, "/images/create"):
+		// docker import 使用 fromSrc 参数，docker pull 使用 fromImage 参数
+		if strings.Contains(query, "fromSrc=") {
+			return ActionImport
+		}
 		return ActionPull
 	case method == "POST" && pathMatches(path, "/images/load"):
 		return ActionLoad
@@ -253,8 +291,9 @@ func ClassifyAction(method, uri string) string {
 		return ActionPush
 	case method == "DELETE" && pathHasPrefix(path, "/images/"):
 		return ActionRemoveImage
-	case method == "GET" && (pathMatchesN(path, "/images/", "/json") ||
-		pathMatchesN(path, "/images/", "/history")):
+	case method == "GET" && pathMatchesN(path, "/images/", "/history"):
+		return ActionHistory
+	case method == "GET" && pathMatchesN(path, "/images/", "/json"):
 		return ActionInspect
 	case method == "POST" && pathMatchesN(path, "/images/", "/tag"):
 		return ActionTag

@@ -178,10 +178,16 @@ func VerifyIdentityAtRequest(id *CallerIdentity) error {
 		// 进程退出本身说明命令已正常完成，不是持续持有连接的提权攻击场景
 		return nil
 	}
-	if rUID != id.RealUID {
+	// sudo/su 用户：sudo 会将 rUID 和 eUID 都设为 0，而 id.RealUID 记录的是原始登录用户（loginUID）。
+	// 此时应校验 rUID == EffectiveUID（均为 0），而非 rUID == RealUID（loginUID）。
+	expectedRUID := id.RealUID
+	if id.UserType == UserTypeSudo {
+		expectedRUID = id.EffectiveUID
+	}
+	if rUID != expectedRUID {
 		return &IdentityForgeryError{
 			Reason: fmt.Sprintf("real UID changed after connection: was %d, now %d (pid=%d)",
-				id.RealUID, rUID, id.PID),
+				expectedRUID, rUID, id.PID),
 		}
 	}
 	if eUID != id.EffectiveUID {

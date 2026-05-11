@@ -1,0 +1,280 @@
+问题：
+1、Error response from daemon: conflict: unable to delete 925ff61909ae (must be forced) - image is referenced in multiple repositories
+root删除正在使用的公共镜像时如何处理？
+1）提示正在使用不能删除
+2）提供强制删除功能
+
+现在的实现逻辑是对着的
+docker rmi 925ff61909ae --force
+
+2、修改策略配置文件后程序能自动热重载吗
+可以热重载，不需要人工介入
+configuration file changed, reloading
+policy loaded successfully
+
+3、docker_event_listener_error
+http.Client.Timeout = 15s 对整个 HTTP 事务生效，包括读取 body。/events 是永不结束的流，15 秒后必然超时 → Listen 返回错误 → 打印 WARN → 等 5 秒重连 → 循环。                                                  
+修复： DockerEventListener 现在使用独立的无 Timeout 的 http.Client，只保留 dial 阶段的 5 秒超时。连接生命周期完全由传入的 ctx 控制，ctx 取消时 Listen 正常退出，不再产生 WARN 日志。
+
+4、su - bob -c 'ls /run/docker-authz/alice.sock'
+执行上述命令， bob能访问alice.sock
+解决：
+把每个用户的 socket 放到各自的子目录 /run/docker-authz/<username>/docker.sock，子目录权限 700 且属主为该用户，这样其他用户完全无法进入。
+
+5、storage_cleanup_done","volumes_removed":0,"empty_dirs_removed":0
+题找到了。sync 用户的 shell 是 /bin/sync，不是 nologin 也不是 false，所以通过了过滤，导致 user-4 目录被创建。                                                                                              
+						
+总结分析：                                                                                                                                                                                                   
+																																																			 volumes_removed=0 / empty_dirs_removed=0 的原因：                                                                                                                                                            
+- 正常现象。当前没有孤立 volume，用户存储目录下也没有空子目录，清理任务没有找到需要清理的对象。                                                                                                              
+
+发现的逻辑问题：
+
+listSystemUsers 的过滤条件不够严格，只排除了 nologin 和 false，但 /bin/sync、/bin/sh 等系统用户的 shell 也能通过，导致 sync(uid=4)、root(uid=0) 被当成普通用户处理，创建了不必要的存储目录和 socket。        
+
+建议加一个 UID 白名单过滤，只为 UID ≥ 1000 的用户（加上 root=0 如果需要）创建资源：
+
+// 跳过系统用户（uid < 1000），root 单独处理
+if uid != 0 && uid < 1000 {
+  continue
+}
+
+6、看到的日志权限都是root的，是否合适？
+-rw-r----- 1 root root 843673 Apr 17 15:43 alice.log
+
+不正确。                                                                                                                                                                                                                                                                                                                                                                                                                    
+审计日志 alice.log 记录的是 alice 用户的 Docker 操作，但文件属主是 root:root，权限 -rw-r-----，这意味着：                                                                                                                                                                                                                                                                                                                   
+- alice 本人无法读取自己的审计日志                                                                                                                                                                             - 如果有需要让用户查看自己操作记录的场景，完全做不到                                                                                                                                                                                                                                                                                                                                                                          正确的逻辑应该是：                                                                                                                                                                                                                                                                                                                                                                                                            ┌───────────┬────────────┬──────┬──────────────────────────────────┐                                                                                                                                           │   文件    │    属主    │ 权限 │               理由               │                                                                                                                                         
+├───────────┼────────────┼──────┼──────────────────────────────────┤
+│ alice.log │ root:alice │ 640  │ alice 可读自己的日志，但不能修改 │
+├───────────┼────────────┼──────┼──────────────────────────────────┤
+│ bob.log   │ root:bob   │ 640  │ 同上                             │
+├───────────┼────────────┼──────┼──────────────────────────────────┤
+│ proxy.log │ root:root  │ 640  │ 系统日志，只有 root 读           │
+└───────────┴────────────┴──────┴──────────────────────────────────┘
+
+属主用 root 而不是 alice 是因为日志由 proxy（root 进程）写入，alice 不能有写权限，否则可以篡改审计记录。属组设为对应用户，配合 640 权限，实现只读访问。
+- 属主 root，proxy 进程可写，用户不能篡改
+- 属组为对应用户，用户可以 cat 读取自己的日志
+- 其他用户无法访问
+
+7、root执行docker images -a 报错
+Cannot connect to the Docker daemon at unix:///run/docker-authz/root.sock. Is the docker daemon running?
+实际目录/run/docker-authz/root/docker.sock
+实际每个用户的socket目录已经进行了调整，这是漏掉了，请检查还有没有这种情况，如果进行修复
+
+
+8、执行docker rmi nginx:alpine
+删除镜像后有残留
+<none>              <none>    812d47f806db   36 hours ago   62.2MB
+
+删除失败但 docker images -a 已经看不到了——说明这个层是其他镜像的父层，Docker 拒绝删除是正确行为，不是 bug。
+docker images -a 会显示所有中间层，包括被其他镜像依赖的父层。nginx:alpine 删除后，它的某个中间层仍被其他镜像（比如 alice-commit-v5）引用，所以显示为 <none>，但无法也不应该删除。
+这是正常现象，不是残留问题。等那些依赖它的镜像也被删除后，这个层会自动消失。
+
+9、root和其他用户拉取镜像报错
+docker pull busybox
+Error response from daemon: Get "https://registry-1.docker.io/v2/": net/http: request canceled while waiting for connection (Client.Timeout exceeded while awaiting headers)
+Error response from daemon: Get "https://registry-1.docker.io/v2/": dial tcp 185.45.6.57:443: connect: connection refused
+error during connect: Post "http://%2Frun%2Fdocker-authz%2Froot%2Fdocker.sock/v1.50/images/create?fromImage=docker.io%2Flibrary%2Fbusybox&tag=latest": EOF
+
+国内代理镜像访问异常，切换国内镜像仓库后pull正常。
+拉取镜像失败时，返回EOF逻辑正常吗
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● 逻辑是正常的。分析一下整个链路：
+
+  docker pull → proxy.sock → proxy → dockerd → registry-1.docker.io (超时/拒绝)
+
+  1. dockerd 向 registry 发请求，超时或连接拒绝，返回错误给代理
+  2. 代理的 forward() 收到 dockerd 的错误响应（不是连接失败，而是 dockerd 返回了一个包含错误信息的正常 HTTP 响应）
+  3. 代理把 dockerd 的响应原样透传给 docker CLI
+  4. docker CLI 在读取响应体时遇到连接断开，报 EOF
+
+  EOF 的根本原因：docker pull 是流式长连接，dockerd 在拉取过程中持续推送进度。当 registry 连接失败时，dockerd 关闭了这个流，代理的 io.Copy 正常结束，客户端收到不完整的响应就报 EOF。
+
+  这是正常行为，不是 bug。代理只是透传，网络问题导致的 EOF 无需特殊处理。
+  
+10、执行命令报错
+ docker inspect root-nginx | python3 -c "
+     import json,sys; d=json.load(sys.stdin)[0]
+     hc=d['HostConfig']
+     print('NanoCPUs:', hc['NanoCPUs'])
+     print('Memory:', hc['Memory'])"
+  File "<string>", line 2
+    import json,sys; d=json.load(sys.stdin)[0]
+	
+报错信息
+IndentationError: unexpected indent
+
+11、ssh root登录后执行docker exec root-nginx echo 'hello from root-nginx' && docker exec root-nginx ls /etc/nginx/未看到返回内容和nginx配置文件列表
+debug 日志显示 exec start 请求带了 Upgrade: tcp，dockerd 返回 101，走双向流路径，hijack_done 也正常。但输出没到客户端。
+
+问题在 2090-2091 行：<-done 等两个 goroutine 都结束才退出。goroutine 1（client→upstream）在 clientConn.Close() 后会立即退出，但 goroutine 2（upstream→client）的 io.Copy 可能在数据还没写完时就被 goroutine 1
+的 upstreamConn.Close() 打断了。
+
+两个 goroutine 互相关闭对方的连接，导致竞争：goroutine 1 关了 upstreamConn，goroutine 2 的 io.Copy 从 upstreamReader 读数据失败，数据丢失。
+
+修复：只等第一个完成，且不要在 goroutine 里关闭对方的连接：
+根本原因是两个 goroutine 互相 Close() 对方连接，产生竞争——goroutine 1 关掉 upstreamConn 后，goroutine 2 还没来得及把数据写给客户端就被中断了。现在改为 CloseWrite()
+  半关闭，让上游→客户端方向的数据传完后再退出。
+
+
+12、docker history --no-trunc nginx:latest | head -5执行该命令后，输出的格式是乱的
+docker history --no-trunc nginx:latest | head -5
+正常现象，--no-trunc 会把完整的 SHA256 和命令全部展开，每列很宽导致自动换行，看起来像空行。
+
+去掉 --no-trunc 就好了：
+
+docker history nginx:latest | head -5                                                              
+
+
+13、执行docker update --cpus=0.5 --memory=256m root-update-test报错
+Error response from daemon: Cannot update container f08f544f0442d004c105fc05b84b724e471d8975a33e9cb4a590facd75f39dd0: Memory limit should be smaller than already set memoryswap limit, update the memoryswap at the same time
+
+docker update --cpus=0.5 --memory=256m --memory-swap=512m root-update-test
+
+14、docker network ls看，好像没有给每个用户创建单独的bridge网络
+
+15、bob 执行su - bob -c 'docker network connect alice-net $(docker run -d nginx:alpine)' 
+现象如下
+Unable to find image 'nginx:alpine' locally
+alpine: Pulling from library/nginx
+Digest: sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
+Status: Downloaded newer image for nginx:alpine
+WARNING: Your kernel does not support memory swappiness capabilities or the cgroup is not mounted. Memory swappiness discarded.
+Error response from daemon: network 'alice-net' not accessible by 'bob'(uid=1002)
+
+正常预期直接返回
+Error response from daemon: network 'alice-net' not accessible by 'bob'(uid=1002)
+
+修复后出现下述现象，属正常
+这个 [] 是 Docker CLI inspect 命令的固有行为，不是 proxy 的 bug，无法在 proxy 层修复。对任何失败情况（对象不存在、权限拒绝）docker inspect 都会先输出 [] 再输出错误信息。
+
+如果你想验证：
+docker inspect totally-nonexistent-container
+也会输出 [] + 错误，这是 Docker CLI 28 的设计。
+
+
+16、执行su - bob -c 'docker rm alice-web'报错
+Error response from daemon: container 'alice-web' is not owned by 'bob'(uid=1002)
+
+因为bob和alice资源时隔离的， 报错信息会泄露alice的用户资源信息，最好提示
+Error: No such container: alice-web
+
+17、执行su - bob -c 'docker network connect alice-net $(docker run -d nginx:alpine)'
+报Error response from daemon: network 'alice-net' not accessible by 'bob'(uid=1002)
+因为alice和bob网络是隔离的，正常反馈逻辑应该是Error: network alice-net not found
+
+18、执行su - bob -c 'docker run --rm -v alice-data:/mnt alpine ls /mnt'
+没有任何输出
+预期：Error: volume alice-data not found 或创建了新的 bob 卷
+
+执行docker run --rm -v alice-data:/mnt alpine ls /mnt
+报错
+Unable to find image 'alpine:latest' locally
+3cb067eab609: Pull complete
+docker: Error response from daemon: get alice-data: no such volume
+
+Run 'docker run --help' for more information
+
+实际上alpine:latest镜像对bob来说是存在的，你再看下其他报错信息是否正常
+
+
+19、不同用户网络互通配置没有给root管理员用户提供配置入口
+新增入口
+# 用户级互通
+docker-authz-proxy-ctl peer allow --uid-a 1001 --uid-b 1002
+docker-authz-proxy-ctl peer allow --user-a alice --user-b bob
+
+# 容器级互通
+docker-authz-proxy-ctl peer allow --uid-a 1001 --uid-b 1002 \
+  --container-a alice-web --container-b bob-db
+
+# 撤销
+docker-authz-proxy-ctl peer deny --user-a alice --user-b bob
+
+# 查看列表（支持过滤）
+docker-authz-proxy-ctl peer list
+docker-authz-proxy-ctl peer list --uid 1001
+docker-authz-proxy-ctl peer list --user alice
+docker-authz-proxy-ctl peer list --container alice-web
+
+# 用户级
+docker-authz-proxy-ctl peer allow --uid-a 1001 --uid-b 1002
+docker-authz-proxy-ctl peer deny  --uid-a 1001 --uid-b 1002
+
+# 容器级
+docker-authz-proxy-ctl peer allow --uid-a 1001 --uid-b 1002 --container-a alice-web --container-b bob-db
+docker-authz-proxy-ctl peer deny  --uid-a 1001 --uid-b 1002 --container-a alice-web --container-b bob-db
+
+# 用户名
+docker-authz-proxy-ctl peer allow --uid-a alice --uid-b bob --container-a alice-app --container-b bob-web
+docker-authz-proxy-ctl peer deny  --uid-a alice --uid-b bob --container-a alice-app --container-b bob-web
+
+# uid 数字
+docker-authz-proxy-ctl peer allow --uid-a 1001 --uid-b 1002 --container-a alice-app --container-b bob-web
+
+# 混用
+docker-authz-proxy-ctl peer allow --uid-a alice --uid-b 1002 --container-a alice-app --container-b bob-web
+  
+新问题：
+新增辅助网桥后，用户a和用户b正常应该能看到该辅助网桥？root用户操作的， 可以不让普通用户看到。
+
+执行docker-authz-proxy-ctl peer allow --uid-a 1001 --uid-b 1002  --container-a alice-web --container-b bob-app
+报错
+error: 容器 "alice-web" 在 DB 中不存在
+实际该容器存在
+
+alice 执行docker exec -it alice-net-test ip a
+输出信息后控制台卡死
+
+alice 执行docker exec -it alice-net-test ip a
+输出信息后控制台卡死                                                                                                                                                                                           
+
+● docker exec -it 会触发 HTTP connection hijack（双向流），代理需要在命令结束后正确关闭连接。先看代理里 exec 的处理逻辑：
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● 问题找到了。
+
+  docker exec -it 时 dockerd 返回 101 Upgrade，进入双向流模式。两个 goroutine 分别做：
+  - client → upstream（用户输入）
+  - upstream → client（容器输出）
+
+  ip a 执行完后，容器端关闭了输出流，upstream → client 的 io.Copy 结束，done <- struct{}{} 发送一次。但 client → upstream 这边在等用户继续输入（TTY 模式下客户端不会主动关闭），所以第二个 <-done
+  永远等不到，卡死。
+
+  修复：只要任意一端结束，就关闭两个连接，让另一个 goroutine 也退出。
+
+20、执行下列测试后，docker exec bob-net-test ping -c 3 172.18.0.2卡死
+1. bob 启动容器
+   $ su - bob -c "docker run -d --name bob-net-test alpine sleep 3600"
+2. alice 启动容器
+   $ su - alice -c "docker run -d --name alice-net-test alpine sleep 3600"
+3. 建立用户级互通
+   # docker-authz-proxy-ctl peer allow --uid-a 1001 --uid-b 1002
+4. 获取 alice 容器 IP
+   # docker inspect alice-net-test | grep IPAddress
+5. 从 bob 容器 ping alice 容器 IP
+   # docker exec bob-net-test ping -c 3 <alice-net-test-ip>
+
+21、撤销bob和alice网络互通后报Error response from daemon: container 11e3c5c7ae2f003042bb8f69741d9dd666dd6ac6b7226d9c8cfe590d9d99979a is not running，容器不再运行了
+
+22执行撤销命令docker-authz-proxy-ctl peer deny --uid-a 1003 --uid-b 1004
+显示user-level peer denied: uid=1003 <-> uid=1004
+
+
+23、当alice 删除基于public镜像busybox时， docker image rm busybox
+报错
+Error response from daemon: No such image: sha256:925ff61909aebae4bcc9bc04bb96a8bd15cd2271f13159fe95ce4338824531dd
+
+应该是检查该镜像属主，是否为当前用户，否则模拟删除镜像操作， 该镜像引用计数减少，但不真删除该镜像，只有属主（root除外）才能删除该镜像
+
+24、root busybox私有镜像
+当alice 拉取该镜像时，alice认为没有该镜像，模拟拉取该镜像，但因为是同一个镜像，增加引用计数
+当root 将busybox设置为public时， alice此时会看到该镜像， alice拉取该镜像时，不用拉取，提示镜像存在，需要增加引用计数
+
+25、公共镜像和不同网络用户互通设置是否只有root才能设置， sudo用户呢？ 现在实现不允许sudo用户设置， 将sudo用户看成普通用户进行处理。
+

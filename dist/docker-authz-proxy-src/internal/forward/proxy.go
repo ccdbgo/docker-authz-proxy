@@ -486,6 +486,19 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			zap.String("upgrade", r.Header.Get("Upgrade")),
 			zap.String("connection", r.Header.Get("Connection")),
 		)
+		// 在进入 hijack 之前先做策略检查：此时连接尚未升级，ResponseWriter 仍可
+		// 写普通 HTTP 响应，Docker CLI 能正确解析并显示 "Error response from daemon: ..."
+		hijackAction := authz.ClassifyAction(r.Method, r.URL.RequestURI())
+		hijackPolicy := p.getPolicy()
+		if !isAuxiliaryCall(identity.DockerCommand, hijackAction, r.Method, r.URL.Path) &&
+			hijackPolicy.IsDenied(identity, hijackAction) {
+			auditID := toAuditIdentity(identity)
+			audit.LogAuthzDeniedCommand(p.logger, auditID, hijackAction, r.URL.RequestURI())
+			p.auditLog.WriteEntry(makeAuditEntry(identity, r, hijackAction, "deny", "command_not_permitted", hijackAction, http.StatusForbidden))
+			writeDockerError(w, http.StatusForbidden, fmt.Sprintf("user '%s'(uid=%d) not permitted to perform: %s",
+				identity.RealUsername, identity.RealUID, hijackAction))
+			return
+		}
 		p.handleHijack(w, r, identity)
 		return
 	}
@@ -496,8 +509,12 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		zap.String("connection", r.Header.Get("Connection")),
 	)
 
-	action := authz.ClassifyAction(r.Method, r.URL.Path)
+	action := authz.ClassifyAction(r.Method, r.URL.RequestURI())
 	policy := p.getPolicy()
+
+	// 某些 Docker 命令共用同一个 API（如 port/inspect 都调用 GET /containers/{id}/json）
+	// 用 DockerCommand 推导出更具体的 action，使 policy 可以独立控制它们
+	action = authz.OverrideActionByCommand(identity.DockerCommand, action)
 
 	isAuxiliary := isAuxiliaryCall(identity.DockerCommand, action, r.Method, r.URL.Path)
 
@@ -528,7 +545,8 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 提前重写网络/卷 URL（容器名不加前缀，通过 Docker hex ID + label 追踪归属）
 	// 不对容器 URL 做前缀重写，保持原始容器名直接转发给 Docker daemon
 
-	if !p.checkOwnershipPreRequest(w, r, identity, action) {
+	r, ok := p.checkOwnershipPreRequest(w, r, identity, action)
+	if !ok {
 		return
 	}
 
@@ -608,20 +626,20 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // checkOwnershipPreRequest 请求前的资源归属检查
 func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Request,
-	id *auth.CallerIdentity, action string) bool {
+	id *auth.CallerIdentity, action string) (*http.Request, bool) {
 
 	containerID := authz.ExtractContainerID(r.URL.Path)
 	nonContainerIDs := map[string]bool{"json": true, "create": true, "prune": true}
 	if containerID != "" && !nonContainerIDs[containerID] {
 		owner, found := p.db.GetContainerOwner(containerID)
 		if !found {
-			if id.RealUID != 0 {
+			if !id.IsPrivileged() {
 				// 数据库中未找到 → 通过 Docker API 读取容器标签，进行标签归属核验
 				if !p.checkContainerOwnershipByLabel(w, id, containerID, action) {
-					return false
+					return r, false
 				}
 			}
-		} else if owner.UID != id.RealUID && id.RealUID != 0 {
+		} else if owner.UID != id.RealUID && !id.IsPrivileged() {
 			// root (uid=0) 可访问所有容器，普通用户只能访问自己的容器
 			auditID := toAuditIdentity(id)
 			auditOwner := &audit.OwnerInfo{Username: owner.Username, UID: owner.UID, GID: owner.GID}
@@ -629,7 +647,7 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 			p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "container_not_owned",
 				fmt.Sprintf("owner=%s(uid=%d)", owner.Username, owner.UID), http.StatusNotFound))
 			writeDockerNotFound(w, "container", containerID)
-			return false
+			return r, false
 		}
 	}
 
@@ -644,18 +662,18 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 			}
 			owner, found := p.db.GetContainerOwner(dockerID)
 			if !found {
-				if id.RealUID != 0 {
+				if !id.IsPrivileged() {
 					// DB 中未找到 → 回退到标签归属核验（容器可能在代理重启前创建）
 					if !p.checkContainerOwnershipByLabel(w, id, qContainerID, action) {
-						return false
+						return r, false
 					}
 				}
-			} else if owner.UID != id.RealUID && id.RealUID != 0 {
+			} else if owner.UID != id.RealUID && !id.IsPrivileged() {
 				auditID := toAuditIdentity(id)
 				auditOwner := &audit.OwnerInfo{Username: owner.Username, UID: owner.UID, GID: owner.GID}
 				audit.LogAuthzDeniedOwnership(p.logger, auditID, auditOwner, "container", truncID(qContainerID), action)
 				writeDockerNotFound(w, "container", qContainerID)
-				return false
+				return r, false
 			}
 		}
 	}
@@ -669,14 +687,14 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 			} else {
 				_, isPublic, found := p.db.GetImageOwner(resolvedID)
 				if !found {
-					if id.RealUID != 0 {
+					if !id.IsPrivileged() {
 						auditID := toAuditIdentity(id)
 						p.logger.Info("image_not_tracked_trigger_pull",
 							append(audit.LogIdentityFields(auditID),
 								zap.String("image_ref", imageRef),
 							)...)
 						writeDockerError(w, http.StatusNotFound, fmt.Sprintf("No such image: %s", imageRef))
-						return false
+						return r, false
 					}
 				} else if isPublic {
 					_ = p.db.EnsureImageAccess(resolvedID, id.RealUID)
@@ -689,7 +707,7 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 								zap.String("image_id", truncID(resolvedID)),
 							)...)
 						writeDockerError(w, http.StatusNotFound, fmt.Sprintf("No such image: %s", imageRef))
-						return false
+						return r, false
 					}
 				}
 			}
@@ -698,14 +716,14 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 		// 检查容器创建请求中显式指定的网络权限（非 root 用户）
 		// 防止 docker run --network alice-net 或 docker network connect alice-net $(docker run -d ...)
 		// 在容器创建阶段就拒绝，避免先 pull 镜像/创建容器再失败
-		if id.RealUID != 0 {
+		if !id.IsPrivileged() {
 			if err := p.checkCreateContainerNetworks(w, r, id, action); err != nil {
-				return false
+				return r, false
 			}
 		}
 
 		// 步骤3+4：查询配额，校验请求参数，记录详细审计日志
-		if p.quota != nil && id.RealUID != 0 {
+		if p.quota != nil && !id.IsPrivileged() {
 			quota := p.quota.GetQuota(id)
 			auditID := toAuditIdentity(id)
 			p.logger.Info("quota_resolved",
@@ -734,7 +752,7 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 					)...)
 				p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "quota_exceeded", qErr.Error(), http.StatusForbidden))
 				writeDockerError(w, http.StatusForbidden, qErr.Error())
-				return false
+				return r, false
 			}
 
 			// 用注入后的请求体替换原始 body，后续 preprocessRequest 直接使用
@@ -742,7 +760,7 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 		}
 
 		// 网络注入：强制容器接入用户专属桥接网络（root 用户跳过）
-		if id.RealUID != 0 {
+		if !id.IsPrivileged() {
 			body, _ := io.ReadAll(r.Body)
 			r.Body.Close()
 
@@ -755,7 +773,51 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 					)...)
 				p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "bind_mount_not_allowed", mountErr.Error(), http.StatusForbidden))
 				writeDockerError(w, http.StatusForbidden, mountErr.Error())
-				return false
+				return r, false
+			}
+
+			// tmpfs 大小限制：校验并注入上限
+			if p.quota != nil {
+				quota := p.quota.GetQuota(id)
+				var tmpfsErr error
+				body, tmpfsErr = isolation.ValidateAndInjectTmpfs(body, quota.TmpfsSizeMB)
+				if tmpfsErr != nil {
+					auditID := toAuditIdentity(id)
+					p.logger.Warn("tmpfs_size_violation",
+						append(audit.LogIdentityFields(auditID),
+							zap.String("detail", tmpfsErr.Error()),
+						)...)
+					p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "tmpfs_size_exceeded", tmpfsErr.Error(), http.StatusForbidden))
+					writeDockerError(w, http.StatusForbidden, tmpfsErr.Error())
+					return r, false
+				}
+			}
+
+			// device mount 白名单校验
+			if p.quota != nil {
+				quota := p.quota.GetQuota(id)
+				if devErr := isolation.ValidateDeviceMounts(body, quota.AllowedDevices, id.RealUID); devErr != nil {
+					auditID := toAuditIdentity(id)
+					p.logger.Warn("device_mount_violation",
+						append(audit.LogIdentityFields(auditID),
+							zap.String("detail", devErr.Error()),
+						)...)
+					p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "device_not_allowed", devErr.Error(), http.StatusForbidden))
+					writeDockerError(w, http.StatusForbidden, devErr.Error())
+					return r, false
+				}
+			}
+
+			// volumes-from 归属校验：只能引用自己的容器（root/sudo 用户跳过）
+			if vfErr := isolation.ValidateVolumesFrom(body, id.RealUID, id.IsPrivileged(), p.db, p.resolveContainerDockerID); vfErr != nil {
+				auditID := toAuditIdentity(id)
+				p.logger.Warn("volumes_from_violation",
+					append(audit.LogIdentityFields(auditID),
+						zap.String("detail", vfErr.Error()),
+					)...)
+				p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "volumes_from_not_allowed", vfErr.Error(), http.StatusForbidden))
+				writeDockerError(w, http.StatusForbidden, vfErr.Error())
+				return r, false
 			}
 
 			// named volume 校验与重写：确保用户只能挂载自己的 volume，并补全前缀
@@ -773,12 +835,12 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusInternalServerError)
 				_, _ = fmt.Fprintf(w, `{"message":%q}`, volViolation.Error())
-				return false
+				return r, false
 			}
 
 			// 端口冲突检测（在注入网络前，使用原始请求体）
 			if !p.checkPortConflict(w, r, id, body) {
-				return false
+				return r, false
 			}
 
 			// 将端口映射存入 context，供 postprocessResponse 在容器创建成功后写入 DB
@@ -796,7 +858,7 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 						zap.Error(bridgeErr),
 					)...)
 				writeDockerError(w, http.StatusInternalServerError, "failed to initialize user network: "+bridgeErr.Error())
-				return false
+				return r, false
 			} else if networkID != "" {
 				bridgeName := isolation.UserBridgeName(id.RealUID)
 				_ = p.db.SetManagedNetworkOwner(networkID, bridgeName, id.RealUID, id.RealUsername)
@@ -812,7 +874,22 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 				}
 			}
 
-			injected, err := isolation.InjectUserNetwork(body, id.RealUID, peerNetIDs)
+			// 收集用户显式指定的网络名（加前缀后的真实名称），传给 InjectUserNetwork 保留
+			var userRequestedNets []string
+			prefix := isolation.UserResourcePrefix(id)
+			bridgeName := isolation.UserBridgeName(id.RealUID)
+			for _, netName := range isolation.ExtractRequestedNetworks(body) {
+				if netName == "default" || netName == "bridge" || netName == "host" || netName == "none" || netName == bridgeName {
+					continue
+				}
+				if strings.HasPrefix(netName, prefix) {
+					userRequestedNets = append(userRequestedNets, netName)
+				} else {
+					userRequestedNets = append(userRequestedNets, prefix+netName)
+				}
+			}
+
+			injected, err := isolation.InjectUserNetwork(body, id.RealUID, peerNetIDs, userRequestedNets)
 			if err == nil {
 				r.Body = io.NopCloser(bytes.NewReader(injected))
 			} else {
@@ -844,35 +921,35 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 				writeDockerError(w, http.StatusForbidden,
 					fmt.Sprintf("user '%s'(uid=%d) not permitted to access image '%s'",
 						id.RealUsername, id.RealUID, truncID(imageRef)))
-				return false
+				return r, false
 			}
 		}
 
 	case authz.ActionRemoveImage:
 		if !p.checkImageRemovePermission(w, r, id) {
-			return false
+			return r, false
 		}
 
 	case authz.ActionPull:
 		if !p.checkImagePullPermission(w, r, id) {
-			return false
+			return r, false
 		}
 
 	case authz.ActionTag:
 		if !p.checkImageTagPermission(w, r, id) {
-			return false
+			return r, false
 		}
 
 	case authz.ActionPush:
 		if !p.checkImagePushPermission(w, r, id) {
-			return false
+			return r, false
 		}
 	}
 
 	switch action {
 	case authz.ActionNetworkInspect, authz.ActionNetworkConnect, authz.ActionNetworkDisconnect, authz.ActionNetworkRemove:
 		networkName := isolation.ExtractNetworkID(r.URL.Path)
-		if networkName != "" && id.RealUID != 0 {
+		if networkName != "" && !id.IsPrivileged() {
 			// 尝试按用户前缀名查找真实 Docker 网络 ID
 			prefix := isolation.UserResourcePrefix(id)
 			lookupName := networkName
@@ -894,14 +971,14 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 					)...)
 				p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "network_not_accessible", "", http.StatusNotFound))
 				writeDockerNotFound(w, "network", networkName)
-				return false
+				return r, false
 			}
 		}
 	}
 
 	if action == authz.ActionVolumeRemove {
 		volName := isolation.ExtractVolumeName(r.URL.Path)
-		if volName != "" && id.RealUID != 0 {
+		if volName != "" && !id.IsPrivileged() {
 			// 补全用户前缀以匹配 DB 中存储的卷名
 			prefix := isolation.UserVolumePrefix(id.RealUID)
 			if !strings.HasPrefix(volName, prefix) {
@@ -918,7 +995,7 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 					)...)
 				p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "volume_not_tracked", "", http.StatusNotFound))
 				writeDockerNotFound(w, "volume", volName)
-				return false
+				return r, false
 			} else if owner.UID != id.RealUID {
 				auditID := toAuditIdentity(id)
 				p.logger.Warn("AUTHZ_DENY",
@@ -929,12 +1006,12 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 					)...)
 				p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "not_your_volume", "", http.StatusNotFound))
 				writeDockerNotFound(w, "volume", volName)
-				return false
+				return r, false
 			}
 		}
 	}
 
-	return true
+	return r, true
 }
 
 // checkImageRemovePermission 校验 docker rmi 权限：
@@ -954,7 +1031,7 @@ func (p *ProxyServer) checkImageRemovePermission(w http.ResponseWriter, r *http.
 	}
 	owner, isPublic, found := p.db.GetImageOwner(resolvedID)
 	if !found {
-		if id.RealUID != 0 {
+		if !id.IsPrivileged() {
 			auditID := toAuditIdentity(id)
 			audit.LogAuthzDeniedNotTracked(p.logger, auditID, "image", truncID(resolvedID), authz.ActionRemoveImage)
 			writeDockerNotFound(w, "image", resolvedID)
@@ -966,7 +1043,7 @@ func (p *ProxyServer) checkImageRemovePermission(w http.ResponseWriter, r *http.
 	auditID := toAuditIdentity(id)
 
 	// 非 root：只有属主才能 rmi
-	if id.RealUID != 0 {
+	if !id.IsPrivileged() {
 		isImageOwner := owner.UID == id.RealUID
 		if !isImageOwner {
 			auditOwner := &audit.OwnerInfo{Username: owner.Username, UID: owner.UID, GID: owner.GID}
@@ -990,7 +1067,7 @@ func (p *ProxyServer) checkImageRemovePermission(w http.ResponseWriter, r *http.
 	}
 
 	// 属主或 root 尝试物理删除时，若其他用户还有引用则阻止
-	isOwner := id.RealUID == 0 || owner.UID == id.RealUID
+	isOwner := id.IsPrivileged() || owner.UID == id.RealUID
 	if isOwner && isPublic {
 		refCount, err := p.db.GetImageRefCount(resolvedID)
 		if err != nil {
@@ -1019,7 +1096,7 @@ func (p *ProxyServer) checkImageRemovePermission(w http.ResponseWriter, r *http.
 // - 公共镜像：所有用户可拉取；覆盖公共镜像只有属主或 root 可操作
 // - 私有镜像：只有属主或 root 可拉取
 func (p *ProxyServer) checkImagePullPermission(w http.ResponseWriter, r *http.Request, id *auth.CallerIdentity) bool {
-	if id.RealUID == 0 {
+	if id.IsPrivileged() {
 		return true
 	}
 	if r.URL.Query().Get("authz.public") == "true" {
@@ -1099,7 +1176,7 @@ func (p *ProxyServer) checkImagePullPermission(w http.ResponseWriter, r *http.Re
 
 // checkImageTagPermission 校验 docker tag 权限：属主、有访问权限的用户或 root 可打标签
 func (p *ProxyServer) checkImageTagPermission(w http.ResponseWriter, r *http.Request, id *auth.CallerIdentity) bool {
-	if id.RealUID == 0 {
+	if id.IsPrivileged() {
 		return true
 	}
 	imageRef := authz.ExtractImageID(r.URL.Path)
@@ -1131,7 +1208,7 @@ func (p *ProxyServer) checkImageTagPermission(w http.ResponseWriter, r *http.Req
 
 // checkImagePushPermission 校验 docker push 权限：只有属主或 root 可推送
 func (p *ProxyServer) checkImagePushPermission(w http.ResponseWriter, r *http.Request, id *auth.CallerIdentity) bool {
-	if id.RealUID == 0 {
+	if id.IsPrivileged() {
 		return true
 	}
 	imageRef := authz.ExtractImageID(r.URL.Path)
@@ -1166,11 +1243,11 @@ func (p *ProxyServer) preprocessRequest(r *http.Request, id *auth.CallerIdentity
 	switch action {
 	case authz.ActionNetworkInspect, authz.ActionNetworkConnect,
 		authz.ActionNetworkDisconnect, authz.ActionNetworkRemove:
-		if id.RealUID != 0 {
+		if !id.IsPrivileged() {
 			r = isolation.RewriteNetworkURL(r, id)
 		}
 	case authz.ActionVolumeInspect, authz.ActionVolumeRemove:
-		if id.RealUID != 0 {
+		if !id.IsPrivileged() {
 			r = isolation.RewriteVolumeURL(r, id.RealUID)
 		}
 	}
@@ -1191,7 +1268,7 @@ func (p *ProxyServer) preprocessRequest(r *http.Request, id *auth.CallerIdentity
 	switch action {
 	case authz.ActionCreateContainer:
 		// 注入容器名称前缀（user-{uid}-），并将改写后名称存入 context 供审计使用
-		if id.RealUID != 0 {
+		if !id.IsPrivileged() {
 			rewritten, rewrittenName, _ := isolation.InjectContainerNamePrefix(body, id)
 			if rewrittenName != "" {
 				body = rewritten
@@ -1208,7 +1285,7 @@ func (p *ProxyServer) preprocessRequest(r *http.Request, id *auth.CallerIdentity
 		}
 
 	case authz.ActionNetworkCreate:
-		if id.RealUID != 0 {
+		if !id.IsPrivileged() {
 			modified, actualName, _ := isolation.InjectNetworkNamePrefixWithName(body, id)
 			body = modified
 			if actualName != "" {
@@ -1218,7 +1295,7 @@ func (p *ProxyServer) preprocessRequest(r *http.Request, id *auth.CallerIdentity
 		}
 
 	case authz.ActionVolumeCreate:
-		if id.RealUID != 0 {
+		if !id.IsPrivileged() {
 			body, _ = isolation.InjectVolumeNamePrefix(body, id)
 		}
 	}
@@ -1284,6 +1361,10 @@ func (p *ProxyServer) forward(r *http.Request) (*http.Response, error) {
 		outReq.ContentLength = r.ContentLength
 		if len(bodyBytes) > 0 {
 			outReq.ContentLength = int64(len(bodyBytes))
+		} else if body == nil && outReq.ContentLength < 0 {
+			// body 为 nil 时 ContentLength 不能为 -1，否则 http.Transport 会报错
+			// （docker import <url> 场景：fromSrc 作为 query 参数，body 为空）
+			outReq.ContentLength = 0
 		}
 
 		resp, err = p.transport.RoundTrip(outReq)
@@ -1357,7 +1438,7 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 			return
 		}
 		totalCount = isolation.CountJSONArray(body)
-		filtered, err := isolation.FilterContainerListResponse(body, id.RealUID, id.RealUsername, p.db)
+		filtered, err := isolation.FilterContainerListResponse(body, id.RealUID, id.RealUsername, id.IsPrivileged(), p.db)
 		if err != nil {
 			p.logger.Error("filter_containers_failed",
 				zap.String("user", fmt.Sprintf("%s(uid=%d)", id.RealUsername, id.RealUID)),
@@ -1378,7 +1459,7 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 			return
 		}
 		totalCount = isolation.CountJSONArray(body)
-		filtered, err := isolation.FilterImageListResponse(body, id.RealUID, p.db)
+		filtered, err := isolation.FilterImageListResponse(body, id.RealUID, id.IsPrivileged(), p.db)
 		if err != nil {
 			p.logger.Error("filter_images_failed",
 				zap.String("user", fmt.Sprintf("%s(uid=%d)", id.RealUsername, id.RealUID)),
@@ -1423,7 +1504,7 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 						)...)
 				}
 				// 写入端口映射记录（容器创建成功后才写入，避免失败时留下脏数据）
-				if id.RealUID != 0 {
+				if !id.IsPrivileged() {
 					if portMappings, ok := r.Context().Value(portMappingsCtxKey).([]isolation.PortMapping); ok && len(portMappings) > 0 {
 						dbMappings := make([]authz.PortMappingInfo, 0, len(portMappings))
 						for _, m := range portMappings {
@@ -1572,44 +1653,86 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 		w.WriteHeader(resp.StatusCode)
 		_, _ = io.Copy(w, resp.Body)
 
+	case authz.ActionImport:
+		isolation.CopyHeaders(w, resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		body, _ := io.ReadAll(resp.Body)
+		_, _ = w.Write(body)
+		if resp.StatusCode == http.StatusOK {
+			// 响应格式：{"status":"sha256:..."} 或纯文本 "sha256:..."
+			var statusMsg struct {
+				Status string `json:"status"`
+			}
+			imageID := ""
+			if json.Unmarshal(body, &statusMsg) == nil && statusMsg.Status != "" {
+				imageID = strings.TrimPrefix(strings.TrimSpace(statusMsg.Status), "sha256:")
+			} else {
+				imageID = strings.TrimPrefix(strings.TrimSpace(string(body)), "sha256:")
+				imageID = strings.TrimRight(imageID, "\r\n")
+			}
+			if imageID != "" {
+				if err := p.db.SetImageOwner(imageID, id, false, "import"); err != nil {
+					p.logger.Error("save_image_owner_failed",
+						zap.String("image_id", truncID(imageID)),
+						zap.String("real_username", id.RealUsername),
+						zap.Int("real_uid", id.RealUID),
+						zap.Error(err))
+				}
+				if err := p.db.EnsureImageAccess(imageID, id.RealUID); err != nil {
+					p.logger.Error("ensure_image_access_failed",
+						zap.String("image_id", truncID(imageID)),
+						zap.String("real_username", id.RealUsername),
+						zap.Int("real_uid", id.RealUID),
+						zap.Error(err))
+				} else {
+					p.logger.Info("image_imported",
+						append(audit.LogIdentityFields(auditID),
+							zap.String("image_id", truncID(imageID)),
+						)...)
+				}
+			}
+		}
+
 	case authz.ActionPull:
 		isolation.CopyHeaders(w, resp.Header)
 		w.WriteHeader(resp.StatusCode)
+		if resp.StatusCode != http.StatusOK {
+			_, _ = io.Copy(w, resp.Body)
+			break
+		}
 		streamAndCaptureImageID(w, resp, "pull")
-		if resp.StatusCode == http.StatusOK {
-			imageRef := parseImageRefFromURI(requestURI)
-			if imageRef != "" {
-				if imageID := p.resolveImageIDByRef(imageRef); imageID != "" {
-					if err := p.db.SetImageOwner(imageID, id, false, "pull"); err != nil {
-						p.logger.Error("save_image_owner_failed",
-							zap.String("image_id", imageID),
-							zap.String("real_username", id.RealUsername),
-							zap.Int("real_uid", id.RealUID),
-							zap.Error(err))
-					}
-					if err := p.db.EnsureImageAccess(imageID, id.RealUID); err != nil {
-						p.logger.Error("ensure_image_access_failed",
-							zap.String("image_id", imageID),
-							zap.String("real_username", id.RealUsername),
-							zap.Int("real_uid", id.RealUID),
-							zap.Error(err))
-					} else {
-						p.logger.Info("image_pulled",
-							append(audit.LogIdentityFields(auditID),
-								zap.String("image_id", truncID(imageID)),
-								zap.String("image_ref", imageRef),
-							)...)
-					}
-					if id.RealUID == 0 {
-						if strings.Contains(requestURI, "authz.public=true") {
-							if err := p.db.SetImagePublic(imageID, true); err != nil {
-								p.logger.Error("set_image_public_failed", zap.Error(err))
-							} else {
-								p.logger.Info("image_marked_public",
-									append(audit.LogIdentityFields(auditID),
-										zap.String("image_id", truncID(imageID)),
-									)...)
-							}
+		imageRef := parseImageRefFromURI(requestURI)
+		if imageRef != "" {
+			if imageID := p.resolveImageIDByRef(imageRef); imageID != "" {
+				if err := p.db.SetImageOwner(imageID, id, false, "pull"); err != nil {
+					p.logger.Error("save_image_owner_failed",
+						zap.String("image_id", imageID),
+						zap.String("real_username", id.RealUsername),
+						zap.Int("real_uid", id.RealUID),
+						zap.Error(err))
+				}
+				if err := p.db.EnsureImageAccess(imageID, id.RealUID); err != nil {
+					p.logger.Error("ensure_image_access_failed",
+						zap.String("image_id", imageID),
+						zap.String("real_username", id.RealUsername),
+						zap.Int("real_uid", id.RealUID),
+						zap.Error(err))
+				} else {
+					p.logger.Info("image_pulled",
+						append(audit.LogIdentityFields(auditID),
+							zap.String("image_id", truncID(imageID)),
+							zap.String("image_ref", imageRef),
+						)...)
+				}
+				if id.IsPrivileged() {
+					if strings.Contains(requestURI, "authz.public=true") {
+						if err := p.db.SetImagePublic(imageID, true); err != nil {
+							p.logger.Error("set_image_public_failed", zap.Error(err))
+						} else {
+							p.logger.Info("image_marked_public",
+								append(audit.LogIdentityFields(auditID),
+									zap.String("image_id", truncID(imageID)),
+								)...)
 						}
 					}
 				}
@@ -1708,7 +1831,7 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 			return
 		}
 		totalCount = isolation.CountJSONArray(body)
-		filtered, err := isolation.FilterNetworkListResponse(body, id.RealUID, p.db)
+		filtered, err := isolation.FilterNetworkListResponse(body, id.RealUID, id.IsPrivileged(), p.db)
 		if err != nil {
 			p.logger.Error("filter_networks_failed", zap.Error(err))
 			filtered = emptyJSONArray
@@ -1766,7 +1889,7 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 			return
 		}
 		totalCount = isolation.CountVolumeList(body)
-		filtered, err := isolation.FilterVolumeListResponse(body, id.RealUID, p.db)
+		filtered, err := isolation.FilterVolumeListResponse(body, id.RealUID, id.IsPrivileged(), p.db)
 		if err != nil {
 			p.logger.Error("filter_volumes_failed", zap.Error(err))
 			emptyBody, _ := json.Marshal(struct {
@@ -1792,6 +1915,58 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 		isolation.CopyHeaders(w, resp.Header)
 		w.WriteHeader(resp.StatusCode)
 		_, _ = io.Copy(w, resp.Body)
+
+	case authz.ActionSystemInfo:
+		body, err := isolation.ReadFullBody(resp.Body)
+		if err != nil {
+			p.logger.Error("read_response_body_failed", zap.String("action", "info"), zap.Error(err))
+			writeDockerError(w, http.StatusBadGateway, "read upstream response failed")
+			return
+		}
+
+		// root 用户直接透传，不做过滤
+		if id.IsPrivileged() || resp.StatusCode != http.StatusOK {
+			isolation.CopyHeaders(w, resp.Header)
+			w.WriteHeader(resp.StatusCode)
+			_, _ = w.Write(body)
+			return
+		}
+
+		// 查询用户容器 ID 列表，再查实际运行状态
+		containerIDs, _ := p.db.GetContainerIDsByOwner(id.RealUID)
+		states := p.queryUserContainerStates(containerIDs)
+
+		// 查询用户可访问的镜像数量
+		imageCount, _ := p.db.CountAccessibleImages(id.RealUID)
+
+		// 将响应 JSON 解析为 map，替换计数字段后返回
+		var info map[string]json.RawMessage
+		if err := json.Unmarshal(body, &info); err != nil {
+			// 解析失败则透传原始响应
+			isolation.CopyHeaders(w, resp.Header)
+			w.WriteHeader(resp.StatusCode)
+			_, _ = w.Write(body)
+			return
+		}
+
+		info["Containers"] = json.RawMessage(strconv.Itoa(states.Total))
+		info["ContainersRunning"] = json.RawMessage(strconv.Itoa(states.Running))
+		info["ContainersPaused"] = json.RawMessage(strconv.Itoa(states.Paused))
+		info["ContainersStopped"] = json.RawMessage(strconv.Itoa(states.Stopped))
+		info["Images"] = json.RawMessage(strconv.Itoa(imageCount))
+
+		filtered, err := json.Marshal(info)
+		if err != nil {
+			isolation.CopyHeaders(w, resp.Header)
+			w.WriteHeader(resp.StatusCode)
+			_, _ = w.Write(body)
+			return
+		}
+
+		isolation.CopyHeaders(w, resp.Header)
+		w.Header().Set("Content-Length", strconv.Itoa(len(filtered)))
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(filtered)
 
 	default:
 		isolation.CopyHeaders(w, resp.Header)
@@ -1871,7 +2046,7 @@ func isAuxiliaryCall(dockerCmd, action, method, path string) bool {
 		"kill":    {authz.ActionStop},
 		"rm":      {authz.ActionRemoveContainer},
 		"exec":    {authz.ActionExec},
-		"attach":  {authz.ActionExec},
+		"attach":  {authz.ActionAttach},
 		"logs":    {authz.ActionLogs},
 		"stats":   {authz.ActionLogs},
 		"top":     {authz.ActionLogs},
@@ -1879,9 +2054,15 @@ func isAuxiliaryCall(dockerCmd, action, method, path string) bool {
 		"commit":  {authz.ActionCommit},
 		"ps":      {authz.ActionPS},
 		"inspect": {authz.ActionInspect},
+		"port":    {authz.ActionPort},
 		"pause":   {authz.ActionStop},
 		"unpause": {authz.ActionStop},
+		"wait":    {authz.ActionWait},
+		"rename":  {authz.ActionRename},
+		"update":  {authz.ActionUpdate},
+		"diff":    {authz.ActionDiff},
 		"pull":    {authz.ActionPull},
+		"import":  {authz.ActionImport},
 		"push":    {authz.ActionPush},
 		"build":   {authz.ActionBuild},
 		"images":  {authz.ActionImages},
@@ -1943,7 +2124,7 @@ func isHijackRequest(r *http.Request) bool {
 
 // handleHijack 处理需要双向流的请求（attach/exec-start 等）
 func (p *ProxyServer) handleHijack(w http.ResponseWriter, r *http.Request, id *auth.CallerIdentity) {
-	action := authz.ClassifyAction(r.Method, r.URL.Path)
+	action := authz.OverrideActionByCommand(id.DockerCommand, authz.ClassifyAction(r.Method, r.URL.RequestURI()))
 	p.logger.Debug("hijack_request",
 		zap.String("user", fmt.Sprintf("%s(uid=%d)", id.RealUsername, id.RealUID)),
 		zap.String("action", action),
@@ -1952,21 +2133,34 @@ func (p *ProxyServer) handleHijack(w http.ResponseWriter, r *http.Request, id *a
 
 	policy := p.getPolicy()
 	isAuxiliary := isAuxiliaryCall(id.DockerCommand, action, r.Method, r.URL.Path)
-	if !isAuxiliary && policy.IsDenied(id, action) {
-		auditID := toAuditIdentity(id)
-		audit.LogAuthzDeniedCommand(p.logger, auditID, action, r.URL.RequestURI())
-		writeDockerError(w, http.StatusForbidden, fmt.Sprintf("user '%s'(uid=%d) not permitted to perform: %s",
-			id.RealUsername, id.RealUID, action))
-		return
-	}
-	if !p.checkOwnershipPreRequest(w, r, id, action) {
-		return
-	}
+	isDenied := !isAuxiliary && policy.IsDenied(id, action)
 
+	// 对于升级请求（Connection: Upgrade），ResponseWriter.WriteHeader 可能不会立即
+	// 发给客户端；需要先 hijack 连接，再通过原始 TCP 写拒绝响应并关闭。
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
 		p.logger.Error("hijack_not_supported")
 		writeDockerError(w, http.StatusInternalServerError, "hijack not supported")
+		return
+	}
+
+	if isDenied {
+		auditID := toAuditIdentity(id)
+		audit.LogAuthzDeniedCommand(p.logger, auditID, action, r.URL.RequestURI())
+		errMsg := fmt.Sprintf("user '%s'(uid=%d) not permitted to perform: %s", id.RealUsername, id.RealUID, action)
+		// hijack 后写拒绝响应，确保客户端能立即收到并退出
+		conn, _, hijackErr := hijacker.Hijack()
+		if hijackErr != nil {
+			writeDockerError(w, http.StatusForbidden, errMsg)
+			return
+		}
+		body := fmt.Sprintf(`{"message":%q}`, errMsg)
+		resp := fmt.Sprintf("HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
+		_, _ = conn.Write([]byte(resp))
+		conn.Close()
+		return
+	}
+	if _, ok := p.checkOwnershipPreRequest(w, r, id, action); !ok {
 		return
 	}
 	clientConn, clientBuf, err := hijacker.Hijack()
@@ -2169,56 +2363,76 @@ func listSystemUsers() []systemUser {
 	return users
 }
 
-// setUserDockerHost 将 DOCKER_HOST 环境变量写入用户的 ~/.bashrc
+// setUserDockerHost 将 DOCKER_HOST 环境变量写入用户的 shell 配置文件。
+// 同时写入 ~/.bashrc（交互式 shell）和 ~/.bash_profile / ~/.profile（登录 shell
+// 及非交互式登录，如 su -c、SSH 非交互执行等），确保各场景均能生效。
 func setUserDockerHost(u systemUser, socketDir string, logger *zap.Logger) {
 	if u.HomeDir == "" {
 		return
 	}
-	bashrc := filepath.Join(u.HomeDir, ".bashrc")
 	sockPath := "unix://" + filepath.Join(socketDir, u.Username, "docker.sock")
 	exportLine := fmt.Sprintf("export DOCKER_HOST=%s", sockPath)
 	marker := "# docker-authz-proxy: DOCKER_HOST"
 
-	existing, err := os.ReadFile(bashrc)
+	// 候选配置文件：bashrc（交互式）+ bash_profile / profile（登录/非交互式登录）
+	candidates := []string{
+		filepath.Join(u.HomeDir, ".bashrc"),
+		filepath.Join(u.HomeDir, ".bash_profile"),
+		filepath.Join(u.HomeDir, ".profile"),
+	}
+
+	for _, cfgFile := range candidates {
+		writeDockerHostToFile(cfgFile, u, exportLine, marker, logger)
+	}
+}
+
+// writeDockerHostToFile 向单个 shell 配置文件写入或更新 DOCKER_HOST。
+func writeDockerHostToFile(cfgFile string, u systemUser, exportLine, marker string, logger *zap.Logger) {
+	existing, err := os.ReadFile(cfgFile)
 	if err == nil {
 		content := string(existing)
 		if strings.Contains(content, exportLine) {
-			return // 路径已是最新，无需修改
+			return // 已是最新，无需修改
 		}
 		if strings.Contains(content, marker) {
 			// marker 存在但路径是旧格式，替换整行
 			oldPattern := marker + "\nexport DOCKER_HOST=unix:///run/docker-authz/" + u.Username + ".sock"
 			newContent := strings.ReplaceAll(content, oldPattern, marker+"\n"+exportLine)
-			if err := os.WriteFile(bashrc, []byte(newContent), 0644); err != nil {
-				logger.Warn("failed to update DOCKER_HOST in bashrc",
+			if err := os.WriteFile(cfgFile, []byte(newContent), 0644); err != nil {
+				logger.Warn("failed to update DOCKER_HOST in shell config",
 					zap.String("username", u.Username),
+					zap.String("file", cfgFile),
 					zap.Error(err))
 			}
 			return
 		}
+	} else if !os.IsNotExist(err) {
+		// 文件存在但读取失败，跳过
+		return
 	}
 
-	f, err := os.OpenFile(bashrc, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(cfgFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
-		logger.Warn("failed to write DOCKER_HOST to bashrc",
+		logger.Warn("failed to write DOCKER_HOST to shell config",
 			zap.String("username", u.Username),
-			zap.String("bashrc", bashrc),
+			zap.String("file", cfgFile),
 			zap.Error(err))
 		return
 	}
 	defer f.Close()
 
 	if _, err = fmt.Fprintf(f, "\n%s\n%s\n", marker, exportLine); err != nil {
-		logger.Warn("failed to write DOCKER_HOST to bashrc",
+		logger.Warn("failed to write DOCKER_HOST to shell config",
 			zap.String("username", u.Username),
+			zap.String("file", cfgFile),
 			zap.Error(err))
 		return
 	}
-	_ = os.Chown(bashrc, u.UID, u.GID)
-	logger.Info("set DOCKER_HOST in bashrc",
+	_ = os.Chown(cfgFile, u.UID, u.GID)
+	logger.Info("set DOCKER_HOST in shell config",
 		zap.String("username", u.Username),
-		zap.String("bashrc", bashrc),
-		zap.String("docker_host", sockPath))
+		zap.String("file", cfgFile),
+		zap.String("docker_host", exportLine))
 }
 
 // extractImageRefFromBody 从请求体中提取 Image 字段
@@ -2443,6 +2657,69 @@ func (p *ProxyServer) resolveImageIDByRef(imageRef string) string {
 		return ""
 	}
 	return img.ID
+}
+
+// containerStateCounts 查询用户容器的运行状态统计
+type containerStateCounts struct {
+	Total   int
+	Running int
+	Paused  int
+	Stopped int
+}
+
+// queryUserContainerStates 通过 Docker API 查询用户容器的实际运行状态
+func (p *ProxyServer) queryUserContainerStates(containerIDs []string) containerStateCounts {
+	if len(containerIDs) == 0 {
+		return containerStateCounts{}
+	}
+
+	upstreamURL := &url.URL{
+		Scheme:   "http",
+		Host:     "docker",
+		Path:     "/containers/json",
+		RawQuery: "all=1",
+	}
+	req, err := http.NewRequest("GET", upstreamURL.String(), nil)
+	if err != nil {
+		return containerStateCounts{Total: len(containerIDs)}
+	}
+	resp, err := p.transport.RoundTrip(req)
+	if err != nil {
+		return containerStateCounts{Total: len(containerIDs)}
+	}
+	defer resp.Body.Close()
+
+	var containers []struct {
+		ID    string `json:"Id"`
+		State string `json:"State"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&containers); err != nil {
+		return containerStateCounts{Total: len(containerIDs)}
+	}
+
+	// 构建用户容器 ID 集合（支持短 ID 匹配）
+	idSet := make(map[string]bool, len(containerIDs))
+	for _, id := range containerIDs {
+		idSet[id] = true
+	}
+
+	var counts containerStateCounts
+	for _, c := range containers {
+		// 全 ID 或短 ID（12位）匹配
+		if !idSet[c.ID] && !idSet[c.ID[:min(12, len(c.ID))]] {
+			continue
+		}
+		counts.Total++
+		switch c.State {
+		case "running":
+			counts.Running++
+		case "paused":
+			counts.Paused++
+		default:
+			counts.Stopped++
+		}
+	}
+	return counts
 }
 
 // resolveContainerDockerID 通过容器名称（或短 ID）查询 dockerd 获取容器的真实 Docker ID

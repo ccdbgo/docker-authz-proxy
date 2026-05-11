@@ -11,6 +11,16 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// builtinAllowedDevices 内置安全设备白名单（所有用户均可使用，无需配置）
+var builtinAllowedDevices = []string{
+	"/dev/null",
+	"/dev/zero",
+	"/dev/urandom",
+	"/dev/random",
+	"/dev/full",
+	"/dev/tty",
+}
+
 // ── 配置结构 ──────────────────────────────────────────────────
 
 // QuotaConfig quota.yaml 顶层结构
@@ -23,18 +33,22 @@ type QuotaConfig struct {
 
 // QuotaEntry 单条配额（0 表示不限制）
 type QuotaEntry struct {
-	CPUCores      float64 `yaml:"cpu_cores"`      // 单容器最大 CPU 核数（转换为 NanoCPUs）
-	MemMB         int     `yaml:"mem_mb"`         // 单容器最大内存（MB）
-	StorageGB     int     `yaml:"storage_gb"`     // 单容器最大存储（GB），注入 StorageOpt.size
-	MaxContainers int     `yaml:"max_containers"` // 用户最多同时存在的容器数（含已停止）
+	CPUCores       float64  `yaml:"cpu_cores"`       // 单容器最大 CPU 核数（转换为 NanoCPUs）
+	MemMB          int      `yaml:"mem_mb"`          // 单容器最大内存（MB）
+	StorageGB      int      `yaml:"storage_gb"`      // 单容器最大存储（GB），注入 StorageOpt.size
+	MaxContainers  int      `yaml:"max_containers"`  // 用户最多同时存在的容器数（含已停止）
+	TmpfsSizeMB    int      `yaml:"tmpfs_size_mb"`   // 单个 tmpfs 挂载最大内存（MB），0 不限制，默认 512
+	AllowedDevices []string `yaml:"allowed_devices"` // 允许挂载的设备 glob 模式列表（追加到内置白名单）
 }
 
 // UserQuota 运行期单用户有效配额（0 表示不限制）
 type UserQuota struct {
-	CPUCores      float64 // 对应 docker run --cpus
-	MemMB         int     // 对应 docker run -m / --memory
-	StorageGB     int     // 对应 docker run --storage-opt size=
-	MaxContainers int     // 用户容器总数上限
+	CPUCores       float64  // 对应 docker run --cpus
+	MemMB          int      // 对应 docker run -m / --memory
+	StorageGB      int      // 对应 docker run --storage-opt size=
+	MaxContainers  int      // 用户容器总数上限
+	TmpfsSizeMB    int      // 单个 tmpfs 挂载最大内存（MB），0 不限制
+	AllowedDevices []string // 允许挂载的设备 glob 模式列表（已合并内置白名单）
 }
 
 // ── 错误类型 ──────────────────────────────────────────────────
@@ -189,6 +203,12 @@ func (m *QuotaManager) GetQuota(identity *auth.CallerIdentity) UserQuota {
 			if ge.MaxContainers > q.MaxContainers {
 				q.MaxContainers = ge.MaxContainers
 			}
+			if ge.TmpfsSizeMB > q.TmpfsSizeMB {
+				q.TmpfsSizeMB = ge.TmpfsSizeMB
+			}
+			if len(ge.AllowedDevices) > 0 {
+				q.AllowedDevices = append(q.AllowedDevices, ge.AllowedDevices...)
+			}
 		}
 	}
 
@@ -206,13 +226,32 @@ func (m *QuotaManager) GetQuota(identity *auth.CallerIdentity) UserQuota {
 		if ue.MaxContainers > 0 {
 			q.MaxContainers = ue.MaxContainers
 		}
+		if ue.TmpfsSizeMB > 0 {
+			q.TmpfsSizeMB = ue.TmpfsSizeMB
+		}
+		if len(ue.AllowedDevices) > 0 {
+			q.AllowedDevices = append(q.AllowedDevices, ue.AllowedDevices...)
+		}
 	}
 
+	// tmpfs 默认值：未配置时使用 512MB
+	tmpfsMB := q.TmpfsSizeMB
+	if tmpfsMB == 0 {
+		tmpfsMB = 512
+	}
+
+	// 合并内置白名单与用户配置的设备列表
+	devices := make([]string, len(builtinAllowedDevices))
+	copy(devices, builtinAllowedDevices)
+	devices = append(devices, q.AllowedDevices...)
+
 	return UserQuota{
-		CPUCores:      q.CPUCores,
-		MemMB:         q.MemMB,
-		StorageGB:     q.StorageGB,
-		MaxContainers: q.MaxContainers,
+		CPUCores:       q.CPUCores,
+		MemMB:          q.MemMB,
+		StorageGB:      q.StorageGB,
+		MaxContainers:  q.MaxContainers,
+		TmpfsSizeMB:    tmpfsMB,
+		AllowedDevices: devices,
 	}
 }
 

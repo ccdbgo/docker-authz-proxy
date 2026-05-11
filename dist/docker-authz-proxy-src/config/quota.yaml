@@ -2,8 +2,11 @@
 # 版本：1
 #
 # 配额说明：
-#   cpu_cores: 0 = 不限制，1.0 = 1核，4.0 = 400%
-#   mem_mb:    0 = 不限制，单位 MB
+#   cpu_cores:       0 = 不限制，1.0 = 1核，4.0 = 400%
+#   mem_mb:          0 = 不限制，单位 MB
+#   tmpfs_size_mb:   单个 tmpfs 挂载最大内存（MB），0 = 不限制，默认 512MB
+#   allowed_devices: 允许挂载的设备 glob 模式列表（追加到内置白名单）
+#                    内置白名单：/dev/null /dev/zero /dev/urandom /dev/random /dev/full /dev/tty
 #
 # 优先级：users > groups > defaults
 # 组配额取最宽松的组配额（避免因某个严格组限制了用户）
@@ -14,6 +17,7 @@ version: 1
 defaults:
   cpu_cores: 2.0    # 默认 2 核
   mem_mb: 2048      # 默认 2GB
+  tmpfs_size_mb: 512 # 默认 tmpfs 上限 512MB
 
 # 按用户配置
 users:
@@ -21,11 +25,13 @@ users:
   root:
     cpu_cores: 0
     mem_mb: 0
+    tmpfs_size_mb: 0  # root 不限制
 
   # test-sudo：sudo 组成员，给予较多资源
   test-sudo:
     cpu_cores: 4.0
     mem_mb: 4096
+    tmpfs_size_mb: 1024
 
   # test-docker-g：docker 组成员，标准资源
   test-docker-g:
@@ -41,6 +47,7 @@ users:
   alice:
     cpu_cores: 1.0
     mem_mb: 1024
+    tmpfs_size_mb: 256
 
 # 按组配置
 groups:
@@ -48,6 +55,11 @@ groups:
   sudo:
     cpu_cores: 4.0
     mem_mb: 4096
+    tmpfs_size_mb: 1024
+    # sudo 组允许使用 GPU 设备（示例）
+    # allowed_devices:
+    #   - /dev/dri/*
+    #   - /dev/nvidia*
 
   # docker 组：标准资源（test-docker-g 属于此组）
   docker:

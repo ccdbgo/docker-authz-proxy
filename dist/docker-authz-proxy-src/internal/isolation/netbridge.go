@@ -265,9 +265,10 @@ func ExtractPortMappings(body []byte) []PortMapping {
 // ── 网络注入 ──────────────────────────────────────────────────
 
 // InjectUserNetwork 向容器创建请求体注入用户专属网络及所有用户级 peer 网络。
-// 强制覆盖任何 --net 参数，用户无法绕过。
+// userRequestedNetworks 为用户显式指定的、已通过权限检查的网络名列表（带用户前缀的真实名称）。
+// 若用户指定了自己的网络，NetworkMode 保留为该网络；否则强制设为用户专属 bridge。
 // peerNetworkIDs 为该用户已配置的用户级互通网络 ID 列表，可为空。
-func InjectUserNetwork(body []byte, uid int, peerNetworkIDs []string) ([]byte, error) {
+func InjectUserNetwork(body []byte, uid int, peerNetworkIDs []string, userRequestedNetworks []string) ([]byte, error) {
 	var req map[string]json.RawMessage
 	if err := json.Unmarshal(body, &req); err != nil {
 		return body, nil
@@ -280,17 +281,55 @@ func InjectUserNetwork(body []byte, uid int, peerNetworkIDs []string) ([]byte, e
 
 	bridgeName := UserBridgeName(uid)
 
-	// 强制覆盖 NetworkMode，无论用户指定了什么
-	b, _ := json.Marshal(bridgeName)
+	// 确定 NetworkMode：用户显式指定了自己的网络时保留，否则强制用专属 bridge
+	primaryNet := bridgeName
+	if len(userRequestedNetworks) > 0 && userRequestedNetworks[0] != "" {
+		primaryNet = userRequestedNetworks[0]
+	}
+	b, _ := json.Marshal(primaryNet)
 	hostConfig["NetworkMode"] = b
 
-	// EndpointsConfig：私有网络 + 所有用户级 peer 网络
-	endpoints := map[string]any{
-		bridgeName: map[string]any{},
+	// 读取原始 EndpointsConfig，保留 alias 等用户配置
+	origEndpoints := make(map[string]json.RawMessage)
+	if nc, ok := req["NetworkingConfig"]; ok && len(nc) > 0 && string(nc) != "null" {
+		var ncMap struct {
+			EndpointsConfig map[string]json.RawMessage `json:"EndpointsConfig"`
+		}
+		if json.Unmarshal(nc, &ncMap) == nil {
+			origEndpoints = ncMap.EndpointsConfig
+		}
+	}
+
+	// EndpointsConfig：始终包含专属 bridge + 用户指定的所有网络（保留原始配置）+ peer 网络
+	endpoints := map[string]json.RawMessage{}
+	emptyObj, _ := json.Marshal(map[string]any{})
+	endpoints[bridgeName] = emptyObj
+	for i, netName := range userRequestedNetworks {
+		if netName == "" || netName == bridgeName {
+			continue
+		}
+		// 尝试从原始 EndpointsConfig 中找到对应的配置（原始名或带前缀名）
+		origName := netName
+		if i < len(userRequestedNetworks) {
+			// 原始请求里的网络名（不带前缀）
+			rawNames := ExtractRequestedNetworks(body)
+			if i < len(rawNames) {
+				origName = rawNames[i]
+			}
+		}
+		if cfg, ok := origEndpoints[origName]; ok {
+			endpoints[netName] = cfg
+		} else if cfg, ok := origEndpoints[netName]; ok {
+			endpoints[netName] = cfg
+		} else {
+			endpoints[netName] = emptyObj
+		}
 	}
 	for _, netID := range peerNetworkIDs {
 		if netID != "" {
-			endpoints[netID] = map[string]any{}
+			if _, exists := endpoints[netID]; !exists {
+				endpoints[netID] = emptyObj
+			}
 		}
 	}
 	networkingConfig := map[string]any{"EndpointsConfig": endpoints}
