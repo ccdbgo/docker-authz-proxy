@@ -231,9 +231,10 @@ func (p *ProxyServer) startUserListener(u systemUser) error {
 	p.mu.Unlock()
 
 	srv := &http.Server{
-		Handler:      p,
-		ReadTimeout:  p.requestTimeout,
-		WriteTimeout: p.requestTimeout,
+		Handler:     p,
+		ReadTimeout: p.requestTimeout,
+		// WriteTimeout 不在此设置：docker events/stats 是长连接流式响应，
+		// 全局 WriteTimeout 会在超时后强制断开，客户端收到 unexpected EOF。
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
 			clientAddr := c.RemoteAddr().String()
 			p.logger.Debug("new_connection",
@@ -375,9 +376,8 @@ func (p *ProxyServer) StartTCPListener(addr string, tlsCfg *tls.Config) error {
 	}
 
 	srv := &http.Server{
-		Handler:      p,
-		ReadTimeout:  p.requestTimeout,
-		WriteTimeout: p.requestTimeout,
+		Handler:     p,
+		ReadTimeout: p.requestTimeout,
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
 			return context.WithValue(ctx, identityContextKey, &auth.CallerIdentity{
 				RealUID:    -1,
@@ -1407,6 +1407,46 @@ type upstreamError struct {
 func (e *upstreamError) Error() string { return e.cause.Error() }
 func (e *upstreamError) Unwrap() error { return e.cause }
 
+// eventBelongsToUser 判断一行 docker events JSON 是否属于指定 uid 的用户。
+// 过滤规则：
+//   - container/volume/image 事件：通过 system.authz.owner.uid 或 user_id 字段判断
+//   - network 事件：通过网络名前缀 user-<uid>- 或 peer-<uid>- 判断
+//   - 无法判断归属的事件（系统事件、无 uid 字段）一律放行
+func eventBelongsToUser(line []byte, uid int) bool {
+	var ev struct {
+		Type  string `json:"Type"`
+		Actor struct {
+			Attributes map[string]string `json:"Attributes"`
+		} `json:"Actor"`
+	}
+	if err := json.Unmarshal(line, &ev); err != nil {
+		return true
+	}
+	attrs := ev.Actor.Attributes
+	if attrs == nil {
+		return true
+	}
+	uidStr := strconv.Itoa(uid)
+
+	// network 事件：通过网络名前缀判断（user-<uid>- 或 peer-<uid>-）
+	if ev.Type == "network" {
+		name := attrs["name"]
+		return strings.HasPrefix(name, "user-"+uidStr+"-") ||
+			strings.HasPrefix(name, "peer-"+uidStr+"-") ||
+			strings.HasPrefix(name, "peer-") && strings.Contains(name, "-"+uidStr+"-")
+	}
+
+	// 其他事件：通过 system.authz.owner.uid 或 user_id 判断
+	if v, ok := attrs["system.authz.owner.uid"]; ok {
+		return v == uidStr
+	}
+	if v, ok := attrs["user_id"]; ok {
+		return v == uidStr
+	}
+	// 没有 uid 相关字段：系统级事件，放行
+	return true
+}
+
 // isConnectionRefused 判断错误是否为连接拒绝（Dockerd未启动）
 func isConnectionRefused(err error) bool {
 	if err == nil {
@@ -1970,11 +2010,58 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 
 	default:
 		isolation.CopyHeaders(w, resp.Header)
-		w.WriteHeader(resp.StatusCode)
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
+		// 流式响应（如 docker events、docker stats）：逐行读取并立即 flush，
+		// 避免 io.Copy 的 32KB 缓冲导致事件积压、客户端无法实时收到数据。
+		// 判断依据：无 Content-Length 且为 chunked 或纯流式（events/stats 均如此）。
+		isStreaming := resp.Header.Get("Content-Length") == "" &&
+			(strings.Contains(resp.Header.Get("Transfer-Encoding"), "chunked") ||
+				strings.Contains(r.URL.Path, "/events") ||
+				strings.Contains(r.URL.Path, "/stats"))
+		if isStreaming {
+			// 删除上游的 Transfer-Encoding 头：Go HTTP server 会自动对流式响应做
+			// chunked 编码，若保留该头会造成双重 chunked，客户端报 unexpected EOF。
+			w.Header().Del("Transfer-Encoding")
 		}
-		_, _ = io.Copy(w, resp.Body)
+		w.WriteHeader(resp.StatusCode)
+		if flusher, ok := w.(http.Flusher); ok && isStreaming {
+			// /events 流：逐行读取，按 owner label 过滤，只向当前用户推送自己的事件。
+			// privileged 用户（root/sudo）可看到所有事件。
+			// 其他流式响应（/stats 等）直接透传不过滤。
+			isEvents := strings.Contains(r.URL.Path, "/events")
+			br := bufio.NewReaderSize(resp.Body, 64*1024)
+			for {
+				// ReadLine 不受单行长度限制（isPrefix=true 时分段拼接）
+				var line []byte
+				for {
+					seg, isPrefix, err := br.ReadLine()
+					line = append(line, seg...)
+					if !isPrefix || err != nil {
+						break
+					}
+				}
+				if len(line) == 0 {
+					// 检查是否已到流末尾
+					if _, peekErr := br.Peek(1); peekErr != nil {
+						break
+					}
+					continue
+				}
+				// /events 过滤：非 privileged 用户只看自己的事件
+				if isEvents && !id.IsPrivileged() {
+					if !eventBelongsToUser(line, id.RealUID) {
+						continue
+					}
+				}
+				_, _ = w.Write(line)
+				_, _ = w.Write([]byte("\n"))
+				flusher.Flush()
+			}
+		} else {
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			_, _ = io.Copy(w, resp.Body)
+		}
 	}
 
 	if !isAuxiliaryCall(id.DockerCommand, action, "", requestURI) {
