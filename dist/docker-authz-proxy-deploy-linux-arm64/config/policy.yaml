@@ -11,31 +11,6 @@
 #   test-docker-g - docker 组成员，受限用户，禁止 build/push/commit/load/save/swarm/plugin/secret/config
 #   bob           - 普通开发者，禁止 exec/build/push/commit/load/save/swarm/plugin/secret/config
 #   alice         - 受限用户，禁止 ps/exec/build/push/commit/load/save/prune/swarm/plugin/secret/config
-#
-# ⚠️  安全提示：容器创建参数的安全风险
-# ─────────────────────────────────────────────────────────────────────────────
-# 本代理通过 deny_rules 控制 Docker 操作（如 ps/exec/build 等），但容器创建时
-# 的参数（--privileged、--pid=host、--net=host、--cap-add 等）属于
-# create_container 操作的一部分，不在上述操作分类中单独控制。
-#
-# 如需限制受信任度较低的用户使用高危参数，请在 quota.yaml 中配合配额策略，
-# 或在此处通过 deny_rules 禁止 create_container 操作（即禁止该用户创建容器）。
-#
-# 常见高危参数及风险说明：
-#   --privileged          完全绕过容器隔离，可访问宿主机所有设备，风险极高
-#   --pid=host            共享宿主机 PID 命名空间，可看到/操作宿主机进程
-#   --net=host            共享宿主机网络栈，可监听宿主机端口
-#   --ipc=host            共享宿主机 IPC 命名空间
-#   --cap-add SYS_ADMIN   添加高权限 capability，接近特权容器
-#   --cap-add NET_ADMIN   可修改宿主机网络配置
-#   --userns=host         禁用用户命名空间隔离
-#
-# 建议：对于不受信任的普通用户（如 alice 类角色），应在 deny_rules 中
-# 禁止 create_container，仅允许使用管理员预先创建好的容器（start/stop/logs）。
-# 示例（禁止 alice 自行创建容器）：
-#   - users: [alice]
-#     actions: [create_container, ...]
-# ─────────────────────────────────────────────────────────────────────────────
 
 version: 1
 default_action: allow
