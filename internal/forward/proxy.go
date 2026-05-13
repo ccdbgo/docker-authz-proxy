@@ -1784,9 +1784,24 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 		w.WriteHeader(resp.StatusCode)
 		imageID := streamAndCaptureImageID(w, resp, "build")
 		if imageID != "" && resp.StatusCode == http.StatusOK {
-			// 将短 ID（12-char）或 BuildKit ID 解析为完整 sha256（规范化存储）
-			if fullID := p.resolveImageIDByRef(imageID); fullID != "" {
-				imageID = fullID // "sha256:ba6dc382fcdc..."（SetImageOwner 会自动去掉 sha256: 前缀）
+			// BuildKit（有 buildx）构建时，流中 aux.ID 是 manifest list 的 SHA，
+			// 而 Docker inspect 返回的 Id 是 image config 的 SHA，两者不同。
+			// 优先用 build 请求的 ?t= tag 参数重新 resolve，确保存入 DB 的 ID
+			// 与 rmi/images 时 resolveImageIDByRef 返回的结果一致。
+			resolved := false
+			if u, err := url.ParseRequestURI(requestURI); err == nil {
+				if tag := u.Query().Get("t"); tag != "" {
+					if fullID := p.resolveImageIDByRef(tag); fullID != "" {
+						imageID = fullID
+						resolved = true
+					}
+				}
+			}
+			// 回退：用流中提取的 ID（短 ID 或旧版 builder）直接 resolve
+			if !resolved {
+				if fullID := p.resolveImageIDByRef(imageID); fullID != "" {
+					imageID = fullID
+				}
 			}
 			if err := p.db.SetImageOwner(imageID, id, false, "build"); err != nil {
 				p.logger.Error("save_image_owner_failed",
