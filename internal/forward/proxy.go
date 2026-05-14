@@ -2226,6 +2226,13 @@ func isHijackRequest(r *http.Request) bool {
 
 // handleHijack 处理需要双向流的请求（attach/exec-start 等）
 func (p *ProxyServer) handleHijack(w http.ResponseWriter, r *http.Request, id *auth.CallerIdentity) {
+	// BuildKit 通过 POST /grpc 进行构建，在 hijack 开始前先快照当前镜像列表，
+	// 连接关闭后与新列表对比，将新增镜像归属到当前用户。
+	isGRPC := r.Method == "POST" && (r.URL.Path == "/grpc" || strings.HasSuffix(r.URL.Path, "/grpc"))
+	var preGRPCImageIDs map[string]bool
+	if isGRPC {
+		preGRPCImageIDs = p.listAllImageIDs()
+	}
 	action := authz.OverrideActionByCommand(id.DockerCommand, authz.ClassifyAction(r.Method, r.URL.RequestURI()))
 	p.logger.Debug("hijack_request",
 		zap.String("user", fmt.Sprintf("%s(uid=%d)", id.RealUsername, id.RealUID)),
@@ -2419,6 +2426,86 @@ func (p *ProxyServer) handleHijack(w http.ResponseWriter, r *http.Request, id *a
 		zap.String("user", fmt.Sprintf("%s(uid=%d)", id.RealUsername, id.RealUID)),
 		zap.String("action", action),
 	)
+
+	// BuildKit gRPC 连接关闭后，追踪新创建的镜像归属
+	if isGRPC && preGRPCImageIDs != nil {
+		go p.trackBuildKitImages(id, preGRPCImageIDs)
+	}
+}
+
+// trackBuildKitImages 在 BuildKit gRPC 连接（POST /grpc）关闭后，对比镜像列表
+// 找出新增镜像并归属到当前用户。BuildKit 通过 gRPC over h2c 进行构建，不走
+// POST /build，因此需要此机制补录。preImageIDs 为 gRPC 连接建立前的镜像 ID 集合。
+func (p *ProxyServer) trackBuildKitImages(id *auth.CallerIdentity, preImageIDs map[string]bool) {
+	// 短暂等待，确保 Docker daemon 完成镜像写入
+	time.Sleep(300 * time.Millisecond)
+
+	req, err := http.NewRequest("GET", "http://docker/images/json", nil)
+	if err != nil {
+		return
+	}
+	resp, err := p.transport.RoundTrip(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+
+	var images []struct {
+		ID string `json:"Id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&images); err != nil {
+		return
+	}
+
+	auditID := toAuditIdentity(id)
+	for _, img := range images {
+		imageID := strings.TrimPrefix(img.ID, "sha256:")
+		if preImageIDs[imageID] {
+			continue // gRPC 连接前已存在，跳过
+		}
+		if _, _, found := p.db.GetImageOwner(imageID); found {
+			continue // 已有归属记录，跳过
+		}
+		if err := p.db.SetImageOwner(imageID, id, false, "build"); err != nil {
+			p.logger.Error("save_buildkit_image_owner_failed",
+				zap.String("image_id", truncID(imageID)),
+				zap.String("real_username", id.RealUsername),
+				zap.Int("real_uid", id.RealUID),
+				zap.Error(err))
+		} else {
+			_ = p.db.EnsureImageAccess(imageID, id.RealUID)
+			p.logger.Info("buildkit_image_tracked",
+				append(audit.LogIdentityFields(auditID),
+					zap.String("image_id", truncID(imageID)),
+				)...)
+		}
+	}
+}
+
+// listAllImageIDs 查询 Docker 获取所有镜像 ID 集合（不含 sha256: 前缀）
+func (p *ProxyServer) listAllImageIDs() map[string]bool {
+	req, err := http.NewRequest("GET", "http://docker/images/json", nil)
+	if err != nil {
+		return nil
+	}
+	resp, err := p.transport.RoundTrip(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+
+	var images []struct {
+		ID string `json:"Id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&images); err != nil {
+		return nil
+	}
+
+	result := make(map[string]bool, len(images))
+	for _, img := range images {
+		result[strings.TrimPrefix(img.ID, "sha256:")] = true
+	}
+	return result
 }
 
 // systemUser 从 /etc/passwd 读取的用户信息
