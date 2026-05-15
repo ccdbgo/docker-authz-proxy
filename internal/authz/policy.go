@@ -132,6 +132,8 @@ const (
 	ActionStartContainer  = "start"
 	ActionRestart         = "restart"
 	ActionStop            = "stop"
+	ActionPause           = "pause"
+	ActionUnpause         = "unpause"
 	ActionRename          = "rename"
 	ActionUpdate          = "update"
 	ActionRemoveContainer = "rm"
@@ -223,10 +225,12 @@ func ClassifyAction(method, uri string) string {
 	case method == "POST" && pathMatchesN(path, "/containers/", "/restart"):
 		return ActionRestart
 	case method == "POST" && (pathMatchesN(path, "/containers/", "/stop") ||
-		pathMatchesN(path, "/containers/", "/kill") ||
-		pathMatchesN(path, "/containers/", "/pause") ||
-		pathMatchesN(path, "/containers/", "/unpause")):
+		pathMatchesN(path, "/containers/", "/kill")):
 		return ActionStop
+	case method == "POST" && pathMatchesN(path, "/containers/", "/pause"):
+		return ActionPause
+	case method == "POST" && pathMatchesN(path, "/containers/", "/unpause"):
+		return ActionUnpause
 	case method == "POST" && pathMatchesN(path, "/containers/", "/rename"):
 		return ActionRename
 	case method == "POST" && pathMatchesN(path, "/containers/", "/update"):

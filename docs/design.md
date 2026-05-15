@@ -159,6 +159,32 @@ if strings.Contains(errResp.Message, "Pool overlaps") {
 }
 ```
 
+当 Docker daemon 返回包含 "already exists" 的错误时（同名网络已存在），代理：
+
+1. 从 context 取带前缀的网络名（`rewrittenNameCtxKey`）
+2. 调用 `listNetworkSubnets(prefixedName)` 查询该网络的实际子网
+3. 去掉前缀得到用户可见名
+4. 将错误信息替换为：原始消息 + "。该网络已存在，当前子网：<列表>。如需更改子网，请先执行 docker network rm <用户可见名>"
+
+```go
+if strings.Contains(errResp.Message, "already exists") {
+    prefixedName, _ := r.Context().Value(rewrittenNameCtxKey).(string)
+    userVisibleName := strings.TrimPrefix(prefixedName, isolation.UserResourcePrefix(id))
+    subnets := p.listNetworkSubnets(prefixedName)
+    msg := errResp.Message
+    if len(subnets) > 0 {
+        msg += "。该网络已存在，当前子网：" + strings.Join(subnets, ", ")
+    } else {
+        msg += "。该网络已存在"
+    }
+    if userVisibleName != "" {
+        msg += "。如需更改子网，请先执行 docker network rm " + userVisibleName
+    }
+    writeDockerError(w, resp.StatusCode, msg)
+    return
+}
+```
+
 **历史决策**：
 - 方案 A（已废弃）：将 IPv6 ULA 地址的第 3-4 字节替换为用户 UID，确保每用户子网唯一。问题：用户看到被改写的地址会困惑。
 - 方案 B（已废弃）：拒绝用户显式指定 IPv6 子网，要求省略 `--subnet`。问题：这是正常操作行为，不应拒绝，且 IPv4 和 IPv6 行为不一致。
@@ -174,6 +200,35 @@ if strings.Contains(errResp.Message, "Pool overlaps") {
 
 `SetNetworkShared` 底层为 `INSERT OR IGNORE`，只增不删。撤销互通必须调用 `DeleteNetwork` 删除 `network_access` 行。
 
+### 4.4 容器创建错误信息净化
+
+Docker daemon 返回的错误信息中含有内部资源名（如 `sudo_test_u1005_test_v6net`、`user-1005-myapp`），用户不应看到这些内部前缀。
+
+**前缀剥除**（`stripInternalPrefixFromErrorMessage`）：
+
+容器创建失败（4xx/5xx）且非特权用户时，解析响应体的 `message` 字段，将以下两种内部前缀替换为空字符串：
+- 网络/Volume 前缀：`{username}_u{uid}_`（由 `isolation.UserResourcePrefix` 生成）
+- 容器前缀：`user-{uid}-`（由 `isolation.UserContainerPrefix` 生成）
+
+**子网提示**（同一函数内）：
+
+当 `message` 含 `no configured subnet contains` 时，说明用户指定的 `--ip6` 或 `--ip` 地址不在网络的实际子网内。此时：
+
+1. 从原始（未剥除前缀的）`message` 中提取网络名，格式为 `invalid config for network <name>: ...`（由 `extractNetworkNameFromErrorMsg` 解析）
+2. 调用 `listNetworkSubnets(prefixedName)` 查询该网络的实际 IPAM 子网
+3. 在剥除前缀后的 `message` 末尾附加：`。该网络已配置的子网为：<列表>，请使用该范围内的 IP 地址`
+
+```
+原始错误：
+  invalid config for network sudo_test_u1005_test_v6net: invalid endpoint settings:
+  no configured subnet contains IP address fd01::10
+
+用户看到：
+  invalid config for network test_v6net: invalid endpoint settings:
+  no configured subnet contains IP address fd01::10。
+  该网络已配置的子网为：172.20.0.0/16, fd00::/80，请使用该范围内的 IP 地址
+```
+
 ---
 
 ## 五、策略系统
@@ -186,10 +241,14 @@ if strings.Contains(errResp.Message, "Pool overlaps") {
 
 ### 5.2 操作别名
 
-| policy 中的名称 | 实际映射 |
-|----------------|---------|
-| `run` | `create_container` + `start` |
-| `history` | `history` |
+| policy 中的名称 | 实际映射 | 说明 |
+|----------------|---------|------|
+| `run` | `create_container` + `start` | docker run 拆分为两个 action |
+| `history` | `history` | docker image history |
+| `pause` | `pause` | 独立 action，不合并到 `stop` |
+| `unpause` | `unpause` | 独立 action，不合并到 `stop` |
+
+`pause`/`unpause` 与 `stop`/`kill` 相互独立，禁止其中一个不影响其他。
 
 ### 5.3 命令级覆盖
 
@@ -225,8 +284,17 @@ var cmdActionOverrides = map[string]string{
 | `internal/authz/policy.go` | 策略加载、操作分类（ClassifyAction）、路径匹配 |
 | `internal/authz/ownership.go` | 归属数据库（SQLite）CRUD |
 | `internal/isolation/network.go` | 网络/容器名称前缀注入、URL 重写、列表过滤 |
-| `internal/isolation/netbridge.go` | 跨用户网络互通（BridgeManager） |
+| `internal/isolation/netbridge.go` | 跨用户网络互通（BridgeManager）、容器网络注入（InjectUserNetwork） |
 | `internal/isolation/quota.go` | 资源配额检查与注入 |
 | `internal/isolation/storage.go` | bind mount 路径校验 |
 | `internal/isolation/labels.go` | 容器标签注入（owner 追踪） |
 | `internal/forward/proxy.go` | 代理核心：请求预处理、响应后处理、归属记录 |
+
+**`proxy.go` 关键辅助函数**：
+
+| 函数 | 说明 |
+|------|------|
+| `listUsedSubnets()` | 查询所有网络的 IPAM 子网，用于子网冲突提示 |
+| `listNetworkSubnets(name)` | 查询指定网络的 IPAM 子网，用于 already exists 和 no configured subnet 提示 |
+| `stripInternalPrefixFromErrorMessage(p, body, id)` | 剥除容器创建错误信息中的内部前缀，并在子网不匹配时附加实际子网提示 |
+| `extractNetworkNameFromErrorMsg(msg)` | 从 `invalid config for network <name>:` 格式的错误信息中提取网络名 |

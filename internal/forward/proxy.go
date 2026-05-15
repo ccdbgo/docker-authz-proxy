@@ -1786,7 +1786,8 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(body)
 
-	case authz.ActionStartContainer, authz.ActionRestart, authz.ActionStop:
+	case authz.ActionStartContainer, authz.ActionRestart, authz.ActionStop,
+		authz.ActionPause, authz.ActionUnpause:
 		isolation.CopyHeaders(w, resp.Header)
 		w.WriteHeader(resp.StatusCode)
 		_, _ = io.Copy(w, resp.Body)
@@ -2303,8 +2304,8 @@ func isAuxiliaryCall(dockerCmd, action, method, path string) bool {
 		"ps":      {authz.ActionPS},
 		"inspect": {authz.ActionInspect},
 		"port":    {authz.ActionPort},
-		"pause":   {authz.ActionStop},
-		"unpause": {authz.ActionStop},
+		"pause":   {authz.ActionPause},
+		"unpause": {authz.ActionUnpause},
 		"wait":    {authz.ActionWait},
 		"rename":  {authz.ActionRename},
 		"update":  {authz.ActionUpdate},
@@ -3089,8 +3090,9 @@ func (p *ProxyServer) checkContainerOwnershipByLabel(w http.ResponseWriter, id *
 				return true
 			}
 		}
-		// 容器不存在时，rm/stop 等操作直接放行，让 Docker 返回 404（幂等操作）
-		if action == authz.ActionRemoveContainer || action == authz.ActionStop {
+		// 容器不存在时，rm/stop/pause/unpause 等操作直接放行，让 Docker 返回 404（幂等操作）
+		if action == authz.ActionRemoveContainer || action == authz.ActionStop ||
+			action == authz.ActionPause || action == authz.ActionUnpause {
 			return true
 		}
 		// 无法获取容器信息（容器不存在或网络故障），拒绝以确保安全
