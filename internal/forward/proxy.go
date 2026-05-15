@@ -1072,10 +1072,52 @@ func (p *ProxyServer) checkImageRemovePermission(w http.ResponseWriter, r *http.
 
 	auditID := toAuditIdentity(id)
 
-	// 非 root：只有属主才能 rmi
+	// 非 root：只有属主才能物理删除，但有 image_access 记录的用户可以虚拟删除（解除引用）
 	if !id.IsPrivileged() {
 		isImageOwner := owner.UID == id.RealUID
 		if !isImageOwner {
+			// 检查是否有 image_access 记录（用户曾 pull 或 build 过该镜像）
+			hasAccess, _ := p.db.HasUserImageAccess(resolvedID, id.RealUID)
+			if !hasAccess {
+				// 检查 pending build：trackBuildKitImages 可能正在为当前用户添加 image_access
+				if startTime, ok := p.pendingBuilds.Load(id.RealUID); ok {
+					buildStart := startTime.(time.Time)
+					if time.Since(buildStart) < 30*time.Second {
+						p.logger.Info("rmi_waiting_for_pending_build_access",
+							zap.String("user", id.RealUsername),
+							zap.Int("uid", id.RealUID),
+							zap.String("image_id", truncID(resolvedID)),
+						)
+						deadline := time.Now().Add(5 * time.Second)
+						for time.Now().Before(deadline) {
+							time.Sleep(50 * time.Millisecond)
+							hasAccess, _ = p.db.HasUserImageAccess(resolvedID, id.RealUID)
+							if hasAccess {
+								break
+							}
+						}
+					}
+				}
+			}
+			if hasAccess {
+				// 虚拟删除：移除当前用户的引用记录，不物理删除镜像
+				_, _ = p.db.RemoveUserImageAccess(resolvedID, id.RealUID)
+				p.logger.Info("image_virtual_deleted",
+					append(audit.LogIdentityFields(auditID),
+						zap.String("image_id", truncID(resolvedID)),
+						zap.String("owner", owner.Username),
+					)...)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				// 返回 Docker 格式的成功响应（仅 Untagged，不含 Deleted，因为镜像未物理删除）
+				imageRef := authz.ExtractImageID(r.URL.Path)
+				if imageRef != "" && strings.Contains(imageRef, ":") && !strings.HasPrefix(imageRef, "sha256:") {
+					fmt.Fprintf(w, `[{"Untagged":%q}]`, imageRef)
+				} else {
+					fmt.Fprintf(w, `[]`)
+				}
+				return false
+			}
 			auditOwner := &audit.OwnerInfo{Username: owner.Username, UID: owner.UID, GID: owner.GID}
 			audit.LogAuthzDeniedOwnership(p.logger, auditID, auditOwner, "image", truncID(resolvedID), authz.ActionRemoveImage)
 			msg := fmt.Sprintf("image '%s' belongs to user '%s', only the owner can remove it", truncID(resolvedID), owner.Username)
@@ -2262,8 +2304,6 @@ func (p *ProxyServer) handleHijack(w http.ResponseWriter, r *http.Request, id *a
 	var preSnapshot *imageSnapshot
 	if isGRPC {
 		preSnapshot = p.snapshotImageState()
-		// 记录 pending build，供 checkImageRemovePermission 检测竞态
-		p.pendingBuilds.Store(id.RealUID, time.Now())
 	}
 	action := authz.OverrideActionByCommand(id.DockerCommand, authz.ClassifyAction(r.Method, r.URL.RequestURI()))
 	p.logger.Debug("hijack_request",
@@ -2459,12 +2499,12 @@ func (p *ProxyServer) handleHijack(w http.ResponseWriter, r *http.Request, id *a
 		zap.String("action", action),
 	)
 
-	// BuildKit gRPC 连接关闭后，追踪新创建的镜像归属
+	// BuildKit gRPC 连接关闭后，追踪新创建的镜像归属。
+	// 在启动 goroutine 前更新时间戳（连接关闭时刻），确保 30 秒窗口从构建完成开始计算，
+	// 避免长时间构建（>30s）导致窗口提前过期。
 	if isGRPC && preSnapshot != nil {
+		p.pendingBuilds.Store(id.RealUID, time.Now())
 		go p.trackBuildKitImages(id, preSnapshot)
-	} else if isGRPC {
-		// 快照失败时也要清除 pending 记录
-		p.pendingBuilds.Delete(id.RealUID)
 	}
 }
 
@@ -2475,8 +2515,10 @@ func (p *ProxyServer) handleHijack(w http.ResponseWriter, r *http.Request, id *a
 //  2. 相同 SHA 重建（Dockerfile/基础镜像未变，产生相同 manifest list SHA）：
 //     tag 指向的 SHA 不在 DB 中，也归属给当前用户
 func (p *ProxyServer) trackBuildKitImages(id *auth.CallerIdentity, pre *imageSnapshot) {
-	// 构建完成后清除 pending 记录（无论成功与否）
-	defer p.pendingBuilds.Delete(id.RealUID)
+	// 注意：不在此处删除 pendingBuilds 记录。
+	// BuildKit 会建立多个 gRPC 连接，若第一个连接的 goroutine 删除了记录，
+	// 后续连接的 goroutine 还在 sleep 时 docker rmi 就会找不到 pending 记录。
+	// pendingBuilds 记录通过 30 秒时间窗口自然过期（checkImageRemovePermission 中判断）。
 
 	// 短暂等待，确保 Docker daemon 完成镜像写入
 	time.Sleep(300 * time.Millisecond)
@@ -2512,8 +2554,25 @@ func (p *ProxyServer) trackBuildKitImages(id *auth.CallerIdentity, pre *imageSna
 
 	auditID := toAuditIdentity(id)
 	writeOne := func(imageID string) {
-		if _, _, found := p.db.GetImageOwner(imageID); found {
-			return // 已有归属记录，跳过
+		existingOwner, _, found := p.db.GetImageOwner(imageID)
+		if found {
+			// 镜像已有归属记录
+			if existingOwner.UID != id.RealUID {
+				// 属主是其他用户：为当前用户添加访问权限，允许虚拟删除
+				if err := p.db.EnsureImageAccess(imageID, id.RealUID); err != nil {
+					p.logger.Error("ensure_image_access_failed",
+						zap.String("image_id", truncID(imageID)),
+						zap.String("real_username", id.RealUsername),
+						zap.Error(err))
+				} else {
+					p.logger.Info("buildkit_image_access_added",
+						append(audit.LogIdentityFields(auditID),
+							zap.String("image_id", truncID(imageID)),
+							zap.String("owner", existingOwner.Username),
+						)...)
+				}
+			}
+			return
 		}
 		if err := p.db.SetImageOwner(imageID, id, false, "build"); err != nil {
 			p.logger.Error("save_buildkit_image_owner_failed",
