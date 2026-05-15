@@ -925,7 +925,7 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 
 	// ── 镜像权限校验 ──────────────────────────────────────────────────────────
 	switch action {
-	case authz.ActionInspect, authz.ActionSave:
+	case authz.ActionInspect, authz.ActionSave, authz.ActionHistory:
 		// docker save 使用 GET /images/get?names=... 格式，需从 query 参数提取镜像名
 		imageRef := authz.ExtractImageID(r.URL.Path)
 		if action == authz.ActionSave && (imageRef == "" || imageRef == "get") {
