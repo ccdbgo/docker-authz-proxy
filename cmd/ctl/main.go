@@ -661,6 +661,7 @@ func imageList(args []string, db *authz.OwnershipDB) error {
 	fs := flag.NewFlagSet("image list", flag.ContinueOnError)
 	filterUID  := fs.Int("uid", 0, "按 uid 过滤（显示该用户可见的镜像）")
 	filterUser := fs.String("user", "", "按用户名过滤")
+	showAll    := fs.Bool("all", false, "显示全部镜像，包括悬挂镜像（<none>）")
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return nil
@@ -792,6 +793,11 @@ func imageList(args []string, db *authz.OwnershipDB) error {
 			if meta.Size > 0 {
 				size = formatSize(meta.Size)
 			}
+		}
+
+		// 默认隐藏悬挂镜像（<none>），--all 时显示
+		if !*showAll && repo == "<none>" {
+			continue
 		}
 
 		fmt.Printf("%-20s %-10s %-14s %-16s %-6d %-7s %-16s %s\n",

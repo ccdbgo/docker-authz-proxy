@@ -26,7 +26,7 @@
 
 sudo 用户的 `RealUID` 保持原始登录 UID，不改为 0。`IsPrivileged()` 对 `UserTypeSudo` 和 `UserTypeRoot` 均返回 true。
 
-**关键区别**：`IsPrivileged()` 控制资源隔离（列表过滤、归属检查、配额），policy deny 规则使用 `RealUID`，sudo 用户仍受 deny 规则约束。
+**关键区别**：`IsPrivileged()` 控制资源隔离（列表过滤、归属检查），policy deny 规则使用 `RealUID`，sudo 用户仍受 deny 规则约束。**配额检查对所有用户生效（含 sudo、root），无豁免，配额值为 0 表示不限制**。
 
 ---
 

@@ -741,7 +741,8 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 		}
 
 		// 步骤3+4：查询配额，校验请求参数，记录详细审计日志
-		if p.quota != nil && !id.IsPrivileged() {
+		// 所有用户（含 sudo、root）均受配额约束，配额值为 0 表示不限制
+		if p.quota != nil {
 			quota := p.quota.GetQuota(id)
 			auditID := toAuditIdentity(id)
 			p.logger.Info("quota_resolved",
@@ -961,6 +962,37 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 	case authz.ActionPush:
 		if !p.checkImagePushPermission(w, r, id) {
 			return r, false
+		}
+	}
+
+	// container update 配额校验：防止通过 update 绕过内存限制
+	if action == authz.ActionUpdate && p.quota != nil {
+		quota := p.quota.GetQuota(id)
+		if quota.MemMB > 0 {
+			body, _ := io.ReadAll(r.Body)
+			r.Body.Close()
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			var hc struct {
+				Memory int64 `json:"Memory"`
+			}
+			if err := json.Unmarshal(body, &hc); err == nil && hc.Memory > 0 {
+				limitBytes := int64(quota.MemMB) * 1024 * 1024
+				if hc.Memory > limitBytes {
+					auditID := toAuditIdentity(id)
+					p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "quota_exceeded",
+						fmt.Sprintf("memory requested=%dMB limit=%dMB", hc.Memory/1024/1024, quota.MemMB), http.StatusForbidden))
+					p.logger.Warn("quota_exceeded_update",
+						append(audit.LogIdentityFields(auditID),
+							zap.String("resource", "memory"),
+							zap.Int64("requested_mb", hc.Memory/1024/1024),
+							zap.Int("limit_mb", quota.MemMB),
+						)...)
+					writeDockerError(w, http.StatusForbidden, fmt.Sprintf(
+						"quota exceeded: memory requested=%dMB limit=%dMB excess=+%dMB",
+						hc.Memory/1024/1024, quota.MemMB, hc.Memory/1024/1024-int64(quota.MemMB)))
+					return r, false
+				}
+			}
 		}
 	}
 
@@ -1357,7 +1389,8 @@ func (p *ProxyServer) preprocessRequest(r *http.Request, id *auth.CallerIdentity
 	}
 
 	switch action {
-	case authz.ActionCreateContainer, authz.ActionNetworkCreate, authz.ActionVolumeCreate:
+	case authz.ActionCreateContainer, authz.ActionNetworkCreate, authz.ActionVolumeCreate,
+		authz.ActionUpdate:
 		// 需要读取并修改请求体
 	default:
 		return r, nil
@@ -1405,6 +1438,11 @@ func (p *ProxyServer) preprocessRequest(r *http.Request, id *auth.CallerIdentity
 		if !id.IsPrivileged() {
 			body, _ = isolation.InjectVolumeNamePrefix(body, id)
 		}
+
+	case authz.ActionUpdate:
+		// 同步 MemorySwap = Memory，避免 Docker 报 "Memory limit should be smaller than memoryswap" 错误
+		// 配额校验在 checkOwnershipPreRequest 中完成（那里有 w http.ResponseWriter）
+		body = syncMemorySwapForUpdate(body)
 	}
 
 	newReq := r.Clone(r.Context())
@@ -2883,6 +2921,31 @@ func stripNetworkNamePrefix(body []byte, prefix string) []byte {
 		return body
 	}
 	return bytes.Replace(body, old, []byte(`"Name":"`), 1)
+}
+
+// syncMemorySwapForUpdate 将 container update 请求体中的 MemorySwap 同步为 Memory 值。
+// 代理在创建容器时强制 MemorySwap = Memory，update 时若只改 Memory 不改 MemorySwap
+// 会触发 Docker 报错 "Memory limit should be smaller than already set memoryswap limit"。
+func syncMemorySwapForUpdate(body []byte) []byte {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return body
+	}
+	raw, ok := obj["Memory"]
+	if !ok {
+		return body
+	}
+	var mem int64
+	if err := json.Unmarshal(raw, &mem); err != nil || mem <= 0 {
+		return body
+	}
+	// 将 MemorySwap 设为与 Memory 相同的值
+	obj["MemorySwap"] = raw
+	result, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	return result
 }
 
 func extractNetworkNameFromErrorMsg(msg string) string {
