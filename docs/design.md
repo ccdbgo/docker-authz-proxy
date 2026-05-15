@@ -245,10 +245,11 @@ Docker daemon 返回的错误信息中含有内部资源名（如 `sudo_test_u10
 |----------------|---------|------|
 | `run` | `create_container` + `start` | docker run 拆分为两个 action |
 | `history` | `history` | docker image history |
+| `kill` | `kill` | 独立 action，不合并到 `stop` |
 | `pause` | `pause` | 独立 action，不合并到 `stop` |
 | `unpause` | `unpause` | 独立 action，不合并到 `stop` |
 
-`pause`/`unpause` 与 `stop`/`kill` 相互独立，禁止其中一个不影响其他。
+`kill`/`pause`/`unpause` 与 `stop` 相互独立，禁止其中一个不影响其他。
 
 ### 5.3 命令级覆盖
 

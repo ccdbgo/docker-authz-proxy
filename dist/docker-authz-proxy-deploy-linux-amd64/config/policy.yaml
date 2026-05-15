@@ -64,8 +64,9 @@ action_mapping:
   create_container: ["POST /containers/create"]
   start:            ["POST /containers/{id}/start"]
   restart:          ["POST /containers/{id}/restart"]
-  stop:             ["POST /containers/{id}/stop", "POST /containers/{id}/kill",
-                     "POST /containers/{id}/pause", "POST /containers/{id}/unpause"]
+  stop:             ["POST /containers/{id}/stop", "POST /containers/{id}/kill"]
+  pause:            ["POST /containers/{id}/pause"]
+  unpause:          ["POST /containers/{id}/unpause"]
   rm:               ["DELETE /containers/{id}"]
   exec:             ["POST /containers/{id}/exec", "POST /containers/{id}/attach",
                      "POST /exec/{id}/start", "POST /exec/{id}/resize"]

@@ -1787,7 +1787,7 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 		_, _ = w.Write(body)
 
 	case authz.ActionStartContainer, authz.ActionRestart, authz.ActionStop,
-		authz.ActionPause, authz.ActionUnpause:
+		authz.ActionKill, authz.ActionPause, authz.ActionUnpause:
 		isolation.CopyHeaders(w, resp.Header)
 		w.WriteHeader(resp.StatusCode)
 		_, _ = io.Copy(w, resp.Body)
@@ -2292,7 +2292,7 @@ func isAuxiliaryCall(dockerCmd, action, method, path string) bool {
 		"start":   {authz.ActionStartContainer},
 		"stop":    {authz.ActionStop},
 		"restart": {authz.ActionRestart},
-		"kill":    {authz.ActionStop},
+		"kill":    {authz.ActionKill},
 		"rm":      {authz.ActionRemoveContainer},
 		"exec":    {authz.ActionExec},
 		"attach":  {authz.ActionAttach},
@@ -3090,8 +3090,9 @@ func (p *ProxyServer) checkContainerOwnershipByLabel(w http.ResponseWriter, id *
 				return true
 			}
 		}
-		// 容器不存在时，rm/stop/pause/unpause 等操作直接放行，让 Docker 返回 404（幂等操作）
+		// 容器不存在时，rm/stop/kill/pause/unpause 等操作直接放行，让 Docker 返回 404（幂等操作）
 		if action == authz.ActionRemoveContainer || action == authz.ActionStop ||
+			action == authz.ActionKill ||
 			action == authz.ActionPause || action == authz.ActionUnpause {
 			return true
 		}
