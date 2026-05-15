@@ -2026,6 +2026,20 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(body)
 
+	case authz.ActionNetworkInspect:
+		body, err := isolation.ReadFullBody(resp.Body)
+		if err != nil {
+			writeDockerError(w, http.StatusBadGateway, "read upstream response failed")
+			return
+		}
+		if resp.StatusCode == http.StatusOK && !id.IsPrivileged() {
+			body = stripNetworkNamePrefix(body, isolation.UserResourcePrefix(id))
+		}
+		isolation.CopyHeaders(w, resp.Header)
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(body)
+
 	case authz.ActionNetworkList:
 		body, err := isolation.ReadFullBody(resp.Body)
 		if err != nil {
@@ -2856,6 +2870,21 @@ func stripInternalPrefixFromErrorMessage(p *ProxyServer, body []byte, id *auth.C
 
 // extractNetworkNameFromErrorMsg 从 Docker 错误信息中提取网络名。
 // 格式：invalid config for network <name>: ...
+// stripNetworkNamePrefix 将 network inspect 响应体中的 Name 字段值剥除用户前缀。
+// 使用字节替换而非反序列化，保留原始 JSON 结构不变。
+func stripNetworkNamePrefix(body []byte, prefix string) []byte {
+	// 构造 JSON 中的原始名称片段和替换后的片段，直接做字节替换
+	// 原始："Name":"<prefix><name>"  →  替换为："Name":"<name>"
+	quotedPrefix, _ := json.Marshal(prefix)
+	// quotedPrefix 形如 "alice_u1001_"（含引号），去掉两端引号得到纯前缀字符串
+	prefixStr := string(quotedPrefix[1 : len(quotedPrefix)-1])
+	old := []byte(`"Name":"` + prefixStr)
+	if !bytes.Contains(body, old) {
+		return body
+	}
+	return bytes.Replace(body, old, []byte(`"Name":"`), 1)
+}
+
 func extractNetworkNameFromErrorMsg(msg string) string {
 	const marker = "invalid config for network "
 	idx := strings.Index(msg, marker)
