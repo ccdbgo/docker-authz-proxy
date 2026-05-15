@@ -95,6 +95,38 @@ func FilterContainerListResponse(body []byte, realUID int, realUsername string, 
 	if filtered == nil {
 		return emptyJSONArray, nil
 	}
+
+	// 剥除容器名称前缀（user-{uid}-），让用户看到原始名称
+	containerPrefix := UserContainerPrefix(realUID)
+	for i, raw := range filtered {
+		var item map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &item); err != nil {
+			continue
+		}
+		namesRaw, ok := item["Names"]
+		if !ok {
+			continue
+		}
+		var names []string
+		if err := json.Unmarshal(namesRaw, &names); err != nil {
+			continue
+		}
+		modified := false
+		for j, name := range names {
+			// Docker 容器名带前导斜杠："/user-1001-test_container"
+			if strings.HasPrefix(name, "/"+containerPrefix) {
+				names[j] = "/" + name[1+len(containerPrefix):]
+				modified = true
+			}
+		}
+		if modified {
+			newNames, _ := json.Marshal(names)
+			item["Names"] = newNames
+			newRaw, _ := json.Marshal(item)
+			filtered[i] = newRaw
+		}
+	}
+
 	return json.Marshal(filtered)
 }
 

@@ -547,8 +547,14 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 提前重写网络/卷 URL（容器名不加前缀，通过 Docker hex ID + label 追踪归属）
-	// 不对容器 URL 做前缀重写，保持原始容器名直接转发给 Docker daemon
+	// 非特权用户：提前重写资源 URL（注入用户前缀），确保归属检查使用正确的内部名称。
+	// 容器名前缀 user-{uid}-，网络/Volume 前缀 {username}_u{uid}_。
+	// 必须在 checkOwnershipPreRequest 之前执行，否则归属检查会用原始名查 Docker 找不到容器。
+	if !identity.IsPrivileged() {
+		r = isolation.RewriteContainerURL(r, identity.RealUID)
+		r = isolation.RewriteNetworkURL(r, identity)
+		r = isolation.RewriteVolumeURL(r, identity.RealUID)
+	}
 
 	r, ok := p.checkOwnershipPreRequest(w, r, identity, action)
 	if !ok {
@@ -1376,17 +1382,7 @@ func (p *ProxyServer) checkImagePushPermission(w http.ResponseWriter, r *http.Re
 // preprocessRequest 修改请求（注入标签、配额、资源名称前缀等）
 func (p *ProxyServer) preprocessRequest(r *http.Request, id *auth.CallerIdentity, action string) (*http.Request, error) {
 	// 先处理不需要读取 body 的 URL 重写
-	switch action {
-	case authz.ActionNetworkInspect, authz.ActionNetworkConnect,
-		authz.ActionNetworkDisconnect, authz.ActionNetworkRemove:
-		if !id.IsPrivileged() {
-			r = isolation.RewriteNetworkURL(r, id)
-		}
-	case authz.ActionVolumeInspect, authz.ActionVolumeRemove:
-		if !id.IsPrivileged() {
-			r = isolation.RewriteVolumeURL(r, id.RealUID)
-		}
-	}
+	// URL 重写已在主 handler 中完成（checkOwnershipPreRequest 之前），此处无需重复。
 
 	switch action {
 	case authz.ActionCreateContainer, authz.ActionNetworkCreate, authz.ActionVolumeCreate,
@@ -1404,13 +1400,19 @@ func (p *ProxyServer) preprocessRequest(r *http.Request, id *auth.CallerIdentity
 
 	switch action {
 	case authz.ActionCreateContainer:
-		// 注入容器名称前缀（user-{uid}-），并将改写后名称存入 context 供审计使用
+		// 注入容器名称前缀到 URL 查询参数 ?name=（容器名通过 query param 传递，不在 body 中）
 		if !id.IsPrivileged() {
-			rewritten, rewrittenName, _ := isolation.InjectContainerNamePrefix(body, id)
-			if rewrittenName != "" {
-				body = rewritten
-				newCtx := context.WithValue(r.Context(), rewrittenNameCtxKey, rewrittenName)
-				r = r.WithContext(newCtx)
+			if name := r.URL.Query().Get("name"); name != "" {
+				prefix := isolation.UserContainerPrefix(id.RealUID)
+				if !strings.HasPrefix(name, prefix) {
+					newURL := *r.URL
+					q := newURL.Query()
+					q.Set("name", prefix+name)
+					newURL.RawQuery = q.Encode()
+					ctx := context.WithValue(r.Context(), rewrittenNameCtxKey, prefix+name)
+					r = r.Clone(ctx)
+					r.URL = &newURL
+				}
 			}
 		}
 		body, _ = isolation.InjectSystemLabels(body, id)
@@ -1612,6 +1614,28 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 	emptyJSONArray := []byte("[]")
 
 	switch action {
+	case authz.ActionInspect:
+		// docker inspect 对容器和镜像都使用此 action。
+		// 容器 inspect 响应含 "Name":"/user-{uid}-xxx"，需剥除前缀。
+		// 镜像 inspect 响应无此格式，bytes.Contains 检查会直接跳过。
+		body, err := isolation.ReadFullBody(resp.Body)
+		if err != nil {
+			writeDockerError(w, http.StatusBadGateway, "read upstream response failed")
+			return
+		}
+		if resp.StatusCode == http.StatusOK && !id.IsPrivileged() {
+			prefix := isolation.UserContainerPrefix(id.RealUID)
+			// 容器 inspect Name 格式："Name":"/user-1001-test_container"
+			old := []byte(`"Name":"/` + prefix)
+			if bytes.Contains(body, old) {
+				body = bytes.Replace(body, old, []byte(`"Name":"/`), 1)
+			}
+		}
+		isolation.CopyHeaders(w, resp.Header)
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(body)
+
 	case authz.ActionPS:
 		p.logger.Debug("filter_containers_start",
 			zap.String("user", fmt.Sprintf("%s(uid=%d)", id.RealUsername, id.RealUID)),
