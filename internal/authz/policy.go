@@ -283,7 +283,8 @@ func ClassifyAction(method, uri string) string {
 	case method == "POST" && pathMatches(path, "/images/load"):
 		return ActionLoad
 	case method == "POST" && (pathMatches(path, "/build") ||
-		pathMatches(path, "/images/build")):
+		pathMatches(path, "/images/build") ||
+		pathMatches(path, "/grpc")):
 		return ActionBuild
 	case method == "POST" && pathMatches(path, "/build/prune"):
 		return ActionPrune
@@ -397,8 +398,21 @@ func pathMatchesN(path, prefix, suffix string) bool {
 	if slashIdx < 0 {
 		return false
 	}
+	// 快速路径：镜像名不含斜杠（如 /images/alpine/push）
 	tail := rest[slashIdx:]
-	return strings.TrimRight(tail, "/") == strings.TrimRight(suffix, "/")
+	if strings.TrimRight(tail, "/") == strings.TrimRight(suffix, "/") {
+		return true
+	}
+	// 镜像名含斜杠（如 /images/docker.io/library/alpine/push）：
+	// 检查 path 在 prefix 之后是否以 /{id...}{suffix} 结尾，且 suffix 是最后一段。
+	suffixClean := "/" + strings.Trim(suffix, "/")
+	pathClean := strings.TrimRight(path, "/")
+	if !strings.HasSuffix(pathClean, suffixClean) {
+		return false
+	}
+	// 确保 suffix 之前还有内容（即 ID 段非空）
+	before := pathClean[:len(pathClean)-len(suffixClean)]
+	return strings.HasPrefix(before+"/", prefix)
 }
 
 func pathHasPrefix(path, prefix string) bool {

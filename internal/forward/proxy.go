@@ -562,12 +562,12 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	)
 	modifiedReq, err := p.preprocessRequest(r, identity, action)
 	if err != nil {
-		p.logger.Error("preprocess_request_failed",
-			zap.Error(err),
-			zap.String("real_username", identity.RealUsername),
-			zap.Int("real_uid", identity.RealUID),
-		)
-		writeDockerError(w, http.StatusInternalServerError, "internal error")
+		auditID := toAuditIdentity(identity)
+		p.logger.Warn("preprocess_request_rejected",
+			append(audit.LogIdentityFields(auditID),
+				zap.String("action", action),
+				zap.Error(err))...)
+		writeDockerError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	p.logger.Debug("preprocess_request_done",
@@ -686,6 +686,19 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 	if action == authz.ActionCreateContainer {
 		imageRef := extractImageRefFromBody(r)
 		if imageRef != "" {
+			// BuildKit docker-container driver 通过创建 moby/buildkit 容器来执行构建。
+			// 若用户的 build 操作被 deny，则拒绝创建 BuildKit 容器（等价于拒绝 build）。
+			if !id.IsPrivileged() && isBuildKitImage(imageRef) {
+				policy := p.getPolicy()
+				if policy.IsDenied(id, authz.ActionBuild) {
+					auditID := toAuditIdentity(id)
+					audit.LogAuthzDeniedCommand(p.logger, auditID, authz.ActionBuild, r.URL.RequestURI())
+					writeDockerError(w, http.StatusForbidden,
+						fmt.Sprintf("user '%s'(uid=%d) not permitted to perform: %s",
+							id.RealUsername, id.RealUID, authz.ActionBuild))
+					return r, false
+				}
+			}
 			resolvedID := p.resolveImageIDByRef(imageRef)
 			if resolvedID == "" {
 				// 本地不存在，让 docker 自动 pull
@@ -1109,12 +1122,17 @@ func (p *ProxyServer) checkImageRemovePermission(w http.ResponseWriter, r *http.
 					)...)
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusOK)
-				// 返回 Docker 格式的成功响应（仅 Untagged，不含 Deleted，因为镜像未物理删除）
+				// 返回 Docker 格式的成功响应，模拟真实删除效果
 				imageRef := authz.ExtractImageID(r.URL.Path)
 				if imageRef != "" && strings.Contains(imageRef, ":") && !strings.HasPrefix(imageRef, "sha256:") {
-					fmt.Fprintf(w, `[{"Untagged":%q}]`, imageRef)
+					if p.imageHasOtherTags(resolvedID, imageRef) {
+						// 镜像还有其他 tag，只 untag，不模拟 Deleted（与 Docker 真实行为一致）
+						fmt.Fprintf(w, `[{"Untagged":%q}]`, imageRef)
+					} else {
+						fmt.Fprintf(w, `[{"Untagged":%q},{"Deleted":%q}]`, imageRef, resolvedID)
+					}
 				} else {
-					fmt.Fprintf(w, `[]`)
+					fmt.Fprintf(w, `[{"Deleted":%q}]`, resolvedID)
 				}
 				return false
 			}
@@ -1179,6 +1197,20 @@ func (p *ProxyServer) checkImagePullPermission(w http.ResponseWriter, r *http.Re
 	imageRef := parseImageRefFromURI(r.URL.RequestURI())
 	if imageRef == "" {
 		return true
+	}
+
+	// BuildKit docker-container driver 通过 pull moby/buildkit 来启动构建环境。
+	// 若用户的 build 操作被 deny，在 pull 阶段就拒绝，避免无效的网络请求。
+	if isBuildKitImage(imageRef) {
+		policy := p.getPolicy()
+		if policy.IsDenied(id, authz.ActionBuild) {
+			auditID := toAuditIdentity(id)
+			audit.LogAuthzDeniedCommand(p.logger, auditID, authz.ActionBuild, r.URL.RequestURI())
+			writeDockerError(w, http.StatusForbidden,
+				fmt.Sprintf("user '%s'(uid=%d) not permitted to perform: %s",
+					id.RealUsername, id.RealUID, authz.ActionBuild))
+			return false
+		}
 	}
 
 	resolvedID := p.resolveImageIDByRef(imageRef)
@@ -1358,7 +1390,10 @@ func (p *ProxyServer) preprocessRequest(r *http.Request, id *auth.CallerIdentity
 
 	case authz.ActionNetworkCreate:
 		if !id.IsPrivileged() {
-			modified, actualName, _ := isolation.InjectNetworkNamePrefixWithName(body, id)
+			modified, actualName, err := isolation.InjectNetworkNamePrefixWithName(body, id)
+			if err != nil {
+				return r, err
+			}
 			body = modified
 			if actualName != "" {
 				newCtx := context.WithValue(r.Context(), rewrittenNameCtxKey, actualName)
@@ -1648,6 +1683,10 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 				p.auditLog.LogWithResources(id.RealUsername, id.RealUID, string(id.AuthSource),
 					action, r.URL.RequestURI(), "allow", "", containerID, resp.StatusCode, resUsage)
 			}
+		}
+		// 容器创建失败时，剥除错误信息中的内部资源名前缀，避免用户看到 sudo_test_u1005_xxx 等内部名称
+		if resp.StatusCode >= 400 && !id.IsPrivileged() {
+			body = stripInternalPrefixFromErrorMessage(p, body, id)
 		}
 		isolation.CopyHeaders(w, resp.Header)
 		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
@@ -1943,6 +1982,41 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 				} else {
 					p.logger.Info("network_created",
 						append(audit.LogIdentityShortFields(auditID), zap.String("network_id", truncID(createResp.ID)))...)
+				}
+			}
+		} else if resp.StatusCode >= 400 {
+			// 检测子网冲突错误，增强提示信息
+			var errResp struct {
+				Message string `json:"message"`
+			}
+			if json.Unmarshal(body, &errResp) == nil {
+				if strings.Contains(errResp.Message, "Pool overlaps") {
+					usedSubnets := p.listUsedSubnets()
+					msg := errResp.Message + "。请更换 IP 段，这是系统限制"
+					if len(usedSubnets) > 0 {
+						msg += "。已使用的子网：" + strings.Join(usedSubnets, ", ")
+					}
+					writeDockerError(w, resp.StatusCode, msg)
+					return
+				}
+				if strings.Contains(errResp.Message, "already exists") {
+					prefixedName, _ := r.Context().Value(rewrittenNameCtxKey).(string)
+					userVisibleName := prefixedName
+					if !id.IsPrivileged() && prefixedName != "" {
+						userVisibleName = strings.TrimPrefix(prefixedName, isolation.UserResourcePrefix(id))
+					}
+					subnets := p.listNetworkSubnets(prefixedName)
+					msg := errResp.Message
+					if len(subnets) > 0 {
+						msg += "。该网络已存在，当前子网：" + strings.Join(subnets, ", ")
+					} else {
+						msg += "。该网络已存在"
+					}
+					if userVisibleName != "" {
+						msg += "。如需更改子网，请先执行 docker network rm " + userVisibleName
+					}
+					writeDockerError(w, resp.StatusCode, msg)
+					return
 				}
 			}
 		}
@@ -2528,6 +2602,8 @@ func (p *ProxyServer) trackBuildKitImages(id *auth.CallerIdentity, pre *imageSna
 		return
 	}
 
+	auditID := toAuditIdentity(id)
+
 	// 收集需要归属的镜像 ID，tagged 镜像优先（避免竞态：rmi 先于无 tag 镜像写入）
 	taggedIDs := make(map[string]bool)
 	otherIDs := make(map[string]bool)
@@ -2539,8 +2615,23 @@ func (p *ProxyServer) trackBuildKitImages(id *auth.CallerIdentity, pre *imageSna
 			taggedIDs[postID] = true
 		} else {
 			// tag 存在且 SHA 相同：若不在 DB 中则归属（相同内容重建场景）
-			if _, _, found := p.db.GetImageOwner(postID); !found {
+			existingOwner, _, found := p.db.GetImageOwner(postID)
+			if !found {
 				taggedIDs[postID] = true
+			} else if existingOwner.UID != id.RealUID {
+				// 镜像已被其他用户拥有：直接添加访问权限（允许虚拟删除）
+				if err := p.db.EnsureImageAccess(postID, id.RealUID); err != nil {
+					p.logger.Error("ensure_image_access_failed",
+						zap.String("image_id", truncID(postID)),
+						zap.String("real_username", id.RealUsername),
+						zap.Error(err))
+				} else {
+					p.logger.Info("buildkit_image_access_added",
+						append(audit.LogIdentityFields(auditID),
+							zap.String("image_id", truncID(postID)),
+							zap.String("owner", existingOwner.Username),
+						)...)
+				}
 			}
 		}
 	}
@@ -2552,7 +2643,6 @@ func (p *ProxyServer) trackBuildKitImages(id *auth.CallerIdentity, pre *imageSna
 		}
 	}
 
-	auditID := toAuditIdentity(id)
 	writeOne := func(imageID string) {
 		existingOwner, _, found := p.db.GetImageOwner(imageID)
 		if found {
@@ -2639,6 +2729,144 @@ func (p *ProxyServer) snapshotImageState() *imageSnapshot {
 		}
 	}
 	return snap
+}
+
+// listUsedSubnets 查询 Docker 获取当前所有网络的 IPAM 子网列表（去重）
+func (p *ProxyServer) listUsedSubnets() []string {
+	req, err := http.NewRequest("GET", "http://docker/networks", nil)
+	if err != nil {
+		return nil
+	}
+	resp, err := p.transport.RoundTrip(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+
+	var networks []struct {
+		IPAM struct {
+			Config []struct {
+				Subnet string `json:"Subnet"`
+			} `json:"Config"`
+		} `json:"IPAM"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&networks); err != nil {
+		return nil
+	}
+
+	seen := make(map[string]bool)
+	var subnets []string
+	for _, n := range networks {
+		for _, cfg := range n.IPAM.Config {
+			if cfg.Subnet != "" && !seen[cfg.Subnet] {
+				seen[cfg.Subnet] = true
+				subnets = append(subnets, cfg.Subnet)
+			}
+		}
+	}
+	return subnets
+}
+
+// listNetworkSubnets 查询指定网络的 IPAM 子网列表
+func (p *ProxyServer) listNetworkSubnets(networkName string) []string {
+	if networkName == "" {
+		return nil
+	}
+	req, err := http.NewRequest("GET", "http://docker/networks/"+networkName, nil)
+	if err != nil {
+		return nil
+	}
+	resp, err := p.transport.RoundTrip(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+	var network struct {
+		IPAM struct {
+			Config []struct {
+				Subnet string `json:"Subnet"`
+			} `json:"Config"`
+		} `json:"IPAM"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&network); err != nil {
+		return nil
+	}
+	var subnets []string
+	for _, cfg := range network.IPAM.Config {
+		if cfg.Subnet != "" {
+			subnets = append(subnets, cfg.Subnet)
+		}
+	}
+	return subnets
+}
+
+// stripInternalPrefixFromErrorMessage 剥除错误响应 message 字段中的内部资源名前缀，
+// 避免用户看到 sudo_test_u1005_xxx 或 user-1005-xxx 等内部名称。
+// 若错误为 "no configured subnet contains"，额外附加该网络的实际子网信息。
+func stripInternalPrefixFromErrorMessage(p *ProxyServer, body []byte, id *auth.CallerIdentity) []byte {
+	var errResp map[string]json.RawMessage
+	if err := json.Unmarshal(body, &errResp); err != nil {
+		return body
+	}
+	raw, ok := errResp["message"]
+	if !ok {
+		return body
+	}
+	var msg string
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		return body
+	}
+	netPrefix := isolation.UserResourcePrefix(id)
+	contPrefix := isolation.UserContainerPrefix(id.RealUID)
+	msg = strings.ReplaceAll(msg, netPrefix, "")
+	msg = strings.ReplaceAll(msg, contPrefix, "")
+
+	// 当错误为"指定 IP 不在任何子网"时，从原始 message 中提取带前缀的网络名，
+	// 查询该网络的实际子网并附加到提示，帮助用户选择正确的 IP 段。
+	if strings.Contains(msg, "no configured subnet contains") {
+		// 原始 message 格式：
+		//   "invalid config for network <prefixedName>: invalid endpoint settings: no configured subnet contains IP address <ip>"
+		// 从原始 message（剥除前缀前）中提取带前缀的网络名
+		var origMsg string
+		_ = json.Unmarshal(raw, &origMsg)
+		prefixedNetName := extractNetworkNameFromErrorMsg(origMsg)
+		if prefixedNetName != "" {
+			subnets := p.listNetworkSubnets(prefixedNetName)
+			if len(subnets) > 0 {
+				msg += "。该网络已配置的子网为：" + strings.Join(subnets, ", ") + "，请使用该范围内的 IP 地址"
+			}
+		}
+	}
+
+	newRaw, err := json.Marshal(msg)
+	if err != nil {
+		return body
+	}
+	errResp["message"] = newRaw
+	result, err := json.Marshal(errResp)
+	if err != nil {
+		return body
+	}
+	return result
+}
+
+// extractNetworkNameFromErrorMsg 从 Docker 错误信息中提取网络名。
+// 格式：invalid config for network <name>: ...
+func extractNetworkNameFromErrorMsg(msg string) string {
+	const marker = "invalid config for network "
+	idx := strings.Index(msg, marker)
+	if idx < 0 {
+		return ""
+	}
+	rest := msg[idx+len(marker):]
+	end := strings.Index(rest, ":")
+	if end < 0 {
+		return strings.TrimSpace(rest)
+	}
+	return strings.TrimSpace(rest[:end])
 }
 
 // systemUser 从 /etc/passwd 读取的用户信息
@@ -2979,6 +3207,40 @@ func (p *ProxyServer) resolveImageIDByRef(imageRef string) string {
 		return ""
 	}
 	return img.ID
+}
+
+// isBuildKitImage 判断镜像引用是否为 BuildKit 镜像（docker-container driver 使用）
+func isBuildKitImage(imageRef string) bool {
+	ref := strings.ToLower(imageRef)
+	return strings.Contains(ref, "moby/buildkit") || strings.Contains(ref, "docker/buildkit")
+}
+
+// imageHasOtherTags 检查镜像是否还有除 excludeTag 之外的其他 tag
+func (p *ProxyServer) imageHasOtherTags(imageID, excludeTag string) bool {
+	req, err := http.NewRequest("GET", "http://docker/images/"+imageID+"/json", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := p.transport.RoundTrip(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	var img struct {
+		RepoTags []string `json:"RepoTags"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&img); err != nil {
+		return false
+	}
+	for _, tag := range img.RepoTags {
+		if tag != excludeTag {
+			return true
+		}
+	}
+	return false
 }
 
 // containerStateCounts 查询用户容器的运行状态统计
