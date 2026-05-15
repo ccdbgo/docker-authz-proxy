@@ -1006,14 +1006,13 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 	case authz.ActionNetworkInspect, authz.ActionNetworkConnect, authz.ActionNetworkDisconnect, authz.ActionNetworkRemove:
 		networkName := isolation.ExtractNetworkID(r.URL.Path)
 		if networkName != "" && !id.IsPrivileged() {
-			// 尝试按用户前缀名查找真实 Docker 网络 ID
+			// networkName 此时已是重写后的内部名（含用户前缀），用于 DB 查询
+			// userVisibleName 是剥除前缀后的用户可见名，用于错误信息
 			prefix := isolation.UserResourcePrefix(id)
-			lookupName := networkName
-			if !strings.HasPrefix(networkName, prefix) {
-				lookupName = prefix + networkName
-			}
+			userVisibleName := strings.TrimPrefix(networkName, prefix)
+
 			lookupID := networkName
-			if docID, found := p.db.GetNetworkIDByName(lookupName); found {
+			if docID, found := p.db.GetNetworkIDByName(networkName); found {
 				lookupID = docID
 			}
 			ok, err := p.db.CanUserAccessNetwork(lookupID, id.RealUID)
@@ -1026,7 +1025,7 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 						zap.String("action", action),
 					)...)
 				p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "network_not_accessible", "", http.StatusNotFound))
-				writeDockerNotFound(w, "network", networkName)
+				writeDockerNotFound(w, "network", userVisibleName)
 				return r, false
 			}
 		}
