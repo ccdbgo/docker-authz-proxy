@@ -24,10 +24,12 @@ type OwnershipDB struct {
 }
 
 func NewOwnershipDB(path string) (*OwnershipDB, error) {
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("sqlite", path+"?_busy_timeout=5000")
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
+	// SQLite 写操作串行化：只允许一个写连接，避免 SQLITE_BUSY
+	db.SetMaxOpenConns(1)
 	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
 		return nil, fmt.Errorf("set WAL mode: %w", err)
 	}

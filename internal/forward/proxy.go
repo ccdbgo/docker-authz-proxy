@@ -63,6 +63,11 @@ type ProxyServer struct {
 	servers   []*http.Server
 
 	transport http.RoundTripper
+
+	// pendingBuilds 记录正在进行 BuildKit gRPC 构建的用户（uid → 构建开始时间）。
+	// 用于解决竞态：docker build 返回后立即执行 docker rmi，而 trackBuildKitImages
+	// goroutine 尚未将镜像写入 DB。checkImageRemovePermission 检测到此状态时会短暂等待。
+	pendingBuilds sync.Map // map[int]time.Time (uid → start time)
 }
 
 // ProxyOptions 可选配置参数
@@ -1032,12 +1037,37 @@ func (p *ProxyServer) checkImageRemovePermission(w http.ResponseWriter, r *http.
 	owner, isPublic, found := p.db.GetImageOwner(resolvedID)
 	if !found {
 		if !id.IsPrivileged() {
-			auditID := toAuditIdentity(id)
-			audit.LogAuthzDeniedNotTracked(p.logger, auditID, "image", truncID(resolvedID), authz.ActionRemoveImage)
-			writeDockerNotFound(w, "image", resolvedID)
-			return false
+			// 检查该用户是否有正在进行的 BuildKit 构建（竞态保护）：
+			// docker build 返回后立即执行 docker rmi，而 trackBuildKitImages goroutine
+			// 可能尚未将镜像写入 DB。若检测到 pending build，轮询等待最多 5 秒。
+			if startTime, ok := p.pendingBuilds.Load(id.RealUID); ok {
+				buildStart := startTime.(time.Time)
+				if time.Since(buildStart) < 30*time.Second {
+					p.logger.Info("rmi_waiting_for_pending_build",
+						zap.String("user", id.RealUsername),
+						zap.Int("uid", id.RealUID),
+						zap.String("image_id", truncID(resolvedID)),
+					)
+					deadline := time.Now().Add(5 * time.Second)
+					for time.Now().Before(deadline) {
+						time.Sleep(50 * time.Millisecond)
+						owner, isPublic, found = p.db.GetImageOwner(resolvedID)
+						if found {
+							break
+						}
+					}
+				}
+			}
 		}
-		return true
+		if !found {
+			if !id.IsPrivileged() {
+				auditID := toAuditIdentity(id)
+				audit.LogAuthzDeniedNotTracked(p.logger, auditID, "image", truncID(resolvedID), authz.ActionRemoveImage)
+				writeDockerNotFound(w, "image", resolvedID)
+				return false
+			}
+			return true
+		}
 	}
 
 	auditID := toAuditIdentity(id)
@@ -2229,9 +2259,11 @@ func (p *ProxyServer) handleHijack(w http.ResponseWriter, r *http.Request, id *a
 	// BuildKit 通过 POST /grpc 进行构建，在 hijack 开始前先快照当前镜像列表，
 	// 连接关闭后与新列表对比，将新增镜像归属到当前用户。
 	isGRPC := r.Method == "POST" && (r.URL.Path == "/grpc" || strings.HasSuffix(r.URL.Path, "/grpc"))
-	var preGRPCImageIDs map[string]bool
+	var preSnapshot *imageSnapshot
 	if isGRPC {
-		preGRPCImageIDs = p.listAllImageIDs()
+		preSnapshot = p.snapshotImageState()
+		// 记录 pending build，供 checkImageRemovePermission 检测竞态
+		p.pendingBuilds.Store(id.RealUID, time.Now())
 	}
 	action := authz.OverrideActionByCommand(id.DockerCommand, authz.ClassifyAction(r.Method, r.URL.RequestURI()))
 	p.logger.Debug("hijack_request",
@@ -2428,43 +2460,60 @@ func (p *ProxyServer) handleHijack(w http.ResponseWriter, r *http.Request, id *a
 	)
 
 	// BuildKit gRPC 连接关闭后，追踪新创建的镜像归属
-	if isGRPC && preGRPCImageIDs != nil {
-		go p.trackBuildKitImages(id, preGRPCImageIDs)
+	if isGRPC && preSnapshot != nil {
+		go p.trackBuildKitImages(id, preSnapshot)
+	} else if isGRPC {
+		// 快照失败时也要清除 pending 记录
+		p.pendingBuilds.Delete(id.RealUID)
 	}
 }
 
-// trackBuildKitImages 在 BuildKit gRPC 连接（POST /grpc）关闭后，对比镜像列表
-// 找出新增镜像并归属到当前用户。BuildKit 通过 gRPC over h2c 进行构建，不走
-// POST /build，因此需要此机制补录。preImageIDs 为 gRPC 连接建立前的镜像 ID 集合。
-func (p *ProxyServer) trackBuildKitImages(id *auth.CallerIdentity, preImageIDs map[string]bool) {
+// trackBuildKitImages 在 BuildKit gRPC 连接（POST /grpc）关闭后，对比镜像快照
+// 找出新增或重建的镜像并归属到当前用户。
+// 处理两种情况：
+//  1. 新镜像（构建前不存在）：直接归属
+//  2. 相同 SHA 重建（Dockerfile/基础镜像未变，产生相同 manifest list SHA）：
+//     tag 指向的 SHA 不在 DB 中，也归属给当前用户
+func (p *ProxyServer) trackBuildKitImages(id *auth.CallerIdentity, pre *imageSnapshot) {
+	// 构建完成后清除 pending 记录（无论成功与否）
+	defer p.pendingBuilds.Delete(id.RealUID)
+
 	// 短暂等待，确保 Docker daemon 完成镜像写入
 	time.Sleep(300 * time.Millisecond)
 
-	req, err := http.NewRequest("GET", "http://docker/images/json", nil)
-	if err != nil {
+	post := p.snapshotImageState()
+	if post == nil {
 		return
 	}
-	resp, err := p.transport.RoundTrip(req)
-	if err != nil {
-		return
-	}
-	defer resp.Body.Close()
 
-	var images []struct {
-		ID string `json:"Id"`
+	// 收集需要归属的镜像 ID，tagged 镜像优先（避免竞态：rmi 先于无 tag 镜像写入）
+	taggedIDs := make(map[string]bool)
+	otherIDs := make(map[string]bool)
+
+	// tag 对比：tag 新增、SHA 变更、或 SHA 不变但不在 DB 中（相同内容重建）
+	for tag, postID := range post.tagToID {
+		preID, existed := pre.tagToID[tag]
+		if !existed || preID != postID {
+			taggedIDs[postID] = true
+		} else {
+			// tag 存在且 SHA 相同：若不在 DB 中则归属（相同内容重建场景）
+			if _, _, found := p.db.GetImageOwner(postID); !found {
+				taggedIDs[postID] = true
+			}
+		}
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&images); err != nil {
-		return
+
+	// 新增的无 tag 镜像（构建前不存在的 ID，且不在 taggedIDs 中）
+	for imageID := range post.idSet {
+		if !pre.idSet[imageID] && !taggedIDs[imageID] {
+			otherIDs[imageID] = true
+		}
 	}
 
 	auditID := toAuditIdentity(id)
-	for _, img := range images {
-		imageID := strings.TrimPrefix(img.ID, "sha256:")
-		if preImageIDs[imageID] {
-			continue // gRPC 连接前已存在，跳过
-		}
+	writeOne := func(imageID string) {
 		if _, _, found := p.db.GetImageOwner(imageID); found {
-			continue // 已有归属记录，跳过
+			return // 已有归属记录，跳过
 		}
 		if err := p.db.SetImageOwner(imageID, id, false, "build"); err != nil {
 			p.logger.Error("save_buildkit_image_owner_failed",
@@ -2480,10 +2529,25 @@ func (p *ProxyServer) trackBuildKitImages(id *auth.CallerIdentity, preImageIDs m
 				)...)
 		}
 	}
+
+	// 先写有 tag 的镜像（用户会立即 rmi 的目标）
+	for imageID := range taggedIDs {
+		writeOne(imageID)
+	}
+	// 再写无 tag 的中间层镜像
+	for imageID := range otherIDs {
+		writeOne(imageID)
+	}
 }
 
-// listAllImageIDs 查询 Docker 获取所有镜像 ID 集合（不含 sha256: 前缀）
-func (p *ProxyServer) listAllImageIDs() map[string]bool {
+// imageSnapshot 构建前/后的镜像状态快照
+type imageSnapshot struct {
+	idSet    map[string]bool   // 所有镜像 ID（不含 sha256: 前缀）
+	tagToID  map[string]string // tag → imageID（不含 sha256: 前缀）
+}
+
+// snapshotImageState 查询 Docker 获取当前镜像状态快照
+func (p *ProxyServer) snapshotImageState() *imageSnapshot {
 	req, err := http.NewRequest("GET", "http://docker/images/json", nil)
 	if err != nil {
 		return nil
@@ -2495,17 +2559,27 @@ func (p *ProxyServer) listAllImageIDs() map[string]bool {
 	defer resp.Body.Close()
 
 	var images []struct {
-		ID string `json:"Id"`
+		ID       string   `json:"Id"`
+		RepoTags []string `json:"RepoTags"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&images); err != nil {
 		return nil
 	}
 
-	result := make(map[string]bool, len(images))
-	for _, img := range images {
-		result[strings.TrimPrefix(img.ID, "sha256:")] = true
+	snap := &imageSnapshot{
+		idSet:   make(map[string]bool, len(images)),
+		tagToID: make(map[string]string),
 	}
-	return result
+	for _, img := range images {
+		id := strings.TrimPrefix(img.ID, "sha256:")
+		snap.idSet[id] = true
+		for _, tag := range img.RepoTags {
+			if tag != "<none>:<none>" {
+				snap.tagToID[tag] = id
+			}
+		}
+	}
+	return snap
 }
 
 // systemUser 从 /etc/passwd 读取的用户信息
