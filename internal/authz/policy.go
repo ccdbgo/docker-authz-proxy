@@ -72,6 +72,10 @@ func (p *Policy) resolve() {
 			case "run":
 				r.Actions[ActionCreateContainer] = true
 				r.Actions[ActionStartContainer] = true
+			case "stop":
+				// docker kill 是比 stop 更强制的停止方式，语义上应一并禁止
+				r.Actions[ActionStop] = true
+				r.Actions[ActionKill] = true
 			case "history":
 				// docker image history → GET /images/{id}/history → ActionHistory
 				r.Actions[ActionHistory] = true
