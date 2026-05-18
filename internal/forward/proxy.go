@@ -537,16 +537,6 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		audit.LogAuthzRequest(p.logger, auditID, action, r.Method, r.URL.RequestURI())
 	}
 
-	// 全局硬性禁止 docker login / docker logout（不依赖 policy.yaml，对所有用户生效）
-	if action == authz.ActionSystemLogin {
-		auditID := toAuditIdentity(identity)
-		audit.LogAuthzDeniedCommand(p.logger, auditID, action, r.URL.RequestURI())
-		p.auditLog.WriteEntry(makeAuditEntry(identity, r, action, "deny", "login_globally_disabled", "", http.StatusForbidden))
-		writeDockerError(w, http.StatusForbidden,
-			"docker login/logout is disabled on this host: use pre-configured credentials managed by the administrator")
-		return
-	}
-
 	if !isAuxiliary && policy.IsDenied(identity, action) {
 		auditID := toAuditIdentity(identity)
 		audit.LogAuthzDeniedCommand(p.logger, auditID, action, r.URL.RequestURI())
@@ -1395,7 +1385,8 @@ func (p *ProxyServer) preprocessRequest(r *http.Request, id *auth.CallerIdentity
 
 	switch action {
 	case authz.ActionCreateContainer, authz.ActionNetworkCreate, authz.ActionVolumeCreate,
-		authz.ActionUpdate:
+		authz.ActionUpdate, authz.ActionRename,
+		authz.ActionNetworkConnect, authz.ActionNetworkDisconnect:
 		// 需要读取并修改请求体
 	default:
 		return r, nil
@@ -1450,10 +1441,34 @@ func (p *ProxyServer) preprocessRequest(r *http.Request, id *auth.CallerIdentity
 			body, _ = isolation.InjectVolumeNamePrefix(body, id)
 		}
 
+	case authz.ActionRename:
+		// 注入容器新名称前缀到 URL 查询参数 ?name=（rename 的目标名通过 query param 传递）
+		if !id.IsPrivileged() {
+			if newName := r.URL.Query().Get("name"); newName != "" {
+				prefix := isolation.UserContainerPrefix(id.RealUID)
+				if !strings.HasPrefix(newName, prefix) {
+					newURL := *r.URL
+					q := newURL.Query()
+					q.Set("name", prefix+newName)
+					newURL.RawQuery = q.Encode()
+					r = r.Clone(r.Context())
+					r.URL = &newURL
+				}
+			}
+		}
+
 	case authz.ActionUpdate:
 		// 同步 MemorySwap = Memory，避免 Docker 报 "Memory limit should be smaller than memoryswap" 错误
 		// 配额校验在 checkOwnershipPreRequest 中完成（那里有 w http.ResponseWriter）
 		body = syncMemorySwapForUpdate(body)
+
+	case authz.ActionNetworkConnect, authz.ActionNetworkDisconnect:
+		// 重写请求体中的容器名，补全用户前缀（非特权用户）
+		// docker network connect <net> <container> 的请求体为 {"Container": "test_container", ...}
+		// 实际容器名为 user-{uid}-test_container，不重写则上游 Docker 找不到容器
+		if !id.IsPrivileged() {
+			body = isolation.RewriteContainerInNetworkBody(body, id.RealUID)
+		}
 	}
 
 	newReq := r.Clone(r.Context())
@@ -2092,6 +2107,10 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 				}
 			}
 		}
+		// 去掉响应体中的用户前缀，还原为用户创建时的原始网络名称
+		if resp.StatusCode == http.StatusCreated && !id.IsPrivileged() {
+			body = stripNetworkNamePrefix(body, isolation.UserResourcePrefix(id))
+		}
 		isolation.CopyHeaders(w, resp.Header)
 		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 		w.WriteHeader(resp.StatusCode)
@@ -2164,6 +2183,10 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 				}
 			}
 		}
+		// 去掉响应体中的用户前缀，还原为用户创建时的原始名称
+		if resp.StatusCode == http.StatusCreated && !id.IsPrivileged() {
+			body = isolation.StripVolumeNamePrefix(body, id.RealUID)
+		}
 		isolation.CopyHeaders(w, resp.Header)
 		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 		w.WriteHeader(resp.StatusCode)
@@ -2191,6 +2214,20 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 		w.Header().Set("Content-Length", strconv.Itoa(len(filtered)))
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(filtered)
+
+	case authz.ActionVolumeInspect:
+		body, err := isolation.ReadFullBody(resp.Body)
+		if err != nil {
+			writeDockerError(w, http.StatusBadGateway, "read upstream response failed")
+			return
+		}
+		if resp.StatusCode == http.StatusOK && !id.IsPrivileged() {
+			body = isolation.StripVolumeInspectPrefix(body, id.RealUID)
+		}
+		isolation.CopyHeaders(w, resp.Header)
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(body)
 
 	case authz.ActionVolumeRemove:
 		if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {

@@ -236,7 +236,7 @@ func FilterVolumeListResponse(body []byte, realUID int, privileged bool, db Owne
 // RewriteVolumeURL 将请求 URL 中的卷名补全用户前缀（未带前缀时）
 func RewriteVolumeURL(r *http.Request, uid int) *http.Request {
 	volName := ExtractVolumeName(r.URL.Path)
-	if volName == "" {
+	if volName == "" || volName == "create" || volName == "prune" {
 		return r
 	}
 	prefix := UserVolumePrefix(uid)
@@ -263,4 +263,63 @@ func ExtractVolumeName(path string) string {
 		return rest[:idx]
 	}
 	return rest
+}
+
+// StripVolumeInspectPrefix 将 Volume inspect 响应体中的内部名称还原为用户原始名称。
+// 处理 Name 字段和 Mountpoint 路径中的用户前缀。出错时返回原始 body。
+func StripVolumeInspectPrefix(body []byte, uid int) []byte {
+	prefix := UserVolumePrefix(uid)
+	var resp map[string]json.RawMessage
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return body
+	}
+
+	var name string
+	if raw, ok := resp["Name"]; ok {
+		_ = json.Unmarshal(raw, &name)
+	}
+	if !strings.HasPrefix(name, prefix) {
+		return body
+	}
+	stripped := strings.TrimPrefix(name, prefix)
+
+	// 还原 Name 字段
+	resp["Name"], _ = json.Marshal(stripped)
+
+	// 还原 Mountpoint 中的路径段（将内部名替换为原始名）
+	if raw, ok := resp["Mountpoint"]; ok {
+		var mp string
+		if json.Unmarshal(raw, &mp) == nil && strings.Contains(mp, name) {
+			resp["Mountpoint"], _ = json.Marshal(strings.Replace(mp, name, stripped, 1))
+		}
+	}
+
+	result, err := json.Marshal(resp)
+	if err != nil {
+		return body
+	}
+	return result
+}
+
+// 仅修改 JSON 中的 Name 字段，其余字段保持不变。出错时返回原始 body。
+func StripVolumeNamePrefix(body []byte, uid int) []byte {
+	prefix := UserVolumePrefix(uid)
+	var resp map[string]json.RawMessage
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return body
+	}
+	var name string
+	if raw, ok := resp["Name"]; ok {
+		_ = json.Unmarshal(raw, &name)
+	}
+	if !strings.HasPrefix(name, prefix) {
+		return body
+	}
+	stripped := strings.TrimPrefix(name, prefix)
+	resp["Name"], _ = json.Marshal(stripped)
+	result, err := json.Marshal(resp)
+	if err != nil {
+		return body
+	}
+	return result
 }

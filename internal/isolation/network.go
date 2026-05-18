@@ -85,7 +85,7 @@ func InjectNetworkNamePrefixWithName(body []byte, identity *auth.CallerIdentity)
 // RewriteNetworkURL 将请求 URL 中的网络名补全用户前缀（未带前缀时）
 func RewriteNetworkURL(r *http.Request, identity *auth.CallerIdentity) *http.Request {
 	netName := ExtractNetworkID(r.URL.Path)
-	if netName == "" {
+	if netName == "" || netName == "create" || netName == "prune" {
 		return r
 	}
 	prefix := UserResourcePrefix(identity)
