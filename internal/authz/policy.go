@@ -76,6 +76,18 @@ func (p *Policy) resolve() {
 				// docker kill 是比 stop 更强制的停止方式，语义上应一并禁止
 				r.Actions[ActionStop] = true
 				r.Actions[ActionKill] = true
+			case "plugin":
+				// plugin 别名：展开为所有 plugin 子操作
+				r.Actions[ActionPluginList] = true
+				r.Actions[ActionPluginInspect] = true
+				r.Actions[ActionPluginInstall] = true
+				r.Actions[ActionPluginRemove] = true
+				r.Actions[ActionPluginEnable] = true
+				r.Actions[ActionPluginDisable] = true
+				r.Actions[ActionPluginUpgrade] = true
+				r.Actions[ActionPluginSet] = true
+				r.Actions[ActionPluginPush] = true
+				r.Actions[ActionPluginCreate] = true
 			case "history":
 				// docker image history → GET /images/{id}/history → ActionHistory
 				r.Actions[ActionHistory] = true
@@ -185,8 +197,21 @@ const (
 	ActionSystemEvents  = "events"
 	ActionSystemLogin   = "login"
 
-	ActionSwarm  = "swarm"
-	ActionPlugin = "plugin"
+	ActionSwarm = "swarm"
+
+	// plugin 细粒度子操作
+	ActionPlugin        = "plugin"         // 别名：禁止所有 plugin 操作
+	ActionPluginList    = "plugin_ls"      // docker plugin ls
+	ActionPluginInspect = "plugin_inspect" // docker plugin inspect
+	ActionPluginInstall = "plugin_install" // docker plugin install
+	ActionPluginRemove  = "plugin_rm"      // docker plugin rm
+	ActionPluginEnable  = "plugin_enable"  // docker plugin enable
+	ActionPluginDisable = "plugin_disable" // docker plugin disable
+	ActionPluginUpgrade = "plugin_upgrade" // docker plugin upgrade
+	ActionPluginSet     = "plugin_set"     // docker plugin set
+	ActionPluginPush    = "plugin_push"    // docker plugin push
+	ActionPluginCreate  = "plugin_create"  // docker plugin create
+
 	ActionSecret = "secret"
 	ActionConfig = "config"
 
@@ -360,8 +385,30 @@ func ClassifyAction(method, uri string) string {
 		pathHasPrefix(path, "/tasks"):
 		return ActionSwarm
 
+	// plugin 细粒度分类
+	case method == "GET" && pathMatches(path, "/plugins"):
+		return ActionPluginList
+	case method == "GET" && pathMatchesN(path, "/plugins/", "/json"):
+		return ActionPluginInspect
+	case method == "POST" && pathMatches(path, "/plugins/pull"):
+		return ActionPluginInstall
+	case method == "DELETE" && pathHasPrefix(path, "/plugins/"):
+		return ActionPluginRemove
+	case method == "POST" && pathMatchesN(path, "/plugins/", "/enable"):
+		return ActionPluginEnable
+	case method == "POST" && pathMatchesN(path, "/plugins/", "/disable"):
+		return ActionPluginDisable
+	case method == "POST" && pathMatchesN(path, "/plugins/", "/upgrade"):
+		return ActionPluginUpgrade
+	case method == "POST" && pathMatchesN(path, "/plugins/", "/set"):
+		return ActionPluginSet
+	case method == "POST" && pathMatchesN(path, "/plugins/", "/push"):
+		return ActionPluginPush
+	case method == "POST" && pathMatches(path, "/plugins/create"):
+		return ActionPluginCreate
 	case pathHasPrefix(path, "/plugins"):
-		return ActionPlugin
+		// 兜底：未匹配的 plugin 路径归为 plugin_inspect（只读语义）
+		return ActionPluginInspect
 
 	case pathHasPrefix(path, "/secrets"):
 		return ActionSecret
