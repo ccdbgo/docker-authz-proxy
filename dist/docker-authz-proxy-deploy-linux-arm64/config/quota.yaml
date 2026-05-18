@@ -27,10 +27,10 @@ users:
     mem_mb: 0
     tmpfs_size_mb: 0  # root 不限制
 
-  # test-sudo：sudo 组成员，不限制 CPU（避免超过物理核数报错）
-  test-sudo:
+  # sudo_test：sudo 组成员，不限制 CPU（避免超过物理核数报错）
+  sudo_test:
     cpu_cores: 0
-    mem_mb: 4096
+    mem_mb: 1024
     tmpfs_size_mb: 1024
 
   # test-docker-g：docker 组成员，标准资源

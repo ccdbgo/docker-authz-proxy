@@ -124,7 +124,7 @@ if [ "$MODE" = "binary" ]; then
 
     log_step "步骤 3/3: 执行安装"
     $SSH -t "$TARGET" \
-        "cd $REMOTE_DIR/docker-authz-proxy-deploy-linux-amd64 && bash install.sh $EXTRA_FLAGS"
+        "cd $REMOTE_DIR/docker-authz-proxy-deploy-linux-amd64 && sudo bash install.sh $EXTRA_FLAGS"
 
 # ════════════════════════════════════════════════════════════════════════════
 # 模式B：源码编译模式

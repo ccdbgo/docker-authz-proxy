@@ -537,6 +537,16 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		audit.LogAuthzRequest(p.logger, auditID, action, r.Method, r.URL.RequestURI())
 	}
 
+	// 全局硬性禁止 docker login / docker logout（不依赖 policy.yaml，对所有用户生效）
+	if action == authz.ActionSystemLogin {
+		auditID := toAuditIdentity(identity)
+		audit.LogAuthzDeniedCommand(p.logger, auditID, action, r.URL.RequestURI())
+		p.auditLog.WriteEntry(makeAuditEntry(identity, r, action, "deny", "login_globally_disabled", "", http.StatusForbidden))
+		writeDockerError(w, http.StatusForbidden,
+			"docker login/logout is disabled on this host: use pre-configured credentials managed by the administrator")
+		return
+	}
+
 	if !isAuxiliary && policy.IsDenied(identity, action) {
 		auditID := toAuditIdentity(identity)
 		audit.LogAuthzDeniedCommand(p.logger, auditID, action, r.URL.RequestURI())

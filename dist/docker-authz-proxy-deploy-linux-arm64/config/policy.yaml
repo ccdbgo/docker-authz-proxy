@@ -64,8 +64,10 @@ action_mapping:
   create_container: ["POST /containers/create"]
   start:            ["POST /containers/{id}/start"]
   restart:          ["POST /containers/{id}/restart"]
-  stop:             ["POST /containers/{id}/stop", "POST /containers/{id}/kill",
-                     "POST /containers/{id}/pause", "POST /containers/{id}/unpause"]
+  stop:             ["POST /containers/{id}/stop"]
+  kill:             ["POST /containers/{id}/kill"]
+  pause:            ["POST /containers/{id}/pause"]
+  unpause:          ["POST /containers/{id}/unpause"]
   rm:               ["DELETE /containers/{id}"]
   exec:             ["POST /containers/{id}/exec", "POST /containers/{id}/attach",
                      "POST /exec/{id}/start", "POST /exec/{id}/resize"]
@@ -117,8 +119,21 @@ action_mapping:
   # ── Swarm / Service / Node / Task ─────────────────────────────────────────
   swarm:   ["/swarm/*", "/nodes/*", "/services/*", "/tasks/*"]
 
-  # ── 插件操作 ──────────────────────────────────────────────────────────────
-  plugin:  ["/plugins/*"]
+  # ── 插件操作（细粒度）────────────────────────────────────────────────────────
+  # 使用 "plugin" 可一次性禁止所有插件操作（等价于列出所有子操作）
+  plugin:         ["plugin_ls", "plugin_inspect", "plugin_install", "plugin_rm",
+                   "plugin_enable", "plugin_disable", "plugin_upgrade",
+                   "plugin_set", "plugin_push", "plugin_create"]
+  plugin_ls:      ["GET /plugins"]
+  plugin_inspect: ["GET /plugins/{name}/json"]
+  plugin_install: ["POST /plugins/pull"]
+  plugin_rm:      ["DELETE /plugins/{name}"]
+  plugin_enable:  ["POST /plugins/{name}/enable"]
+  plugin_disable: ["POST /plugins/{name}/disable"]
+  plugin_upgrade: ["POST /plugins/{name}/upgrade"]
+  plugin_set:     ["POST /plugins/{name}/set"]
+  plugin_push:    ["POST /plugins/{name}/push"]
+  plugin_create:  ["POST /plugins/create"]
 
   # ── Secret / Config ───────────────────────────────────────────────────────
   secret:  ["/secrets/*"]
