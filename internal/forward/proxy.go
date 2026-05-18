@@ -943,9 +943,7 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 				!p.db.CanUseImage(id.RealUID, "sha256:"+imageRef) {
 				auditID := toAuditIdentity(id)
 				audit.LogAuthzDeniedImageAccess(p.logger, auditID, truncID(imageRef), action, "image_not_permitted")
-				writeDockerError(w, http.StatusForbidden,
-					fmt.Sprintf("user '%s'(uid=%d) not permitted to access image '%s'",
-						id.RealUsername, id.RealUID, truncID(imageRef)))
+				writeDockerNotFound(w, "image", imageRef)
 				return r, false
 			}
 		}
@@ -2019,6 +2017,32 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 					append(audit.LogIdentityFields(auditID),
 						zap.String("image_id", truncID(imageID)),
 					)...)
+			}
+		}
+
+	case authz.ActionTag:
+		isolation.CopyHeaders(w, resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+		// tag 成功后，将新 tag 解析为 image content ID，写入 image_access 表。
+		// 原因：image_access/images 表均以 content ID 为主键，tag 名无法直接查到。
+		// 必须先 resolveImageIDByRef(newTag) → content ID，再 EnsureImageAccess，
+		// 否则后续 CanUseImage(newTag) 因 resolveImageIDInDB 找不到 tag 名而返回 false。
+		if resp.StatusCode == http.StatusCreated && !id.IsPrivileged() {
+			if u, err := url.ParseRequestURI(requestURI); err == nil {
+				repo := u.Query().Get("repo")
+				tag := u.Query().Get("tag")
+				newRef := ""
+				if repo != "" && tag != "" {
+					newRef = repo + ":" + tag
+				} else if repo != "" {
+					newRef = repo + ":latest"
+				}
+				if newRef != "" {
+					if contentID := p.resolveImageIDByRef(newRef); contentID != "" {
+						_ = p.db.EnsureImageAccess(contentID, id.RealUID)
+					}
+				}
 			}
 		}
 
