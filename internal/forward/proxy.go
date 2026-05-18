@@ -657,7 +657,7 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 			audit.LogAuthzDeniedOwnership(p.logger, auditID, auditOwner, "container", truncID(containerID), action)
 			p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "container_not_owned",
 				fmt.Sprintf("owner=%s(uid=%d)", owner.Username, owner.UID), http.StatusNotFound))
-			writeDockerNotFound(w, "container", containerID)
+			writeDockerNotFound(w, "container", strings.TrimPrefix(containerID, isolation.UserContainerPrefix(id.RealUID)))
 			return r, false
 		}
 	}
@@ -3265,7 +3265,7 @@ func (p *ProxyServer) checkContainerOwnershipByLabel(w http.ResponseWriter, id *
 			AuthSource: string(id.AuthSource), Action: action, Result: "deny",
 			DenyReason: "container_not_found", ContainerID: truncID(containerID), StatusCode: http.StatusForbidden,
 		})
-		writeDockerNotFound(w, "container", containerID)
+		writeDockerNotFound(w, "container", strings.TrimPrefix(containerID, isolation.UserContainerPrefix(id.RealUID)))
 		return false
 	}
 
