@@ -90,7 +90,21 @@ func (id *CallerIdentity) IsPrivileged() bool {
 	return id.RealUID == 0 || id.UserType == UserTypeSudo
 }
 
-// parseDockerCommand 从命令行中解析用户主动执行的 docker 子命令
+// compoundGroups 是 docker CLI 复合命令组名集合。
+// 这些命令以 "docker <group> <subcommand>" 形式调用，parseDockerCommand 会返回 "group/subcommand"。
+var compoundGroups = map[string]bool{
+	"system":    true,
+	"container": true,
+	"image":     true,
+	"network":   true,
+	"volume":    true,
+	"plugin":    true,
+	"builder":   true,
+}
+
+// parseDockerCommand 从命令行中解析用户主动执行的 docker 子命令。
+// 对于复合命令组（如 docker system info），返回 "group/subcommand"（如 "system/info"）。
+// 对于普通命令（如 docker ps），返回子命令名（如 "ps"）。
 func parseDockerCommand(cmdline string) string {
 	if cmdline == "" {
 		return ""
@@ -110,13 +124,29 @@ func parseDockerCommand(cmdline string) string {
 	if dockerIdx < 0 || dockerIdx+1 >= len(parts) {
 		return ""
 	}
-	for _, arg := range parts[dockerIdx+1:] {
-		if strings.HasPrefix(arg, "-") {
-			continue
+	// 取 docker 之后第一个非 - 参数
+	first := ""
+	firstIdx := -1
+	for i, arg := range parts[dockerIdx+1:] {
+		if !strings.HasPrefix(arg, "-") {
+			first = arg
+			firstIdx = dockerIdx + 1 + i
+			break
 		}
-		return arg
 	}
-	return ""
+	if first == "" {
+		return ""
+	}
+	// 若是复合命令组，继续取子命令
+	if compoundGroups[first] {
+		for _, arg := range parts[firstIdx+1:] {
+			if !strings.HasPrefix(arg, "-") {
+				return first + "/" + arg
+			}
+		}
+		return first // 裸组名，如 "docker system"
+	}
+	return first
 }
 
 // readProcStatus 从 /proc/<pid>/status 读取内核记录的真实/有效 UID 和 GID

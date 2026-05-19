@@ -561,6 +561,14 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 非特权用户的 volume prune：拦截并自行处理（Docker 原生只删匿名 volume，无法删具名 volume）
+	if action == authz.ActionPrune &&
+		strings.HasPrefix(authz.StripAPIVersion(r.URL.Path), "/volumes/prune") {
+		if p.handleVolumePrune(w, identity) {
+			return
+		}
+	}
+
 	p.logger.Debug("preprocess_request_start",
 		zap.String("user", fmt.Sprintf("%s(uid=%d)", identity.RealUsername, identity.RealUID)),
 		zap.String("action", action),
@@ -1864,6 +1872,41 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 						}
 					}
 				}
+			} else if strings.HasPrefix(requestURI, "/volumes") {
+				// docker volume prune → POST /volumes/prune
+				var pruneResp struct {
+					VolumesDeleted []string `json:"VolumesDeleted"`
+				}
+				if json.Unmarshal(body, &pruneResp) == nil {
+					for _, vol := range pruneResp.VolumesDeleted {
+						_ = p.db.DeleteVolume(vol)
+					}
+				}
+			} else if strings.HasPrefix(requestURI, "/system") {
+				// docker system prune [--volumes] → POST /system/prune
+				// 响应中同时包含 containers / images / volumes 三类已删除资源
+				var pruneResp struct {
+					ContainersDeleted []string `json:"ContainersDeleted"`
+					ImagesDeleted     []struct {
+						Deleted  string `json:"Deleted"`
+						Untagged string `json:"Untagged"`
+					} `json:"ImagesDeleted"`
+					VolumesDeleted []string `json:"VolumesDeleted"`
+				}
+				if json.Unmarshal(body, &pruneResp) == nil {
+					for _, cid := range pruneResp.ContainersDeleted {
+						_ = p.db.DeleteContainer(cid)
+						_ = p.db.ReleasePortMappings(cid)
+					}
+					for _, img := range pruneResp.ImagesDeleted {
+						if img.Deleted != "" {
+							_ = p.db.DeleteImage(img.Deleted)
+						}
+					}
+					for _, vol := range pruneResp.VolumesDeleted {
+						_ = p.db.DeleteVolume(vol)
+					}
+				}
 			}
 		}
 		isolation.CopyHeaders(w, resp.Header)
@@ -2433,6 +2476,7 @@ func isAuxiliaryCall(dockerCmd, action, method, path string) bool {
 	}
 
 	cmdTargetActions := map[string][]string{
+		// ── 顶层命令 ──────────────────────────────────────────────────────────
 		"run":     {authz.ActionPull, authz.ActionCreateContainer, authz.ActionStartContainer, authz.ActionRemoveContainer},
 		"create":  {authz.ActionCreateContainer},
 		"start":   {authz.ActionStartContainer},
@@ -2473,12 +2517,102 @@ func isAuxiliaryCall(dockerCmd, action, method, path string) bool {
 		"logout":  {authz.ActionSystemLogin},
 		"df":      {authz.ActionSystemDF},
 		"prune":   {authz.ActionPrune},
+
+		// ── system 组（docker system <subcommand>）────────────────────────────
+		"system/info":    {authz.ActionSystemInfo},
+		"system/version": {authz.ActionSystemVersion},
+		"system/df":      {authz.ActionSystemDF},
+		"system/events":  {authz.ActionSystemEvents},
+		"system/prune":   {authz.ActionPrune},
+
+		// ── container 组（docker container <subcommand>）──────────────────────
+		"container/run":     {authz.ActionPull, authz.ActionCreateContainer, authz.ActionStartContainer, authz.ActionRemoveContainer},
+		"container/create":  {authz.ActionCreateContainer},
+		"container/start":   {authz.ActionStartContainer},
+		"container/stop":    {authz.ActionStop},
+		"container/restart": {authz.ActionRestart},
+		"container/kill":    {authz.ActionKill},
+		"container/rm":      {authz.ActionRemoveContainer},
+		"container/exec":    {authz.ActionExec},
+		"container/attach":  {authz.ActionAttach},
+		"container/logs":    {authz.ActionLogs},
+		"container/stats":   {authz.ActionLogs},
+		"container/top":     {authz.ActionLogs},
+		"container/cp":      {authz.ActionCp},
+		"container/commit":  {authz.ActionCommit},
+		"container/ls":      {authz.ActionPS},
+		"container/ps":      {authz.ActionPS},
+		"container/inspect": {authz.ActionInspect},
+		"container/port":    {authz.ActionPort},
+		"container/pause":   {authz.ActionPause},
+		"container/unpause": {authz.ActionUnpause},
+		"container/rename":  {authz.ActionRename},
+		"container/update":  {authz.ActionUpdate},
+		"container/diff":    {authz.ActionDiff},
+		"container/wait":    {authz.ActionWait},
+		"container/export":  {authz.ActionExport},
+		"container/prune":   {authz.ActionPrune},
+
+		// ── image 组（docker image <subcommand>）──────────────────────────────
+		"image/ls":      {authz.ActionImages},
+		"image/list":    {authz.ActionImages},
+		"image/pull":    {authz.ActionPull},
+		"image/push":    {authz.ActionPush},
+		"image/build":   {authz.ActionBuild},
+		"image/rm":      {authz.ActionRemoveImage},
+		"image/rmi":     {authz.ActionRemoveImage},
+		"image/tag":     {authz.ActionTag},
+		"image/save":    {authz.ActionSave},
+		"image/load":    {authz.ActionLoad},
+		"image/import":  {authz.ActionImport},
+		"image/inspect": {authz.ActionInspect},
+		"image/history": {authz.ActionHistory},
+		"image/prune":   {authz.ActionPrune},
+
+		// ── network 组（docker network <subcommand>）──────────────────────────
+		"network/ls":         {authz.ActionNetworkList},
+		"network/list":       {authz.ActionNetworkList},
+		"network/create":     {authz.ActionNetworkCreate},
+		"network/inspect":    {authz.ActionNetworkInspect},
+		"network/rm":         {authz.ActionNetworkRemove},
+		"network/remove":     {authz.ActionNetworkRemove},
+		"network/connect":    {authz.ActionNetworkConnect},
+		"network/disconnect": {authz.ActionNetworkDisconnect},
+		"network/prune":      {authz.ActionPrune},
+
+		// ── volume 组（docker volume <subcommand>）────────────────────────────
+		"volume/ls":      {authz.ActionVolumeList},
+		"volume/list":    {authz.ActionVolumeList},
+		"volume/create":  {authz.ActionVolumeCreate},
+		"volume/inspect": {authz.ActionVolumeInspect},
+		"volume/rm":      {authz.ActionVolumeRemove},
+		"volume/remove":  {authz.ActionVolumeRemove},
+		"volume/prune":   {authz.ActionPrune},
+
+		// ── plugin 组（docker plugin <subcommand>）────────────────────────────
+		"plugin/ls":      {authz.ActionPluginList},
+		"plugin/list":    {authz.ActionPluginList},
+		"plugin/inspect": {authz.ActionPluginInspect},
+		"plugin/install": {authz.ActionPluginInstall},
+		"plugin/rm":      {authz.ActionPluginRemove},
+		"plugin/remove":  {authz.ActionPluginRemove},
+		"plugin/enable":  {authz.ActionPluginEnable},
+		"plugin/disable": {authz.ActionPluginDisable},
+		"plugin/upgrade": {authz.ActionPluginUpgrade},
+		"plugin/set":     {authz.ActionPluginSet},
+		"plugin/push":    {authz.ActionPluginPush},
+		"plugin/create":  {authz.ActionPluginCreate},
+
+		// ── builder 组（docker builder <subcommand>）──────────────────────────
+		"builder/build": {authz.ActionBuild},
+		"builder/prune": {authz.ActionPrune},
 	}
 
 	// 其他命令（如 docker run、docker ps 等）附带触发的 info/version 请求
-	// 属于辅助调用，跳过策略检查；用户直接执行 docker info/version 则走正常检查
+	// 属于辅助调用，跳过策略检查；用户直接执行 docker info/version/system info/system version 则走正常检查
 	if (action == authz.ActionSystemInfo || action == authz.ActionSystemVersion) &&
-		dockerCmd != "info" && dockerCmd != "version" {
+		dockerCmd != "info" && dockerCmd != "version" &&
+		dockerCmd != "system/info" && dockerCmd != "system/version" {
 		return true
 	}
 
@@ -4066,5 +4200,75 @@ func (p *ProxyServer) checkCreateContainerNetworks(w http.ResponseWriter, r *htt
 		}
 	}
 	return nil
+}
+
+// handleVolumePrune 拦截非特权用户的 POST /volumes/prune 请求。
+// Docker 原生 volume prune 只删匿名 volume，无法删除具名 volume（即使未被使用）。
+// 代理改为：从 DB 查出用户拥有的所有具名 volume，逐个调 DELETE /volumes/{name}，
+// 跳过正在使用的（409 Conflict），构造与 Docker 原生格式一致的响应返回。
+// 返回 true 表示已拦截处理，调用方应直接 return；返回 false 表示放行正常流程。
+func (p *ProxyServer) handleVolumePrune(w http.ResponseWriter, id *auth.CallerIdentity) bool {
+	if id.IsPrivileged() {
+		return false // root/sudo 用户直接透传，不干预
+	}
+
+	ownedVols, err := p.db.GetVolumeNamesByOwner(id.RealUID)
+	if err != nil {
+		p.logger.Error("volume_prune_db_error",
+			zap.Int("uid", id.RealUID),
+			zap.Error(err))
+		// DB 故障时回退为空结果，不报错
+		writeVolumePruneEmptyResponse(w)
+		return true
+	}
+
+	var deleted []string
+	for _, volName := range ownedVols {
+		req, err := http.NewRequest("DELETE", "http://docker/volumes/"+volName, nil)
+		if err != nil {
+			continue
+		}
+		resp, err := p.transport.RoundTrip(req)
+		if err != nil {
+			p.logger.Warn("volume_prune_delete_failed",
+				zap.String("volume", volName),
+				zap.Error(err))
+			continue
+		}
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
+			_ = p.db.DeleteVolume(volName)
+			deleted = append(deleted, volName)
+			p.logger.Info("volume_pruned",
+				zap.String("user", fmt.Sprintf("%s(uid=%d)", id.RealUsername, id.RealUID)),
+				zap.String("volume", volName))
+		}
+		// resp.StatusCode == 409: volume 正在被容器使用，跳过（Docker 标准行为）
+	}
+
+	if deleted == nil {
+		deleted = []string{}
+	}
+	body, _ := json.Marshal(struct {
+		VolumesDeleted []string `json:"VolumesDeleted"`
+		SpaceReclaimed uint64   `json:"SpaceReclaimed"`
+	}{VolumesDeleted: deleted, SpaceReclaimed: 0})
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+	return true
+}
+
+func writeVolumePruneEmptyResponse(w http.ResponseWriter) {
+	body, _ := json.Marshal(struct {
+		VolumesDeleted []string `json:"VolumesDeleted"`
+		SpaceReclaimed uint64   `json:"SpaceReclaimed"`
+	}{VolumesDeleted: []string{}, SpaceReclaimed: 0})
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
 }
 
