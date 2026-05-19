@@ -1362,18 +1362,54 @@ func (p *ProxyServer) checkImagePushPermission(w http.ResponseWriter, r *http.Re
 	if imageRef == "" {
 		return true
 	}
-	resolvedID := p.resolveImageIDByRef(imageRef)
-	if resolvedID == "" {
-		// registry 前缀（如 localhost:5000/）导致 Docker API 解析失败时，
-		// 尝试只用 name:tag 部分重新解析（去掉 host:port/ 前缀）
-		if idx := strings.Index(imageRef, "/"); idx >= 0 {
-			shortRef := imageRef[idx+1:]
-			resolvedID = p.resolveImageIDByRef(shortRef)
+
+	// push URL 中 name 和 tag 分开传递（/images/{name}/push?tag=xxx），
+	// 必须拼接 name:tag 才能正确解析到 Docker 本地 tag（如 localhost:5000/alice:test）。
+	tag := r.URL.Query().Get("tag")
+
+	// 按优先级逐步尝试解析 image content ID，第一个成功即停止
+	resolvedID := ""
+	candidates := []string{}
+	if tag != "" {
+		candidates = append(candidates, imageRef+":"+tag) // localhost:5000/alice:test
+	}
+	candidates = append(candidates, imageRef) // localhost:5000/alice（尝试 :latest）
+	if idx := strings.Index(imageRef, "/"); idx >= 0 {
+		shortRef := imageRef[idx+1:] // alice（去掉 host:port/ 前缀）
+		if tag != "" {
+			candidates = append(candidates, shortRef+":"+tag) // alice:test
+		}
+		candidates = append(candidates, shortRef) // alice（尝试 :latest）
+	}
+	for _, ref := range candidates {
+		if rid := p.resolveImageIDByRef(ref); rid != "" {
+			resolvedID = rid
+			break
 		}
 	}
+
+	// --all-tags（tag 为空）：枚举该 repo 下所有本地 tag，逐一验权
+	if resolvedID == "" && tag == "" {
+		imageIDs := p.listImageIDsByRepo(imageRef)
+		if len(imageIDs) > 0 {
+			for _, imgID := range imageIDs {
+				if !p.db.CanUseImage(id.RealUID, imgID) {
+					auditID := toAuditIdentity(id)
+					audit.LogAuthzDeniedNotTracked(p.logger, auditID, "image", truncID(imgID), authz.ActionPush)
+					writeDockerError(w, http.StatusForbidden,
+						fmt.Sprintf("image '%s' not tracked by proxy (only root can push untracked images)", truncID(imgID)))
+					return false
+				}
+			}
+			// 所有 tag 均有权限，放行
+			return true
+		}
+	}
+
 	if resolvedID == "" {
 		resolvedID = imageRef
 	}
+
 	owner, _, found := p.db.GetImageOwner(resolvedID)
 	if !found {
 		auditID := toAuditIdentity(id)
@@ -3522,6 +3558,42 @@ func writeDockerError(w http.ResponseWriter, statusCode int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 	_, _ = fmt.Fprintf(w, `{"message":%q}`, msg)
+}
+
+// listImageIDsByRepo 枚举本地所有以 repo 为前缀的 tag，返回去重后的 content ID 列表。
+// 用于 docker push --all-tags 场景（无 ?tag= 参数）。
+func (p *ProxyServer) listImageIDsByRepo(repo string) []string {
+	filters := fmt.Sprintf(`{"reference":[%q]}`, repo+":*")
+	u := &url.URL{
+		Scheme:   "http",
+		Host:     "docker",
+		Path:     "/images/json",
+		RawQuery: "filters=" + url.QueryEscape(filters),
+	}
+	req, err := http.NewRequest("GET", u.String(), nil)
+	if err != nil {
+		return nil
+	}
+	resp, err := p.transport.RoundTrip(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		return nil
+	}
+	defer resp.Body.Close()
+	var images []struct {
+		ID string `json:"Id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&images); err != nil {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var ids []string
+	for _, img := range images {
+		if img.ID != "" && !seen[img.ID] {
+			seen[img.ID] = true
+			ids = append(ids, img.ID)
+		}
+	}
+	return ids
 }
 
 // resolveImageIDByRef 查询 dockerd 获取镜像的真实内容 ID
