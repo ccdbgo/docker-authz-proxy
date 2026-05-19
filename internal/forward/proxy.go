@@ -1364,6 +1364,14 @@ func (p *ProxyServer) checkImagePushPermission(w http.ResponseWriter, r *http.Re
 	}
 	resolvedID := p.resolveImageIDByRef(imageRef)
 	if resolvedID == "" {
+		// registry 前缀（如 localhost:5000/）导致 Docker API 解析失败时，
+		// 尝试只用 name:tag 部分重新解析（去掉 host:port/ 前缀）
+		if idx := strings.Index(imageRef, "/"); idx >= 0 {
+			shortRef := imageRef[idx+1:]
+			resolvedID = p.resolveImageIDByRef(shortRef)
+		}
+	}
+	if resolvedID == "" {
 		resolvedID = imageRef
 	}
 	owner, _, found := p.db.GetImageOwner(resolvedID)
@@ -1374,11 +1382,15 @@ func (p *ProxyServer) checkImagePushPermission(w http.ResponseWriter, r *http.Re
 			fmt.Sprintf("image '%s' not tracked by proxy (only root can push untracked images)", truncID(resolvedID)))
 		return false
 	}
-	if owner.UID != id.RealUID {
+	// 用 CanUseImage 而非严格 owner 对比：
+	// alpine 等基础镜像由 root 首次拉取成为主 owner，bob tag 后触发 EnsureImageAccess
+	// 写入 image_access 表，CanUseImage 会检查该表，正确放行。
+	// 同时修复错误消息：传 imageRef（用户可见名）而非 resolvedID（sha256），避免内部 ID 泄漏。
+	if !p.db.CanUseImage(id.RealUID, resolvedID) {
 		auditID := toAuditIdentity(id)
 		auditOwner := &audit.OwnerInfo{Username: owner.Username, UID: owner.UID, GID: owner.GID}
 		audit.LogAuthzDeniedOwnership(p.logger, auditID, auditOwner, "image", truncID(resolvedID), authz.ActionPush)
-		writeDockerNotFound(w, "image", resolvedID)
+		writeDockerNotFound(w, "image", imageRef)
 		return false
 	}
 	return true
@@ -2082,7 +2094,15 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 					newRef = repo + ":latest"
 				}
 				if newRef != "" {
-					if contentID := p.resolveImageIDByRef(newRef); contentID != "" {
+					contentID := p.resolveImageIDByRef(newRef)
+					if contentID == "" {
+						// 新 tag 含 registry 前缀时（如 localhost:5000/alpine:test），
+						// Docker API /images/{name}/json 无法解析，改从源镜像名获取 content ID。
+						// 源镜像名为 URL path /images/{srcName}/tag 中的 srcName。
+						srcName := authz.ExtractImageID(requestURI)
+						contentID = p.resolveImageIDByRef(srcName)
+					}
+					if contentID != "" {
 						_ = p.db.EnsureImageAccess(contentID, id.RealUID)
 					}
 				}
