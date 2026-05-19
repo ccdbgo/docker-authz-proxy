@@ -215,6 +215,26 @@ const (
 	ActionSecret = "secret"
 	ActionConfig = "config"
 
+	// builder 管理操作（buildx 专用，不经过 Docker daemon）
+	ActionBuilderManage = "builder_manage" // docker builder create/ls/rm/stop/use/inspect
+
+	// context 管理操作（纯客户端本地操作，不经过 Docker daemon）
+	ActionContextList    = "context_ls"
+	ActionContextCreate  = "context_create"
+	ActionContextRemove  = "context_rm"
+	ActionContextInspect = "context_inspect"
+	ActionContextUpdate  = "context_update"
+	ActionContextExport  = "context_export"
+	ActionContextImport  = "context_import"
+	ActionContextUse     = "context_use"
+
+	// manifest 管理操作（直连 registry，不经过 Docker daemon）
+	ActionManifestInspect  = "manifest_inspect"
+	ActionManifestCreate   = "manifest_create"
+	ActionManifestPush     = "manifest_push"
+	ActionManifestAnnotate = "manifest_annotate"
+	ActionManifestRemove   = "manifest_rm"
+
 	ActionOther = "other"
 )
 

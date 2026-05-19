@@ -100,6 +100,8 @@ var compoundGroups = map[string]bool{
 	"volume":    true,
 	"plugin":    true,
 	"builder":   true,
+	"context":   true, // docker context <subcommand>
+	"manifest":  true, // docker manifest <subcommand>
 }
 
 // parseDockerCommand 从命令行中解析用户主动执行的 docker 子命令。

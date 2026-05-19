@@ -239,6 +239,10 @@ func RewriteVolumeURL(r *http.Request, uid int) *http.Request {
 	if volName == "" || volName == "create" || volName == "prune" {
 		return r
 	}
+	// hex ID（12位或64位纯十六进制）直接透传，不加前缀
+	if isHexID(volName) {
+		return r
+	}
 	prefix := UserVolumePrefix(uid)
 	if strings.HasPrefix(volName, prefix) {
 		return r

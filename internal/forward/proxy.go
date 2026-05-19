@@ -2659,8 +2659,40 @@ func isAuxiliaryCall(dockerCmd, action, method, path string) bool {
 		"plugin/create":  {authz.ActionPluginCreate},
 
 		// ── builder 组（docker builder <subcommand>）──────────────────────────
-		"builder/build": {authz.ActionBuild},
-		"builder/prune": {authz.ActionPrune},
+		"builder/build":      {authz.ActionBuild},
+		"builder/prune":      {authz.ActionPrune},
+		"builder/bake":       {authz.ActionBuild},                // 实际调用 POST /build，与 builder/build 等价
+		"builder/create":     {authz.ActionBuilderManage},        // buildx daemon，不经过 Docker daemon
+		"builder/inspect":    {authz.ActionBuilderManage},
+		"builder/ls":         {authz.ActionBuilderManage},
+		"builder/rm":         {authz.ActionBuilderManage},
+		"builder/stop":       {authz.ActionBuilderManage},
+		"builder/use":        {authz.ActionBuilderManage},
+		"builder/version":    {authz.ActionSystemVersion},
+		"builder/du":         {authz.ActionSystemDF},
+		"builder/dial-stdio": {authz.ActionBuilderManage},
+
+		// ── context 组（docker context <subcommand>）──────────────────────────
+		// context 命令不经过 Docker daemon，注册仅为确保 isAuxiliaryCall 正确识别
+		"context/ls":      {authz.ActionContextList},
+		"context/list":    {authz.ActionContextList},
+		"context/show":    {authz.ActionContextList},
+		"context/create":  {authz.ActionContextCreate},
+		"context/inspect": {authz.ActionContextInspect},
+		"context/rm":      {authz.ActionContextRemove},
+		"context/remove":  {authz.ActionContextRemove},
+		"context/update":  {authz.ActionContextUpdate},
+		"context/export":  {authz.ActionContextExport},
+		"context/import":  {authz.ActionContextImport},
+		"context/use":     {authz.ActionContextUse},
+
+		// ── manifest 组（docker manifest <subcommand>）────────────────────────
+		// manifest 命令直连 registry，不经过 Docker daemon，注册仅为命令识别完整性
+		"manifest/inspect":  {authz.ActionManifestInspect},
+		"manifest/create":   {authz.ActionManifestCreate},
+		"manifest/push":     {authz.ActionManifestPush},
+		"manifest/annotate": {authz.ActionManifestAnnotate},
+		"manifest/rm":       {authz.ActionManifestRemove},
 	}
 
 	// 其他命令（如 docker run、docker ps 等）附带触发的 info/version 请求
