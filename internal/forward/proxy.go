@@ -483,6 +483,14 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 必须在 isHijackRequest 检测之前执行 URL 重写，
+	// 否则 attach/exec 等 hijack 请求会用原始容器名转发给 Docker，导致 404。
+	if !identity.IsPrivileged() {
+		r = isolation.RewriteContainerURL(r, identity.RealUID)
+		r = isolation.RewriteNetworkURL(r, identity)
+		r = isolation.RewriteVolumeURL(r, identity.RealUID)
+	}
+
 	if isHijackRequest(r) {
 		p.logger.Debug("hijack_detected",
 			zap.String("user", fmt.Sprintf("%s(uid=%d)", identity.RealUsername, identity.RealUID)),
@@ -545,15 +553,6 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("user '%s'(uid=%d) not permitted to perform: %s",
 				identity.RealUsername, identity.RealUID, action))
 		return
-	}
-
-	// 非特权用户：提前重写资源 URL（注入用户前缀），确保归属检查使用正确的内部名称。
-	// 容器名前缀 user-{uid}-，网络/Volume 前缀 {username}_u{uid}_。
-	// 必须在 checkOwnershipPreRequest 之前执行，否则归属检查会用原始名查 Docker 找不到容器。
-	if !identity.IsPrivileged() {
-		r = isolation.RewriteContainerURL(r, identity.RealUID)
-		r = isolation.RewriteNetworkURL(r, identity)
-		r = isolation.RewriteVolumeURL(r, identity.RealUID)
 	}
 
 	r, ok := p.checkOwnershipPreRequest(w, r, identity, action)
