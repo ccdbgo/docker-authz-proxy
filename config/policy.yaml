@@ -41,21 +41,23 @@ version: 1
 default_action: allow
 
 deny_rules:
-  # ── test-sudo：sudo 组成员，禁止推送镜像和集群/插件/密钥管理 ──────────────
+  # ── test-sudo：sudo 组成员，禁止推送镜像和插件管理 ──────────────────────────
   - users: [test-sudo]
-    actions: [push, swarm, plugin, secret, config]
+    actions: [push, plugin]
 
-  # ── test-docker-g：docker 组成员，禁止构建/推送/提交/导入导出/集群管理 ──────
+  # ── test-docker-g：docker 组成员，禁止构建/推送/提交/导入导出 ──────────────
   - users: [test-docker-g]
-    actions: [build, push, commit, load, save, swarm, plugin, secret, config]
+    actions: [build, push, commit, load, save, plugin]
 
-  # ── bob：普通开发者，禁止 exec/构建/推送/提交/导入导出/集群管理 ──────────────
+  # ── bob：普通开发者，禁止 exec/构建/推送/提交/导入导出 ──────────────────────
+  # 注：swarm/secret/config 操作允许（代理有归属隔离，用户只能操作自己的资源）
+  # 注：prune 操作允许（代理自动限制为只清理自己的资源）
   - users: [bob]
-    actions: [exec, build, push, commit, load, save, swarm, plugin, secret, config]
+    actions: [exec, build, push, commit, load, save, plugin]
 
-  # ── alice：受限用户，禁止 ps/exec/构建/推送/提交/导入导出/清理/集群管理 ──────
+  # ── alice：受限用户，禁止 ps/exec/构建/推送/提交/导入导出 ──────────────────
   - users: [alice]
-    actions: [ps, exec, build, push, commit, load, save, prune, swarm, plugin, secret, config]
+    actions: [ps, exec, build, push, commit, load, save, plugin]
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 操作别名展开说明

@@ -324,3 +324,178 @@ func RebuildBody(data []byte) io.ReadCloser {
 func NewResponseScanner(r io.Reader) *bufio.Scanner {
 	return bufio.NewScanner(r)
 }
+
+// FilterSystemDFResponse 对 GET /system/df 响应做用户级过滤。
+// 特权用户直接返回原始响应体；普通用户只保留自己的容器、镜像（含公共镜像）、卷。
+// LayersSize 置为 0（无法精确计算用户级别的 layer 共享大小）。
+//
+// Docker system df 响应结构：
+//
+//	{
+//	  "LayersSize": int64,
+//	  "Images":     [{"Id","ParentId","RepoTags","RepoDigests","Created","SharedSize","UniqueSize","Containers",...}],
+//	  "Containers": [{"Id","Names","Image","ImageID","SizeRootFs","SizeRw",...}],
+//	  "Volumes":    [{"Name","Driver","Mountpoint","UsageData":{"Size","RefCount"}}],
+//	  "BuildCache": [...]
+//	}
+func FilterSystemDFResponse(body []byte, realUID int, privileged bool, db OwnershipReader) ([]byte, error) {
+	if privileged {
+		return body, nil
+	}
+
+	// 解析原始响应
+	var raw struct {
+		LayersSize int64               `json:"LayersSize"`
+		Images     []json.RawMessage   `json:"Images"`
+		Containers []json.RawMessage   `json:"Containers"`
+		Volumes    []json.RawMessage   `json:"Volumes"`
+		BuildCache []json.RawMessage   `json:"BuildCache"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		// 解析失败原样透传
+		return body, nil
+	}
+
+	// ── 过滤容器 ────────────────────────────────────────────────────────────
+	ownedContainerIDs, err := db.GetContainerIDsByOwner(realUID)
+	if err != nil {
+		return EmptySystemDFBody(), err
+	}
+	ownedCIDs := make(map[string]bool, len(ownedContainerIDs)*2)
+	for _, cid := range ownedContainerIDs {
+		ownedCIDs[cid] = true
+		if len(cid) >= 12 {
+			ownedCIDs[cid[:12]] = true
+		}
+	}
+	var filteredContainers []json.RawMessage
+	for _, rawItem := range raw.Containers {
+		var c struct {
+			ID string `json:"Id"`
+		}
+		if json.Unmarshal(rawItem, &c) != nil {
+			continue
+		}
+		if ownedCIDs[c.ID] || (len(c.ID) >= 12 && ownedCIDs[c.ID[:12]]) {
+			filteredContainers = append(filteredContainers, rawItem)
+		}
+	}
+	if filteredContainers == nil {
+		filteredContainers = []json.RawMessage{}
+	}
+
+	// ── 过滤镜像（用户自己的 + 公共镜像） ───────────────────────────────────
+	for _, rawItem := range raw.Images {
+		var img struct {
+			ID string `json:"Id"`
+		}
+		if json.Unmarshal(rawItem, &img) != nil {
+			continue
+		}
+		if db.CanSeeImage(realUID, img.ID) {
+			// filteredImages 已在循环体内收集，提到外层
+		}
+	}
+	var filteredImages []json.RawMessage
+	for _, rawItem := range raw.Images {
+		var img struct {
+			ID string `json:"Id"`
+		}
+		if json.Unmarshal(rawItem, &img) != nil {
+			continue
+		}
+		if db.CanSeeImage(realUID, img.ID) {
+			filteredImages = append(filteredImages, rawItem)
+		}
+	}
+	if filteredImages == nil {
+		filteredImages = []json.RawMessage{}
+	}
+
+	// ── 过滤卷 ──────────────────────────────────────────────────────────────
+	ownedVolNames, err := db.GetVolumeNamesByOwner(realUID)
+	if err != nil {
+		return EmptySystemDFBody(), err
+	}
+	ownedVols := make(map[string]bool, len(ownedVolNames))
+	for _, name := range ownedVolNames {
+		ownedVols[name] = true
+	}
+	var filteredVolumes []json.RawMessage
+	for _, rawItem := range raw.Volumes {
+		var v struct {
+			Name string `json:"Name"`
+		}
+		if json.Unmarshal(rawItem, &v) != nil {
+			continue
+		}
+		if ownedVols[v.Name] {
+			filteredVolumes = append(filteredVolumes, rawItem)
+		}
+	}
+	if filteredVolumes == nil {
+		filteredVolumes = []json.RawMessage{}
+	}
+
+	// BuildCache 不做用户级过滤（纯构建缓存层，无法准确归属）
+	buildCache := raw.BuildCache
+	if buildCache == nil {
+		buildCache = []json.RawMessage{}
+	}
+
+	out := struct {
+		LayersSize int64             `json:"LayersSize"`
+		Images     []json.RawMessage `json:"Images"`
+		Containers []json.RawMessage `json:"Containers"`
+		Volumes    []json.RawMessage `json:"Volumes"`
+		BuildCache []json.RawMessage `json:"BuildCache"`
+	}{
+		LayersSize: 0, // 用户级别无法精确计算共享层大小
+		Images:     filteredImages,
+		Containers: filteredContainers,
+		Volumes:    filteredVolumes,
+		BuildCache: buildCache,
+	}
+	return json.Marshal(out)
+}
+
+// FilterSwarmInspectResponse 对 GET /swarm 响应隐藏非特权用户的 JoinTokens。
+// 特权用户原样返回；非特权用户的 Worker/Manager token 替换为 "*"，并附加提示信息。
+func FilterSwarmInspectResponse(body []byte, privileged bool) ([]byte, error) {
+	if privileged {
+		return body, nil
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return body, nil
+	}
+
+	masked, _ := json.Marshal(struct {
+		Worker  string `json:"Worker"`
+		Manager string `json:"Manager"`
+		Hint    string `json:"_hint"`
+	}{
+		Worker:  "****************************************",
+		Manager: "****************************************",
+		Hint:    "如需加入集群，请联系管理员",
+	})
+	raw["JoinTokens"] = masked
+
+	return json.Marshal(raw)
+}
+
+// EmptySystemDFBody 返回空的 system df 响应（DB 故障时 fail-secure，供外部包使用）
+func EmptySystemDFBody() []byte {
+	b, _ := json.Marshal(struct {
+		LayersSize int64             `json:"LayersSize"`
+		Images     []json.RawMessage `json:"Images"`
+		Containers []json.RawMessage `json:"Containers"`
+		Volumes    []json.RawMessage `json:"Volumes"`
+		BuildCache []json.RawMessage `json:"BuildCache"`
+	}{
+		Images: []json.RawMessage{}, Containers: []json.RawMessage{},
+		Volumes: []json.RawMessage{}, BuildCache: []json.RawMessage{},
+	})
+	return b
+}

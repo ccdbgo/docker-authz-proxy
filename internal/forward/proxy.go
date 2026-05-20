@@ -568,6 +568,38 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 非特权用户的 container prune：只清理自己的已停止容器
+	if action == authz.ActionPrune &&
+		strings.HasPrefix(authz.StripAPIVersion(r.URL.Path), "/containers/prune") {
+		if p.handleContainerPrune(w, identity) {
+			return
+		}
+	}
+
+	// 非特权用户的 image prune：只清理自己拥有的悬空镜像
+	if action == authz.ActionPrune &&
+		strings.HasPrefix(authz.StripAPIVersion(r.URL.Path), "/images/prune") {
+		if p.handleImagePrune(w, identity) {
+			return
+		}
+	}
+
+	// 非特权用户的 network prune：只清理自己未使用的网络
+	if action == authz.ActionPrune &&
+		strings.HasPrefix(authz.StripAPIVersion(r.URL.Path), "/networks/prune") {
+		if p.handleNetworkPrune(w, identity) {
+			return
+		}
+	}
+
+	// 非特权用户的 system prune：调用上述全部清理逻辑
+	if action == authz.ActionPrune &&
+		strings.HasPrefix(authz.StripAPIVersion(r.URL.Path), "/system/prune") {
+		if p.handleSystemPrune(w, identity) {
+			return
+		}
+	}
+
 	p.logger.Debug("preprocess_request_start",
 		zap.String("user", fmt.Sprintf("%s(uid=%d)", identity.RealUsername, identity.RealUID)),
 		zap.String("action", action),
@@ -2055,6 +2087,47 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 			}
 		}
 		isolation.CopyHeaders(w, resp.Header)
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(body)
+
+	case authz.ActionSystemDF:
+		body, err := isolation.ReadFullBody(resp.Body)
+		if err != nil {
+			writeDockerError(w, http.StatusBadGateway, "read upstream response failed")
+			return
+		}
+		if resp.StatusCode == http.StatusOK {
+			filtered, ferr := isolation.FilterSystemDFResponse(body, id.RealUID, id.IsPrivileged(), p.db)
+			if ferr != nil {
+				p.logger.Error("filter_system_df_failed",
+					zap.String("user", fmt.Sprintf("%s(uid=%d)", id.RealUsername, id.RealUID)),
+					zap.Error(ferr))
+				// DB 故障时 fail-secure：返回空结果而非全局数据
+				filtered = isolation.EmptySystemDFBody()
+			}
+			body = filtered
+		}
+		isolation.CopyHeaders(w, resp.Header)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(body)
+
+	case authz.ActionSwarmInspect:
+		body, err := isolation.ReadFullBody(resp.Body)
+		if err != nil {
+			writeDockerError(w, http.StatusBadGateway, "read upstream response failed")
+			return
+		}
+		if resp.StatusCode == http.StatusOK {
+			filtered, ferr := isolation.FilterSwarmInspectResponse(body, id.IsPrivileged())
+			if ferr == nil {
+				body = filtered
+			}
+		}
+		isolation.CopyHeaders(w, resp.Header)
+		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(body)
@@ -4828,5 +4901,360 @@ func writeVolumePruneEmptyResponse(w http.ResponseWriter) {
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
+}
+
+// handleContainerPrune 拦截非特权用户的 POST /containers/prune 请求。
+// 只删除该用户拥有的已停止容器（调 DELETE /containers/{id}，运行中容器 Docker 返回 409 跳过）。
+// 返回 true 表示已拦截处理，调用方应直接 return；返回 false 表示放行正常流程。
+func (p *ProxyServer) handleContainerPrune(w http.ResponseWriter, id *auth.CallerIdentity) bool {
+	if id.IsPrivileged() {
+		return false
+	}
+
+	ownedIDs, err := p.db.GetContainerIDsByOwner(id.RealUID)
+	if err != nil {
+		p.logger.Error("container_prune_db_error", zap.Int("uid", id.RealUID), zap.Error(err))
+		body, _ := json.Marshal(struct {
+			ContainersDeleted []string `json:"ContainersDeleted"`
+			SpaceReclaimed    uint64   `json:"SpaceReclaimed"`
+		}{ContainersDeleted: []string{}, SpaceReclaimed: 0})
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+		return true
+	}
+
+	var deleted []string
+	for _, cid := range ownedIDs {
+		req, err := http.NewRequest("DELETE", "http://docker/containers/"+cid, nil)
+		if err != nil {
+			continue
+		}
+		resp, err := p.transport.RoundTrip(req)
+		if err != nil {
+			p.logger.Warn("container_prune_delete_failed", zap.String("container_id", truncID(cid)), zap.Error(err))
+			continue
+		}
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
+			_ = p.db.DeleteContainer(cid)
+			_ = p.db.ReleasePortMappings(cid)
+			deleted = append(deleted, cid)
+			p.logger.Info("container_pruned",
+				zap.String("user", fmt.Sprintf("%s(uid=%d)", id.RealUsername, id.RealUID)),
+				zap.String("container_id", truncID(cid)))
+		}
+		// 409: 容器仍在运行，跳过（标准行为）
+	}
+
+	if deleted == nil {
+		deleted = []string{}
+	}
+	body, _ := json.Marshal(struct {
+		ContainersDeleted []string `json:"ContainersDeleted"`
+		SpaceReclaimed    uint64   `json:"SpaceReclaimed"`
+	}{ContainersDeleted: deleted, SpaceReclaimed: 0})
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+	return true
+}
+
+// handleImagePrune 拦截非特权用户的 POST /images/prune 请求。
+// 只删除该用户拥有的悬空镜像（RepoTags 为空或 ["<none>:<none>"]）。
+// 通过查询 Docker GET /images/json?filters={"dangling":["true"]} 获取悬空镜像列表，
+// 再与用户的 image_access 取交集，逐个调 DELETE /images/{id} 删除。
+// 返回 true 表示已拦截处理，调用方应直接 return；返回 false 表示放行正常流程。
+func (p *ProxyServer) handleImagePrune(w http.ResponseWriter, id *auth.CallerIdentity) bool {
+	if id.IsPrivileged() {
+		return false
+	}
+
+	// 查询 Docker 当前所有悬空镜像
+	req, err := http.NewRequest("GET", "http://docker/images/json?filters=%7B%22dangling%22%3A%5B%22true%22%5D%7D", nil)
+	if err != nil {
+		p.logger.Error("image_prune_list_failed", zap.Int("uid", id.RealUID), zap.Error(err))
+		writeImagePruneEmptyResponse(w)
+		return true
+	}
+	resp, err := p.transport.RoundTrip(req)
+	if err != nil {
+		p.logger.Error("image_prune_list_failed", zap.Int("uid", id.RealUID), zap.Error(err))
+		writeImagePruneEmptyResponse(w)
+		return true
+	}
+	listBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	var danglingImages []struct {
+		ID string `json:"Id"`
+	}
+	if json.Unmarshal(listBody, &danglingImages) != nil {
+		writeImagePruneEmptyResponse(w)
+		return true
+	}
+
+	type pruneDeleted struct {
+		Deleted  string `json:"Deleted,omitempty"`
+		Untagged string `json:"Untagged,omitempty"`
+	}
+	var imagesDeleted []pruneDeleted
+
+	for _, img := range danglingImages {
+		// 只删除用户可访问的悬空镜像
+		if !p.db.CanSeeImage(id.RealUID, img.ID) {
+			continue
+		}
+		delReq, err := http.NewRequest("DELETE", "http://docker/images/"+img.ID, nil)
+		if err != nil {
+			continue
+		}
+		delResp, err := p.transport.RoundTrip(delReq)
+		if err != nil {
+			p.logger.Warn("image_prune_delete_failed", zap.String("image_id", truncID(img.ID)), zap.Error(err))
+			continue
+		}
+		delBody, _ := io.ReadAll(delResp.Body)
+		delResp.Body.Close()
+		if delResp.StatusCode == http.StatusOK {
+			_ = p.db.DeleteImage(img.ID)
+			// Docker 返回 [{"Deleted":"sha256:..."},{"Untagged":"..."}] 格式
+			var items []pruneDeleted
+			if json.Unmarshal(delBody, &items) == nil {
+				imagesDeleted = append(imagesDeleted, items...)
+			} else {
+				imagesDeleted = append(imagesDeleted, pruneDeleted{Deleted: img.ID})
+			}
+			p.logger.Info("image_pruned",
+				zap.String("user", fmt.Sprintf("%s(uid=%d)", id.RealUsername, id.RealUID)),
+				zap.String("image_id", truncID(img.ID)))
+		}
+	}
+
+	if imagesDeleted == nil {
+		imagesDeleted = []pruneDeleted{}
+	}
+	body, _ := json.Marshal(struct {
+		ImagesDeleted  []pruneDeleted `json:"ImagesDeleted"`
+		SpaceReclaimed uint64         `json:"SpaceReclaimed"`
+	}{ImagesDeleted: imagesDeleted, SpaceReclaimed: 0})
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+	return true
+}
+
+func writeImagePruneEmptyResponse(w http.ResponseWriter) {
+	body, _ := json.Marshal(struct {
+		ImagesDeleted  []json.RawMessage `json:"ImagesDeleted"`
+		SpaceReclaimed uint64            `json:"SpaceReclaimed"`
+	}{ImagesDeleted: []json.RawMessage{}, SpaceReclaimed: 0})
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+}
+
+// handleNetworkPrune 拦截非特权用户的 POST /networks/prune 请求。
+// 只删除该用户拥有的、当前没有容器连接的网络（DELETE /networks/{id}，有活跃端点时 Docker 返回 403/409 跳过）。
+// 返回 true 表示已拦截处理，调用方应直接 return；返回 false 表示放行正常流程。
+func (p *ProxyServer) handleNetworkPrune(w http.ResponseWriter, id *auth.CallerIdentity) bool {
+	if id.IsPrivileged() {
+		return false
+	}
+
+	ownedNetworkIDs, err := p.db.GetNetworkIDsByOwner(id.RealUID)
+	if err != nil {
+		p.logger.Error("network_prune_db_error", zap.Int("uid", id.RealUID), zap.Error(err))
+		body, _ := json.Marshal(struct {
+			NetworksDeleted []string `json:"NetworksDeleted"`
+		}{NetworksDeleted: []string{}})
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+		return true
+	}
+
+	var deleted []string
+	for _, netID := range ownedNetworkIDs {
+		delReq, err := http.NewRequest("DELETE", "http://docker/networks/"+netID, nil)
+		if err != nil {
+			continue
+		}
+		delResp, err := p.transport.RoundTrip(delReq)
+		if err != nil {
+			p.logger.Warn("network_prune_delete_failed", zap.String("network_id", truncID(netID)), zap.Error(err))
+			continue
+		}
+		delResp.Body.Close()
+		if delResp.StatusCode == http.StatusNoContent || delResp.StatusCode == http.StatusOK {
+			_ = p.db.DeleteNetwork(netID)
+			deleted = append(deleted, netID)
+			p.logger.Info("network_pruned",
+				zap.String("user", fmt.Sprintf("%s(uid=%d)", id.RealUsername, id.RealUID)),
+				zap.String("network_id", truncID(netID)))
+		}
+		// 403/409: 网络有活跃容器，跳过（标准行为）
+	}
+
+	if deleted == nil {
+		deleted = []string{}
+	}
+	body, _ := json.Marshal(struct {
+		NetworksDeleted []string `json:"NetworksDeleted"`
+	}{NetworksDeleted: deleted})
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+	return true
+}
+
+// handleSystemPrune 拦截非特权用户的 POST /system/prune 请求。
+// 依次调用 container / image / network / volume prune，各自只清理用户自己的资源，
+// 合并结果后返回与 Docker 原生 system prune 格式一致的响应。
+// 返回 true 表示已拦截处理，调用方应直接 return；返回 false 表示放行正常流程。
+func (p *ProxyServer) handleSystemPrune(w http.ResponseWriter, id *auth.CallerIdentity) bool {
+	if id.IsPrivileged() {
+		return false
+	}
+
+	// ── 1. 容器 prune ────────────────────────────────────────────────────────
+	var containersDeleted []string
+	if ownedIDs, err := p.db.GetContainerIDsByOwner(id.RealUID); err == nil {
+		for _, cid := range ownedIDs {
+			req, _ := http.NewRequest("DELETE", "http://docker/containers/"+cid, nil)
+			if req == nil {
+				continue
+			}
+			resp, err := p.transport.RoundTrip(req)
+			if err != nil {
+				continue
+			}
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
+				_ = p.db.DeleteContainer(cid)
+				_ = p.db.ReleasePortMappings(cid)
+				containersDeleted = append(containersDeleted, cid)
+			}
+		}
+	}
+
+	// ── 2. 镜像 prune（悬空镜像） ─────────────────────────────────────────────
+	type pruneDeleted struct {
+		Deleted  string `json:"Deleted,omitempty"`
+		Untagged string `json:"Untagged,omitempty"`
+	}
+	var imagesDeleted []pruneDeleted
+	if req, err := http.NewRequest("GET", "http://docker/images/json?filters=%7B%22dangling%22%3A%5B%22true%22%5D%7D", nil); err == nil {
+		if resp, err := p.transport.RoundTrip(req); err == nil {
+			listBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			var danglingImages []struct {
+				ID string `json:"Id"`
+			}
+			if json.Unmarshal(listBody, &danglingImages) == nil {
+				for _, img := range danglingImages {
+					if !p.db.CanSeeImage(id.RealUID, img.ID) {
+						continue
+					}
+					delReq, _ := http.NewRequest("DELETE", "http://docker/images/"+img.ID, nil)
+					if delReq == nil {
+						continue
+					}
+					delResp, err := p.transport.RoundTrip(delReq)
+					if err != nil {
+						continue
+					}
+					delBody, _ := io.ReadAll(delResp.Body)
+					delResp.Body.Close()
+					if delResp.StatusCode == http.StatusOK {
+						_ = p.db.DeleteImage(img.ID)
+						var items []pruneDeleted
+						if json.Unmarshal(delBody, &items) == nil {
+							imagesDeleted = append(imagesDeleted, items...)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// ── 3. 网络 prune ─────────────────────────────────────────────────────────
+	var networksDeleted []string
+	if ownedNetIDs, err := p.db.GetNetworkIDsByOwner(id.RealUID); err == nil {
+		for _, netID := range ownedNetIDs {
+			req, _ := http.NewRequest("DELETE", "http://docker/networks/"+netID, nil)
+			if req == nil {
+				continue
+			}
+			resp, err := p.transport.RoundTrip(req)
+			if err != nil {
+				continue
+			}
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
+				_ = p.db.DeleteNetwork(netID)
+				networksDeleted = append(networksDeleted, netID)
+			}
+		}
+	}
+
+	// ── 4. 卷 prune（复用 handleVolumePrune 逻辑，直接操作 DB + 逐个删除） ────
+	var volumesDeleted []string
+	if ownedVols, err := p.db.GetVolumeNamesByOwner(id.RealUID); err == nil {
+		for _, volName := range ownedVols {
+			req, _ := http.NewRequest("DELETE", "http://docker/volumes/"+volName, nil)
+			if req == nil {
+				continue
+			}
+			resp, err := p.transport.RoundTrip(req)
+			if err != nil {
+				continue
+			}
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
+				_ = p.db.DeleteVolume(volName)
+				volumesDeleted = append(volumesDeleted, volName)
+			}
+		}
+	}
+
+	// ── 合并响应 ──────────────────────────────────────────────────────────────
+	if containersDeleted == nil {
+		containersDeleted = []string{}
+	}
+	if imagesDeleted == nil {
+		imagesDeleted = []pruneDeleted{}
+	}
+	if networksDeleted == nil {
+		networksDeleted = []string{}
+	}
+	if volumesDeleted == nil {
+		volumesDeleted = []string{}
+	}
+
+	body, _ := json.Marshal(struct {
+		ContainersDeleted []string       `json:"ContainersDeleted"`
+		ImagesDeleted     []pruneDeleted `json:"ImagesDeleted"`
+		NetworksDeleted   []string       `json:"NetworksDeleted"`
+		VolumesDeleted    []string       `json:"VolumesDeleted"`
+		SpaceReclaimed    uint64         `json:"SpaceReclaimed"`
+	}{
+		ContainersDeleted: containersDeleted,
+		ImagesDeleted:     imagesDeleted,
+		NetworksDeleted:   networksDeleted,
+		VolumesDeleted:    volumesDeleted,
+		SpaceReclaimed:    0,
+	})
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+	return true
 }
 
