@@ -172,6 +172,120 @@ func FilterImageListResponse(body []byte, realUID int, privileged bool, db Owner
 	return json.Marshal(filtered)
 }
 
+// FilterServiceListResponse 过滤 Swarm service 列表，只返回用户自己的 service
+func FilterServiceListResponse(body []byte, uid int, privileged bool, db OwnershipReader) ([]byte, error) {
+	if privileged {
+		return body, nil
+	}
+
+	var services []json.RawMessage
+	if err := json.Unmarshal(body, &services); err != nil {
+		return emptyJSONArray, err
+	}
+
+	ownedIDs, err := db.GetServiceIDsByOwner(uid)
+	if err != nil {
+		return emptyJSONArray, err
+	}
+	owned := make(map[string]bool, len(ownedIDs))
+	for _, id := range ownedIDs {
+		owned[id] = true
+	}
+
+	var filtered []json.RawMessage
+	for _, raw := range services {
+		var item struct {
+			ID string `json:"ID"`
+		}
+		if err := json.Unmarshal(raw, &item); err != nil {
+			continue
+		}
+		if owned[item.ID] {
+			filtered = append(filtered, raw)
+		}
+	}
+	if filtered == nil {
+		return emptyJSONArray, nil
+	}
+	return json.Marshal(filtered)
+}
+
+// FilterSecretListResponse 过滤 Swarm secret 列表，只返回用户自己的 secret
+func FilterSecretListResponse(body []byte, uid int, privileged bool, db OwnershipReader) ([]byte, error) {
+	if privileged {
+		return body, nil
+	}
+
+	var secrets []json.RawMessage
+	if err := json.Unmarshal(body, &secrets); err != nil {
+		return emptyJSONArray, err
+	}
+
+	ownedIDs, err := db.GetSecretIDsByOwner(uid)
+	if err != nil {
+		return emptyJSONArray, err
+	}
+	owned := make(map[string]bool, len(ownedIDs))
+	for _, id := range ownedIDs {
+		owned[id] = true
+	}
+
+	var filtered []json.RawMessage
+	for _, raw := range secrets {
+		var item struct {
+			ID string `json:"ID"`
+		}
+		if err := json.Unmarshal(raw, &item); err != nil {
+			continue
+		}
+		if owned[item.ID] {
+			filtered = append(filtered, raw)
+		}
+	}
+	if filtered == nil {
+		return emptyJSONArray, nil
+	}
+	return json.Marshal(filtered)
+}
+
+// FilterConfigListResponse 过滤 Swarm config 列表，只返回用户自己的 config
+func FilterConfigListResponse(body []byte, uid int, privileged bool, db OwnershipReader) ([]byte, error) {
+	if privileged {
+		return body, nil
+	}
+
+	var configs []json.RawMessage
+	if err := json.Unmarshal(body, &configs); err != nil {
+		return emptyJSONArray, err
+	}
+
+	ownedIDs, err := db.GetConfigIDsByOwner(uid)
+	if err != nil {
+		return emptyJSONArray, err
+	}
+	owned := make(map[string]bool, len(ownedIDs))
+	for _, id := range ownedIDs {
+		owned[id] = true
+	}
+
+	var filtered []json.RawMessage
+	for _, raw := range configs {
+		var item struct {
+			ID string `json:"ID"`
+		}
+		if err := json.Unmarshal(raw, &item); err != nil {
+			continue
+		}
+		if owned[item.ID] {
+			filtered = append(filtered, raw)
+		}
+	}
+	if filtered == nil {
+		return emptyJSONArray, nil
+	}
+	return json.Marshal(filtered)
+}
+
 // ReadFullBody 读取 HTTP 响应体并关闭
 func ReadFullBody(body io.ReadCloser) ([]byte, error) {
 	defer body.Close()

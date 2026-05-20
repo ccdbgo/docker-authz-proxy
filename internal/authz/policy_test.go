@@ -164,11 +164,40 @@ func TestClassifyAction_SwarmPluginSecretConfig(t *testing.T) {
 		method, path string
 		want         string
 	}{
-		{"GET", "/swarm", ActionSwarm},
-		{"POST", "/swarm/init", ActionSwarm},
-		{"GET", "/nodes", ActionSwarm},
-		{"GET", "/services", ActionSwarm},
-		{"GET", "/tasks", ActionSwarm},
+		// swarm 集群管理（细粒度）
+		{"GET", "/swarm", ActionSwarmInspect},
+		{"POST", "/swarm/init", ActionSwarmInit},
+		{"POST", "/swarm/join", ActionSwarmJoin},
+		{"POST", "/swarm/leave", ActionSwarmLeave},
+		{"POST", "/swarm/update", ActionSwarmUpdate},
+		{"POST", "/swarm/unlockkey", ActionSwarmInspect},
+		// node 细粒度
+		{"GET", "/nodes", ActionNodeList},
+		{"GET", "/nodes/abc123/json", ActionNodeInspect},
+		{"POST", "/nodes/abc123/update", ActionNodeUpdate},
+		{"DELETE", "/nodes/abc123", ActionNodeRemove},
+		// service 细粒度
+		{"GET", "/services", ActionServiceList},
+		{"POST", "/services/create", ActionServiceCreate},
+		{"GET", "/services/abc123", ActionServiceInspect},
+		{"POST", "/services/abc123/update", ActionServiceUpdate},
+		{"DELETE", "/services/abc123", ActionServiceRemove},
+		{"GET", "/services/abc123/logs", ActionServiceLogs},
+		// task 细粒度
+		{"GET", "/tasks", ActionTaskList},
+		{"GET", "/tasks/abc123", ActionTaskInspect},
+		// secret 细粒度
+		{"GET", "/secrets", ActionSecretList},
+		{"POST", "/secrets/create", ActionSecretCreate},
+		{"GET", "/secrets/abc123", ActionSecretInspect},
+		{"POST", "/secrets/abc123/update", ActionSecretUpdate},
+		{"DELETE", "/secrets/abc123", ActionSecretRemove},
+		// config 细粒度
+		{"GET", "/configs", ActionConfigList},
+		{"POST", "/configs/create", ActionConfigCreate},
+		{"GET", "/configs/abc123", ActionConfigInspect},
+		{"POST", "/configs/abc123/update", ActionConfigUpdate},
+		{"DELETE", "/configs/abc123", ActionConfigRemove},
 		// plugin 细粒度
 		{"GET", "/plugins", ActionPluginList},
 		{"GET", "/plugins/myplugin/json", ActionPluginInspect},
@@ -180,10 +209,6 @@ func TestClassifyAction_SwarmPluginSecretConfig(t *testing.T) {
 		{"POST", "/plugins/myplugin/set", ActionPluginSet},
 		{"POST", "/plugins/myplugin/push", ActionPluginPush},
 		{"POST", "/plugins/create", ActionPluginCreate},
-		{"GET", "/secrets", ActionSecret},
-		{"POST", "/secrets/create", ActionSecret},
-		{"GET", "/configs", ActionConfig},
-		{"POST", "/configs/create", ActionConfig},
 	}
 
 	for _, tt := range tests {

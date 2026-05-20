@@ -6,4 +6,8 @@ type OwnershipReader interface {
 	GetAccessibleNetworkIDs(uid int) ([]string, error)
 	GetVolumeNamesByOwner(uid int) ([]string, error)
 	CanSeeImage(uid int, imageID string) bool
+	// Swarm 资源归属查询
+	GetServiceIDsByOwner(uid int) ([]string, error)
+	GetSecretIDsByOwner(uid int) ([]string, error)
+	GetConfigIDsByOwner(uid int) ([]string, error)
 }

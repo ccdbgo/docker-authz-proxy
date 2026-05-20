@@ -1101,6 +1101,119 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 		}
 	}
 
+	// ── Swarm 管理操作（init/join/leave/update/unlock、node 操作）仅限 privileged 用户 ──
+	switch action {
+	case authz.ActionSwarmInit, authz.ActionSwarmJoin, authz.ActionSwarmLeave,
+		authz.ActionSwarmUpdate, authz.ActionSwarmUnlock,
+		authz.ActionNodeUpdate, authz.ActionNodeRemove:
+		if !id.IsPrivileged() {
+			auditID := toAuditIdentity(id)
+			audit.LogAuthzDeniedCommand(p.logger, auditID, action, r.URL.RequestURI())
+			p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "swarm_admin_required", "", http.StatusForbidden))
+			writeDockerError(w, http.StatusForbidden,
+				fmt.Sprintf("user '%s'(uid=%d) not permitted to perform: %s",
+					id.RealUsername, id.RealUID, action))
+			return r, false
+		}
+	}
+
+	// ── Swarm service 归属检查 ────────────────────────────────────────────────
+	switch action {
+	case authz.ActionServiceInspect, authz.ActionServiceUpdate,
+		authz.ActionServiceRemove, authz.ActionServiceLogs:
+		serviceID := authz.ExtractServiceID(r.URL.Path)
+		if serviceID != "" && !id.IsPrivileged() {
+			owner, found := p.db.GetServiceOwner(serviceID)
+			if !found {
+				auditID := toAuditIdentity(id)
+				p.logger.Warn("AUTHZ_DENY",
+					append(audit.LogIdentityFields(auditID),
+						zap.String("reason", "service_not_tracked"),
+						zap.String("service_id", truncID(serviceID)),
+						zap.String("action", action),
+					)...)
+				p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "service_not_tracked", "", http.StatusNotFound))
+				writeDockerNotFound(w, "service", serviceID)
+				return r, false
+			} else if owner.UID != id.RealUID {
+				auditID := toAuditIdentity(id)
+				p.logger.Warn("AUTHZ_DENY",
+					append(audit.LogIdentityFields(auditID),
+						zap.String("reason", "not_your_service"),
+						zap.String("service_id", truncID(serviceID)),
+						zap.String("action", action),
+					)...)
+				p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "not_your_service", "", http.StatusNotFound))
+				writeDockerNotFound(w, "service", serviceID)
+				return r, false
+			}
+		}
+	}
+
+	// ── Swarm secret 归属检查 ────────────────────────────────────────────────
+	switch action {
+	case authz.ActionSecretInspect, authz.ActionSecretUpdate, authz.ActionSecretRemove:
+		secretID := authz.ExtractSecretID(r.URL.Path)
+		if secretID != "" && !id.IsPrivileged() {
+			owner, found := p.db.GetSecretOwner(secretID)
+			if !found {
+				auditID := toAuditIdentity(id)
+				p.logger.Warn("AUTHZ_DENY",
+					append(audit.LogIdentityFields(auditID),
+						zap.String("reason", "secret_not_tracked"),
+						zap.String("secret_id", truncID(secretID)),
+						zap.String("action", action),
+					)...)
+				p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "secret_not_tracked", "", http.StatusNotFound))
+				writeDockerNotFound(w, "secret", secretID)
+				return r, false
+			} else if owner.UID != id.RealUID {
+				auditID := toAuditIdentity(id)
+				p.logger.Warn("AUTHZ_DENY",
+					append(audit.LogIdentityFields(auditID),
+						zap.String("reason", "not_your_secret"),
+						zap.String("secret_id", truncID(secretID)),
+						zap.String("action", action),
+					)...)
+				p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "not_your_secret", "", http.StatusNotFound))
+				writeDockerNotFound(w, "secret", secretID)
+				return r, false
+			}
+		}
+	}
+
+	// ── Swarm config 归属检查 ────────────────────────────────────────────────
+	switch action {
+	case authz.ActionConfigInspect, authz.ActionConfigUpdate, authz.ActionConfigRemove:
+		configID := authz.ExtractConfigID(r.URL.Path)
+		if configID != "" && !id.IsPrivileged() {
+			owner, found := p.db.GetConfigOwner(configID)
+			if !found {
+				auditID := toAuditIdentity(id)
+				p.logger.Warn("AUTHZ_DENY",
+					append(audit.LogIdentityFields(auditID),
+						zap.String("reason", "config_not_tracked"),
+						zap.String("config_id", truncID(configID)),
+						zap.String("action", action),
+					)...)
+				p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "config_not_tracked", "", http.StatusNotFound))
+				writeDockerNotFound(w, "config", configID)
+				return r, false
+			} else if owner.UID != id.RealUID {
+				auditID := toAuditIdentity(id)
+				p.logger.Warn("AUTHZ_DENY",
+					append(audit.LogIdentityFields(auditID),
+						zap.String("reason", "not_your_config"),
+						zap.String("config_id", truncID(configID)),
+						zap.String("action", action),
+					)...)
+				p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "not_your_config", "", http.StatusNotFound))
+				writeDockerNotFound(w, "config", configID)
+				return r, false
+			}
+		}
+	}
+
 	return r, true
 }
 
@@ -2423,6 +2536,165 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 		w.WriteHeader(resp.StatusCode)
 		_, _ = io.Copy(w, resp.Body)
 
+	// ── Swarm service ────────────────────────────────────────────────────────
+
+	case authz.ActionServiceCreate:
+		body, err := isolation.ReadFullBody(resp.Body)
+		if err != nil {
+			writeDockerError(w, http.StatusBadGateway, "read upstream response failed")
+			return
+		}
+		if resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusOK {
+			var created struct {
+				ID string `json:"ID"`
+			}
+			if json.Unmarshal(body, &created) == nil && created.ID != "" {
+				if err := p.db.SetServiceOwner(created.ID, created.ID, id); err != nil {
+					p.logger.Error("set_service_owner_failed",
+						zap.String("service_id", truncID(created.ID)), zap.Error(err))
+				}
+			}
+		}
+		isolation.CopyHeaders(w, resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(body)
+
+	case authz.ActionServiceList:
+		body, err := isolation.ReadFullBody(resp.Body)
+		if err != nil {
+			writeDockerError(w, http.StatusBadGateway, "read upstream response failed")
+			return
+		}
+		totalCount = isolation.CountJSONArray(body)
+		filtered, err := isolation.FilterServiceListResponse(body, id.RealUID, id.IsPrivileged(), p.db)
+		if err != nil {
+			p.logger.Error("filter_services_failed", zap.Error(err))
+			filtered = emptyJSONArray
+		}
+		filteredCount = isolation.CountJSONArray(filtered)
+		isolation.CopyHeaders(w, resp.Header)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", strconv.Itoa(len(filtered)))
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(filtered)
+
+	case authz.ActionServiceRemove:
+		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent {
+			serviceID := authz.ExtractServiceID(requestURI)
+			if serviceID != "" {
+				_ = p.db.DeleteService(serviceID)
+			}
+		}
+		isolation.CopyHeaders(w, resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+
+	// ── Swarm secret ─────────────────────────────────────────────────────────
+
+	case authz.ActionSecretCreate:
+		body, err := isolation.ReadFullBody(resp.Body)
+		if err != nil {
+			writeDockerError(w, http.StatusBadGateway, "read upstream response failed")
+			return
+		}
+		if resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusOK {
+			var created struct {
+				ID string `json:"ID"`
+			}
+			if json.Unmarshal(body, &created) == nil && created.ID != "" {
+				if err := p.db.SetSecretOwner(created.ID, created.ID, id); err != nil {
+					p.logger.Error("set_secret_owner_failed",
+						zap.String("secret_id", truncID(created.ID)), zap.Error(err))
+				}
+			}
+		}
+		isolation.CopyHeaders(w, resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(body)
+
+	case authz.ActionSecretList:
+		body, err := isolation.ReadFullBody(resp.Body)
+		if err != nil {
+			writeDockerError(w, http.StatusBadGateway, "read upstream response failed")
+			return
+		}
+		totalCount = isolation.CountJSONArray(body)
+		filtered, err := isolation.FilterSecretListResponse(body, id.RealUID, id.IsPrivileged(), p.db)
+		if err != nil {
+			p.logger.Error("filter_secrets_failed", zap.Error(err))
+			filtered = emptyJSONArray
+		}
+		filteredCount = isolation.CountJSONArray(filtered)
+		isolation.CopyHeaders(w, resp.Header)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", strconv.Itoa(len(filtered)))
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(filtered)
+
+	case authz.ActionSecretRemove:
+		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent {
+			secretID := authz.ExtractSecretID(requestURI)
+			if secretID != "" {
+				_ = p.db.DeleteSecret(secretID)
+			}
+		}
+		isolation.CopyHeaders(w, resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+
+	// ── Swarm config ─────────────────────────────────────────────────────────
+
+	case authz.ActionConfigCreate:
+		body, err := isolation.ReadFullBody(resp.Body)
+		if err != nil {
+			writeDockerError(w, http.StatusBadGateway, "read upstream response failed")
+			return
+		}
+		if resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusOK {
+			var created struct {
+				ID string `json:"ID"`
+			}
+			if json.Unmarshal(body, &created) == nil && created.ID != "" {
+				if err := p.db.SetConfigOwner(created.ID, created.ID, id); err != nil {
+					p.logger.Error("set_config_owner_failed",
+						zap.String("config_id", truncID(created.ID)), zap.Error(err))
+				}
+			}
+		}
+		isolation.CopyHeaders(w, resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(body)
+
+	case authz.ActionConfigList:
+		body, err := isolation.ReadFullBody(resp.Body)
+		if err != nil {
+			writeDockerError(w, http.StatusBadGateway, "read upstream response failed")
+			return
+		}
+		totalCount = isolation.CountJSONArray(body)
+		filtered, err := isolation.FilterConfigListResponse(body, id.RealUID, id.IsPrivileged(), p.db)
+		if err != nil {
+			p.logger.Error("filter_configs_failed", zap.Error(err))
+			filtered = emptyJSONArray
+		}
+		filteredCount = isolation.CountJSONArray(filtered)
+		isolation.CopyHeaders(w, resp.Header)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", strconv.Itoa(len(filtered)))
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(filtered)
+
+	case authz.ActionConfigRemove:
+		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent {
+			configID := authz.ExtractConfigID(requestURI)
+			if configID != "" {
+				_ = p.db.DeleteConfig(configID)
+			}
+		}
+		isolation.CopyHeaders(w, resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+
 	case authz.ActionSystemInfo:
 		body, err := isolation.ReadFullBody(resp.Body)
 		if err != nil {
@@ -2754,6 +3026,70 @@ func isAuxiliaryCall(dockerCmd, action, method, path string) bool {
 		"manifest/push":     {authz.ActionManifestPush},
 		"manifest/annotate": {authz.ActionManifestAnnotate},
 		"manifest/rm":       {authz.ActionManifestRemove},
+
+		// ── swarm 组（docker swarm <subcommand>）──────────────────────────────
+		"swarm/init":   {authz.ActionSwarmInit},
+		"swarm/join":   {authz.ActionSwarmJoin},
+		"swarm/leave":  {authz.ActionSwarmLeave},
+		"swarm/update": {authz.ActionSwarmUpdate},
+		"swarm/unlock": {authz.ActionSwarmUnlock},
+		"swarm/ca":     {authz.ActionSwarmUpdate},
+
+		// ── node 组（docker node <subcommand>）───────────────────────────────
+		"node/ls":      {authz.ActionNodeList},
+		"node/list":    {authz.ActionNodeList},
+		"node/inspect": {authz.ActionNodeInspect},
+		"node/update":  {authz.ActionNodeUpdate},
+		"node/rm":      {authz.ActionNodeRemove},
+		"node/remove":  {authz.ActionNodeRemove},
+		"node/ps":      {authz.ActionTaskList},
+		"node/demote":  {authz.ActionNodeUpdate},
+		"node/promote": {authz.ActionNodeUpdate},
+
+		// ── service 组（docker service <subcommand>）──────────────────────────
+		"service/ls":      {authz.ActionServiceList},
+		"service/list":    {authz.ActionServiceList},
+		"service/create":  {authz.ActionServiceCreate},
+		"service/inspect": {authz.ActionServiceInspect},
+		"service/update":  {authz.ActionServiceUpdate},
+		"service/rm":      {authz.ActionServiceRemove},
+		"service/remove":  {authz.ActionServiceRemove},
+		"service/logs":    {authz.ActionServiceLogs},
+		"service/ps":      {authz.ActionTaskList},
+		"service/scale":   {authz.ActionServiceUpdate},
+		"service/rollback": {authz.ActionServiceUpdate},
+
+		// ── task 组（docker task <subcommand>）───────────────────────────────
+		"task/ls":      {authz.ActionTaskList},
+		"task/inspect": {authz.ActionTaskInspect},
+
+		// ── secret 组（docker secret <subcommand>）────────────────────────────
+		"secret/ls":      {authz.ActionSecretList},
+		"secret/list":    {authz.ActionSecretList},
+		"secret/create":  {authz.ActionSecretCreate},
+		"secret/inspect": {authz.ActionSecretInspect},
+		"secret/rm":      {authz.ActionSecretRemove},
+		"secret/remove":  {authz.ActionSecretRemove},
+
+		// ── config 组（docker config <subcommand>）────────────────────────────
+		"config/ls":      {authz.ActionConfigList},
+		"config/list":    {authz.ActionConfigList},
+		"config/create":  {authz.ActionConfigCreate},
+		"config/inspect": {authz.ActionConfigInspect},
+		"config/rm":      {authz.ActionConfigRemove},
+		"config/remove":  {authz.ActionConfigRemove},
+
+		// ── stack 组（docker stack <subcommand>）──────────────────────────────
+		// stack 操作会触发多个下游 API：service/create、network/create、secret/create 等
+		"stack/deploy":  {authz.ActionServiceCreate, authz.ActionServiceUpdate, authz.ActionNetworkCreate, authz.ActionSecretCreate, authz.ActionConfigCreate},
+		"stack/up":      {authz.ActionServiceCreate, authz.ActionServiceUpdate, authz.ActionNetworkCreate, authz.ActionSecretCreate, authz.ActionConfigCreate},
+		"stack/ls":      {authz.ActionServiceList},
+		"stack/list":    {authz.ActionServiceList},
+		"stack/ps":      {authz.ActionTaskList},
+		"stack/services": {authz.ActionServiceList},
+		"stack/rm":      {authz.ActionServiceRemove, authz.ActionNetworkRemove, authz.ActionSecretRemove, authz.ActionConfigRemove},
+		"stack/remove":  {authz.ActionServiceRemove, authz.ActionNetworkRemove, authz.ActionSecretRemove, authz.ActionConfigRemove},
+		"stack/config":  {authz.ActionServiceInspect},
 	}
 
 	// 其他命令（如 docker run、docker ps 等）附带触发的 info/version 请求
