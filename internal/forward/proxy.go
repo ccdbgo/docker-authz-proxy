@@ -2443,8 +2443,8 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 		containerIDs, _ := p.db.GetContainerIDsByOwner(id.RealUID)
 		states := p.queryUserContainerStates(containerIDs)
 
-		// 查询用户可访问的镜像数量
-		imageCount, _ := p.db.CountAccessibleImages(id.RealUID)
+		// 查询用户实际可见的镜像数量（以 Docker daemon 实际存在为准，与 docker images 一致）
+		imageCount := p.countUserVisibleImages(id.RealUID)
 
 		// 将响应 JSON 解析为 map，替换计数字段后返回
 		var info map[string]json.RawMessage
@@ -3748,6 +3748,34 @@ func (p *ProxyServer) imageHasOtherTags(imageID, excludeTag string) bool {
 		}
 	}
 	return false
+}
+
+// countUserVisibleImages 向 Docker daemon 查询全量镜像，再经过与 docker images 相同的
+// 过滤逻辑，返回用户实际可见的镜像数量（与 docker images | wc -l 一致）。
+func (p *ProxyServer) countUserVisibleImages(uid int) int {
+	upstreamURL := &url.URL{
+		Scheme: "http",
+		Host:   "docker",
+		Path:   "/images/json",
+	}
+	req, err := http.NewRequest("GET", upstreamURL.String(), nil)
+	if err != nil {
+		return 0
+	}
+	resp, err := p.transport.RoundTrip(req)
+	if err != nil {
+		return 0
+	}
+	defer resp.Body.Close()
+	body, err := isolation.ReadFullBody(resp.Body)
+	if err != nil {
+		return 0
+	}
+	filtered, err := isolation.FilterImageListResponse(body, uid, false, p.db)
+	if err != nil {
+		return 0
+	}
+	return isolation.CountJSONArray(filtered)
 }
 
 // containerStateCounts 查询用户容器的运行状态统计
