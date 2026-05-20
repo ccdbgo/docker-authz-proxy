@@ -1,0 +1,11 @@
+# 编译产物 / 发布包（二进制文件不进入远程仓库）
+dist/
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp

@@ -27,10 +27,10 @@ users:
     mem_mb: 0
     tmpfs_size_mb: 0  # root 不限制
 
-  # test-sudo：sudo 组成员，给予较多资源
-  test-sudo:
-    cpu_cores: 4.0
-    mem_mb: 4096
+  # sudo_test：sudo 组成员，不限制 CPU（避免超过物理核数报错）
+  sudo_test:
+    cpu_cores: 0
+    mem_mb: 1024
     tmpfs_size_mb: 1024
 
   # test-docker-g：docker 组成员，标准资源
@@ -51,9 +51,9 @@ users:
 
 # 按组配置
 groups:
-  # sudo 组：给予较多资源（test-sudo 属于此组）
+  # sudo 组：不限制 CPU（避免超过物理核数报错）
   sudo:
-    cpu_cores: 4.0
+    cpu_cores: 0
     mem_mb: 4096
     tmpfs_size_mb: 1024
     # sudo 组允许使用 GPU 设备（示例）

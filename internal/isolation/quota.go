@@ -185,25 +185,26 @@ func (m *QuotaManager) GetQuota(identity *auth.CallerIdentity) UserQuota {
 	q := m.defaults
 
 	// 组配置（取最大值，允许用户属于多个组时获得最高配额）
+	// 注意：0 表示不限制，是最高优先级，一旦某组设为 0 则覆盖所有限制
 	for _, gid := range auth.GetUserGroups(identity.RealUID) {
 		groupName := auth.LookupGroupName(gid)
 		if groupName == "" {
 			continue
 		}
 		if ge, ok := m.groups[groupName]; ok {
-			if ge.CPUCores > q.CPUCores {
+			if ge.CPUCores == 0 || ge.CPUCores > q.CPUCores {
 				q.CPUCores = ge.CPUCores
 			}
-			if ge.MemMB > q.MemMB {
+			if ge.MemMB == 0 || ge.MemMB > q.MemMB {
 				q.MemMB = ge.MemMB
 			}
-			if ge.StorageGB > q.StorageGB {
+			if ge.StorageGB == 0 || ge.StorageGB > q.StorageGB {
 				q.StorageGB = ge.StorageGB
 			}
-			if ge.MaxContainers > q.MaxContainers {
+			if ge.MaxContainers == 0 || ge.MaxContainers > q.MaxContainers {
 				q.MaxContainers = ge.MaxContainers
 			}
-			if ge.TmpfsSizeMB > q.TmpfsSizeMB {
+			if ge.TmpfsSizeMB == 0 || ge.TmpfsSizeMB > q.TmpfsSizeMB {
 				q.TmpfsSizeMB = ge.TmpfsSizeMB
 			}
 			if len(ge.AllowedDevices) > 0 {
@@ -212,23 +213,13 @@ func (m *QuotaManager) GetQuota(identity *auth.CallerIdentity) UserQuota {
 		}
 	}
 
-	// 用户配置（覆盖组配置）
+	// 用户配置（最高优先级，直接覆盖，包括 0=不限制）
 	if ue, ok := m.users[identity.RealUsername]; ok {
-		if ue.CPUCores > 0 {
-			q.CPUCores = ue.CPUCores
-		}
-		if ue.MemMB > 0 {
-			q.MemMB = ue.MemMB
-		}
-		if ue.StorageGB > 0 {
-			q.StorageGB = ue.StorageGB
-		}
-		if ue.MaxContainers > 0 {
-			q.MaxContainers = ue.MaxContainers
-		}
-		if ue.TmpfsSizeMB > 0 {
-			q.TmpfsSizeMB = ue.TmpfsSizeMB
-		}
+		q.CPUCores = ue.CPUCores
+		q.MemMB = ue.MemMB
+		q.StorageGB = ue.StorageGB
+		q.MaxContainers = ue.MaxContainers
+		q.TmpfsSizeMB = ue.TmpfsSizeMB
 		if len(ue.AllowedDevices) > 0 {
 			q.AllowedDevices = append(q.AllowedDevices, ue.AllowedDevices...)
 		}
@@ -509,18 +500,13 @@ func injectQuotaLimits(body []byte, req *containerCreateRequest, quota UserQuota
 			hostConfig["NanoCpus"] = b
 			result.cpuCores = quota.CPUCores
 		} else {
-			// 已指定且不超限：保持原值，但清除 CpuQuota/CpuPeriod 避免冲突
-			// （NanoCPUs 与 CpuQuota 不能同时设置）
+			// 已指定且不超限：保持原值，不做任何转换。
+			// hostConfig 中 NanoCpus/CpuQuota/CpuPeriod 均来自原始请求，无需修改。
+			// Docker 约束为 NanoCpus≠0 与 CpuQuota≠0 不能共存；
+			// Docker CLI 保证两组参数互斥，代理透传即可，不存在冲突。
 			if req.HostConfig.NanoCPUs > 0 {
 				result.cpuCores = float64(req.HostConfig.NanoCPUs) / 1e9
 			} else {
-				// 将 CpuQuota/CpuPeriod 转换为 NanoCPUs，统一表示
-				b, _ := json.Marshal(currentNano)
-				hostConfig["NanoCpus"] = b
-				// 清除 CpuQuota/CpuPeriod，避免 Docker 报冲突错误
-				zero, _ := json.Marshal(int64(0))
-				hostConfig["CpuQuota"] = zero
-				hostConfig["CpuPeriod"] = zero
 				result.cpuCores = float64(currentNano) / 1e9
 			}
 		}
