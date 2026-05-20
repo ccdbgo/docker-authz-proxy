@@ -16,6 +16,7 @@ type OwnerInfo struct {
 	Username string
 	UID      int
 	GID      int
+	Source   string // 镜像来源：pull / build / load / import / commit
 }
 
 // OwnershipDB 容器/镜像归属持久化存储
@@ -295,8 +296,15 @@ func (o *OwnershipDB) SetImageOwner(imageID string, identity *auth.CallerIdentit
 		publicInt = 1
 	}
 	_, err := o.DB.Exec(
-		`INSERT OR IGNORE INTO images(image_id, owner_username, owner_uid, owner_gid, is_public, source, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO images(image_id, owner_username, owner_uid, owner_gid, is_public, source, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(image_id) DO UPDATE SET
+		     owner_username = excluded.owner_username,
+		     owner_uid      = excluded.owner_uid,
+		     owner_gid      = excluded.owner_gid,
+		     source         = excluded.source,
+		     created_at     = excluded.created_at
+		 WHERE images.source = 'build' AND excluded.source = 'pull'`,
 		imageID,
 		identity.RealUsername,
 		identity.RealUID,
@@ -356,8 +364,8 @@ func (o *OwnershipDB) GetImageOwner(imageID string) (*OwnerInfo, bool, bool) {
 	var info OwnerInfo
 	var isPublicInt int
 	err := o.DB.QueryRow(
-		`SELECT owner_username, owner_uid, owner_gid, is_public FROM images WHERE image_id = ?`, resolvedID,
-	).Scan(&info.Username, &info.UID, &info.GID, &isPublicInt)
+		`SELECT owner_username, owner_uid, owner_gid, is_public, COALESCE(source, '') FROM images WHERE image_id = ?`, resolvedID,
+	).Scan(&info.Username, &info.UID, &info.GID, &isPublicInt, &info.Source)
 	if err != nil {
 		return nil, false, false
 	}
@@ -500,6 +508,11 @@ func (o *OwnershipDB) EnsureImageAccess(imageID string, uid int) error {
 
 // DeleteImage 删除镜像归属记录
 func (o *OwnershipDB) DeleteImage(imageID string) error {
+	if resolved := o.resolveImageIDInDB(imageID); resolved != "" {
+		imageID = resolved
+	} else {
+		imageID = normalizeImageID(imageID)
+	}
 	_, _ = o.DB.Exec(`DELETE FROM image_access WHERE image_id = ?`, imageID)
 	_, err := o.DB.Exec(`DELETE FROM images WHERE image_id = ?`, imageID)
 	return err

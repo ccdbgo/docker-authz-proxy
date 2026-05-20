@@ -123,6 +123,74 @@ func TestStreamAndCaptureLoadedImageIDs_ByTag(t *testing.T) {
 	}
 }
 
+// ── extractImageIDFromStreamLines ────────────────────────────────────────────
+
+func TestExtractImageIDFromStreamLines_PullDigestStatus(t *testing.T) {
+	// 标准 docker pull 流：{"status":"Digest: sha256:..."}
+	lines := []string{
+		`{"status":"Pulling from library/alpine"}`,
+		`{"status":"Pull complete","progressDetail":{},"id":"abc123"}`,
+		`{"status":"Digest: sha256:deadbeef1234567890abcdef1234567890abcdef1234567890abcdef12345678"}`,
+		`{"status":"Status: Downloaded newer image for alpine:latest"}`,
+	}
+	got := extractImageIDFromStreamLines(lines, "pull")
+	want := "sha256:deadbeef1234567890abcdef1234567890abcdef1234567890abcdef12345678"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestExtractImageIDFromStreamLines_PullAux(t *testing.T) {
+	// 旧版 aux 格式
+	lines := []string{
+		`{"status":"Pulling from library/nginx"}`,
+		`{"aux":{"Tag":"latest","Digest":"sha256:aabbccdd11223344556677889900aabbccdd11223344556677889900aabbccdd","Size":1234}}`,
+	}
+	got := extractImageIDFromStreamLines(lines, "pull")
+	want := "sha256:aabbccdd11223344556677889900aabbccdd11223344556677889900aabbccdd"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestExtractImageIDFromStreamLines_PullEmpty(t *testing.T) {
+	// 没有 Digest 行时返回空
+	lines := []string{
+		`{"status":"Pulling from library/alpine"}`,
+		`{"status":"Status: Image is up to date for alpine:latest"}`,
+	}
+	got := extractImageIDFromStreamLines(lines, "pull")
+	if got != "" {
+		t.Errorf("expected empty, got %q", got)
+	}
+}
+
+func TestExtractImageIDFromStreamLines_BuildAux(t *testing.T) {
+	// BuildKit aux 格式
+	lines := []string{
+		`{"stream":"Step 1/2 : FROM alpine\n"}`,
+		`{"aux":{"ID":"sha256:cafebabe1234567890abcdef1234567890abcdef1234567890abcdef12345678"}}`,
+	}
+	got := extractImageIDFromStreamLines(lines, "build")
+	want := "cafebabe1234567890abcdef1234567890abcdef1234567890abcdef12345678"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestExtractImageIDFromStreamLines_BuildSuccessfully(t *testing.T) {
+	// 旧版 builder 格式
+	lines := []string{
+		`{"stream":"Step 2/2 : CMD [\"/bin/sh\"]\n"}`,
+		`{"stream":"Successfully built ab12cd34ef56\n"}`,
+	}
+	got := extractImageIDFromStreamLines(lines, "build")
+	want := "ab12cd34ef56"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 func fakeBodyForward(s string) *fakeReadCloserForward {

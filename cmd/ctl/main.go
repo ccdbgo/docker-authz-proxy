@@ -489,8 +489,10 @@ func imageCmd(args []string) error {
 		return imageSetPublic(rest, db)
 	case "list":
 		return imageList(rest, db)
+	case "grant":
+		return imageGrant(rest, db)
 	default:
-		return fmt.Errorf("unknown image subcommand %q, use set-public/list", sub)
+		return fmt.Errorf("unknown image subcommand %q, use set-public/list/grant", sub)
 	}
 }
 
@@ -561,6 +563,63 @@ func imageSetPublic(args []string, db *authz.OwnershipDB) error {
 		status = "public"
 	}
 	fmt.Printf("image %s (%s) marked as %s\n", ref, resolvedID[:min(12, len(resolvedID))], status)
+	return nil
+}
+
+// imageGrant 授予指定用户访问某镜像的权限（image_access 记录）
+func imageGrant(args []string, db *authz.OwnershipDB) error {
+	fs := flag.NewFlagSet("image grant", flag.ContinueOnError)
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "用法: image grant <镜像名或ID> <用户名或UID>\n\n")
+		fmt.Fprintf(os.Stderr, "授予指定用户访问 build 镜像的权限。\n")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return nil
+		}
+		return err
+	}
+	if fs.NArg() < 2 {
+		return fmt.Errorf("用法: image grant <镜像名或ID> <用户名或UID>")
+	}
+	ref := fs.Arg(0)
+	userArg := fs.Arg(1)
+
+	// 解析目标用户 UID
+	targetUID := -1
+	u, err := user.Lookup(userArg)
+	if err == nil {
+		targetUID, _ = strconv.Atoi(u.Uid)
+	} else {
+		// 尝试直接解析为数字 UID
+		if n, err2 := strconv.Atoi(userArg); err2 == nil {
+			targetUID = n
+		}
+	}
+	if targetUID < 0 {
+		return fmt.Errorf("找不到用户 %q", userArg)
+	}
+
+	// 解析镜像 ID
+	imageID, err := resolveImageID(ref)
+	if err != nil {
+		imageID = ref
+	}
+	resolvedID, found := resolveImageIDInDB(db, imageID)
+	if !found {
+		return fmt.Errorf("镜像 %q 不存在", ref)
+	}
+
+	if err := db.EnsureImageAccess(resolvedID, targetUID); err != nil {
+		return fmt.Errorf("grant image access: %w", err)
+	}
+
+	targetUser := userArg
+	if u != nil {
+		targetUser = fmt.Sprintf("%s(uid=%d)", u.Username, targetUID)
+	}
+	fmt.Printf("image %s (%s): access granted to %s\n", ref, resolvedID[:min(12, len(resolvedID))], targetUser)
 	return nil
 }
 

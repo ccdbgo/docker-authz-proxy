@@ -976,33 +976,63 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 		}
 	}
 
-	// container update 配额校验：防止通过 update 绕过内存限制
+	// container update 配额校验：防止通过 update 绕过 CPU/内存限制
 	if action == authz.ActionUpdate && p.quota != nil {
 		quota := p.quota.GetQuota(id)
-		if quota.MemMB > 0 {
-			body, _ := io.ReadAll(r.Body)
-			r.Body.Close()
-			r.Body = io.NopCloser(bytes.NewReader(body))
-			var hc struct {
-				Memory int64 `json:"Memory"`
+		body, _ := io.ReadAll(r.Body)
+		r.Body.Close()
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		var hc struct {
+			NanoCpus  int64 `json:"NanoCpus"`
+			CpuQuota  int64 `json:"CpuQuota"`
+			CpuPeriod int64 `json:"CpuPeriod"`
+			Memory    int64 `json:"Memory"`
+		}
+		_ = json.Unmarshal(body, &hc)
+		if quota.CPUCores > 0 {
+			reqNano := hc.NanoCpus
+			if reqNano == 0 && hc.CpuQuota > 0 {
+				period := hc.CpuPeriod
+				if period <= 0 {
+					period = 100000
+				}
+				reqNano = hc.CpuQuota * 1e9 / period
 			}
-			if err := json.Unmarshal(body, &hc); err == nil && hc.Memory > 0 {
-				limitBytes := int64(quota.MemMB) * 1024 * 1024
-				if hc.Memory > limitBytes {
+			if reqNano > 0 {
+				limitNano := int64(quota.CPUCores * 1e9)
+				if reqNano > limitNano {
 					auditID := toAuditIdentity(id)
 					p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "quota_exceeded",
-						fmt.Sprintf("memory requested=%dMB limit=%dMB", hc.Memory/1024/1024, quota.MemMB), http.StatusForbidden))
+						fmt.Sprintf("cpu requested=%.2f limit=%.2f", float64(reqNano)/1e9, quota.CPUCores), http.StatusForbidden))
 					p.logger.Warn("quota_exceeded_update",
 						append(audit.LogIdentityFields(auditID),
-							zap.String("resource", "memory"),
-							zap.Int64("requested_mb", hc.Memory/1024/1024),
-							zap.Int("limit_mb", quota.MemMB),
+							zap.String("resource", "cpu"),
+							zap.Float64("requested_cores", float64(reqNano)/1e9),
+							zap.Float64("limit_cores", quota.CPUCores),
 						)...)
 					writeDockerError(w, http.StatusForbidden, fmt.Sprintf(
-						"quota exceeded: memory requested=%dMB limit=%dMB excess=+%dMB",
-						hc.Memory/1024/1024, quota.MemMB, hc.Memory/1024/1024-int64(quota.MemMB)))
+						"quota exceeded: cpu requested=%.2f cores limit=%.2f cores excess=+%.2f cores",
+						float64(reqNano)/1e9, quota.CPUCores, float64(reqNano-limitNano)/1e9))
 					return r, false
 				}
+			}
+		}
+		if quota.MemMB > 0 && hc.Memory > 0 {
+			limitBytes := int64(quota.MemMB) * 1024 * 1024
+			if hc.Memory > limitBytes {
+				auditID := toAuditIdentity(id)
+				p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "quota_exceeded",
+					fmt.Sprintf("memory requested=%dMB limit=%dMB", hc.Memory/1024/1024, quota.MemMB), http.StatusForbidden))
+				p.logger.Warn("quota_exceeded_update",
+					append(audit.LogIdentityFields(auditID),
+						zap.String("resource", "memory"),
+						zap.Int64("requested_mb", hc.Memory/1024/1024),
+						zap.Int("limit_mb", quota.MemMB),
+					)...)
+				writeDockerError(w, http.StatusForbidden, fmt.Sprintf(
+					"quota exceeded: memory requested=%dMB limit=%dMB excess=+%dMB",
+					hc.Memory/1024/1024, quota.MemMB, hc.Memory/1024/1024-int64(quota.MemMB)))
+				return r, false
 			}
 		}
 	}
@@ -1293,9 +1323,37 @@ func (p *ProxyServer) checkImagePullPermission(w http.ResponseWriter, r *http.Re
 		return true
 	}
 
-	// 私有镜像且非属主：镜像已在本地，模拟 pull 成功并记录引用计数
-	// 不需要从仓库重新下载，直接给当前用户添加访问权限
+	// 私有镜像且非属主
 	if owner.UID != id.RealUID {
+		if owner.Source == "build" {
+			// build 产出的镜像需要属主或已授权用户才能访问
+			if !p.db.CanSeeImage(id.RealUID, resolvedID) {
+				p.logger.Warn("image_pull_denied_build_source",
+					append(audit.LogIdentityShortFields(auditID),
+						zap.String("image_ref", imageRef),
+						zap.String("image_id", truncID(resolvedID)),
+						zap.String("owner", owner.Username),
+					)...)
+				writeDockerError(w, http.StatusForbidden,
+					fmt.Sprintf("image '%s' is private (built by %s); request access from the owner",
+						imageRef, owner.Username))
+				return false
+			}
+			// 已被授权：模拟 pull 成功
+			p.logger.Info("image_pull_virtual",
+				append(audit.LogIdentityShortFields(auditID),
+					zap.String("image_ref", imageRef),
+					zap.String("image_id", truncID(resolvedID)),
+					zap.String("owner", owner.Username),
+					zap.String("source", "build"),
+				)...)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, "{\"status\":\"Pull complete\",\"id\":\"%s\"}\r\n", truncID(resolvedID))
+			return false
+		}
+
+		// pull/load/import/commit 来源的镜像：自动授予访问权限，模拟 pull 成功
 		if err := p.db.EnsureImageAccess(resolvedID, id.RealUID); err != nil {
 			p.logger.Error("ensure_image_access_failed",
 				zap.String("image_id", resolvedID),
@@ -1310,6 +1368,7 @@ func (p *ProxyServer) checkImagePullPermission(w http.ResponseWriter, r *http.Re
 				zap.String("image_ref", imageRef),
 				zap.String("image_id", truncID(resolvedID)),
 				zap.String("owner", owner.Username),
+				zap.String("source", owner.Source),
 			)...)
 		// 模拟 Docker pull 的流式输出格式
 		w.Header().Set("Content-Type", "application/json")
@@ -2026,10 +2085,16 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 			_, _ = io.Copy(w, resp.Body)
 			break
 		}
-		streamAndCaptureImageID(w, resp, "pull")
+		capturedDigest := streamAndCaptureImageID(w, resp, "pull")
 		imageRef := parseImageRefFromURI(requestURI)
 		if imageRef != "" {
-			if imageID := p.resolveImageIDByRef(imageRef); imageID != "" {
+			imageID := p.resolveImageIDByRef(imageRef)
+			// resolveImageIDByRef 可能因 Docker 索引短暂延迟返回空；
+			// 用流中捕获的 Digest 兜底，确保第一个 puller 能成功登记所有权。
+			if imageID == "" && capturedDigest != "" {
+				imageID = capturedDigest
+			}
+			if imageID != "" {
 				if err := p.db.SetImageOwner(imageID, id, false, "pull"); err != nil {
 					p.logger.Error("save_image_owner_failed",
 						zap.String("image_id", imageID),
@@ -2148,19 +2213,15 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 		if resp.StatusCode == http.StatusOK {
 			imageRef := authz.ExtractImageID(requestURI)
 			if imageRef != "" {
-				// 解析真实 content ID，与 pre-request 阶段保持一致
-				resolvedID := p.resolveImageIDByRef(imageRef)
-				if resolvedID == "" {
-					resolvedID = imageRef
-				}
-				// 到达此处说明 pre-request 阶段已确认引用计数降为 0，可物理删除
-				_ = p.db.DeleteImage(resolvedID)
+				// 镜像已被 Docker 删除，resolveImageIDByRef 必然返回空；
+				// 直接传 imageRef，由 DeleteImage 内部通过 DB 前缀匹配解析完整 ID。
+				_ = p.db.DeleteImage(imageRef)
 				p.logger.Info("image_deleted",
 					append(audit.LogIdentityFields(auditID),
-						zap.String("image_id", truncID(resolvedID)),
+						zap.String("image_id", truncID(imageRef)),
 					)...)
 				p.auditLog.WriteEntry(func() audit.AuditEntry {
-					e := makeAuditEntry(id, r, action, "allow", "physical_delete", resolvedID, resp.StatusCode)
+					e := makeAuditEntry(id, r, action, "allow", "physical_delete", imageRef, resp.StatusCode)
 					e.URI = requestURI
 					return e
 				}())
@@ -3877,16 +3938,26 @@ func extractImageIDFromStreamLines(lines []string, source string) string {
 		}
 
 		if source == "pull" {
-			var msg struct {
+			// 格式1：{"aux":{"Tag":"...","Digest":"sha256:...","Size":...}}（旧版 docker pull -q 输出）
+			var auxMsg struct {
 				Aux *struct {
 					Tag    string `json:"Tag"`
 					Digest string `json:"Digest"`
 					Size   int64  `json:"Size"`
 				} `json:"aux"`
 			}
-			if err := json.Unmarshal([]byte(line), &msg); err == nil {
-				if msg.Aux != nil && msg.Aux.Digest != "" {
-					return msg.Aux.Digest
+			if err := json.Unmarshal([]byte(line), &auxMsg); err == nil {
+				if auxMsg.Aux != nil && auxMsg.Aux.Digest != "" {
+					return auxMsg.Aux.Digest
+				}
+			}
+			// 格式2：{"status":"Digest: sha256:..."}（标准 docker pull 流输出）
+			var statusMsg struct {
+				Status string `json:"status"`
+			}
+			if err := json.Unmarshal([]byte(line), &statusMsg); err == nil {
+				if strings.HasPrefix(statusMsg.Status, "Digest: ") {
+					return strings.TrimPrefix(statusMsg.Status, "Digest: ")
 				}
 			}
 		}
