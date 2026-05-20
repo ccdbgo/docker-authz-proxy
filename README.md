@@ -6,7 +6,8 @@
 
 - **多用户完全隔离**：每个用户只能看到和操作自己的容器、镜像、网络、存储卷
 - **不可伪造身份**：通过 `SO_PEERCRED` + `/proc/<pid>/loginuid` 获取内核级身份，区分 root / sudo / 普通用户
-- **细粒度访问控制**：基于 `policy.yaml` 白名单，按用户/组配置允许的操作
+- **细粒度访问控制**：基于 `policy.yaml` 白名单，按用户/组配置允许的操作（支持 50+ 个独立 action）
+- **Swarm 集群支持**：Service、Secret、Config 归属管理与响应过滤；Node、Task 权限控制；支持细粒度子操作授权
 - **资源配额**：限制每用户容器数、CPU、内存，防止资源滥用
 - **镜像引用计数**：公共镜像共享，删除时自动检查引用，防止误删他人使用的镜像
 - **网络互通**：`allow-network-peer` 机制允许指定用户间容器跨用户通信
@@ -181,13 +182,41 @@ version: 1
 default_action: allow   # 默认允许，通过 deny_rules 禁止特定操作
 
 deny_rules:
-  # 普通用户禁止 exec/build/push 等高危操作
+  # 普通用户禁止 exec/build/push 等高危操作，以及所有 Swarm 集群操作
   - users: [bob]
     actions: [exec, build, push, commit, load, save, swarm, plugin, secret, config]
 
   # 受限用户进一步禁止 ps
   - users: [alice]
     actions: [ps, exec, build, push, commit, load, save, prune, swarm, plugin, secret, config]
+```
+
+#### 操作别名说明
+
+`deny_rules` 中以下名称为别名，代理会自动展开为多个子操作：
+
+| 别名 | 展开为 |
+|------|--------|
+| `run` | `create_container` + `start` |
+| `swarm` | `swarm_init/join/leave/update/unlock/inspect` + `node_ls/inspect/update/rm` + `service_ls/create/inspect/update/rm/logs` + `task_ls/inspect` + `secret_ls/create/inspect/update/rm` + `config_ls/create/inspect/update/rm` |
+| `secret` | `secret_ls` + `secret_create` + `secret_inspect` + `secret_update` + `secret_rm` |
+| `config` | `config_ls` + `config_create` + `config_inspect` + `config_update` + `config_rm` |
+| `plugin` | `plugin_ls/inspect/install/rm/enable/disable/upgrade/set/push/create` |
+
+**细粒度控制示例**：如需允许普通用户管理自己的 service/secret/config，仅禁止集群管理类操作：
+
+```yaml
+deny_rules:
+  - users: [bob]
+    actions:
+      # 禁止集群级管理（影响整个 Swarm 集群）
+      - swarm_init
+      - swarm_join
+      - swarm_leave
+      - swarm_update
+      - node_update
+      - node_rm
+      # 其余 service/secret/config CRUD 允许（代理有归属隔离，用户只能操作自己的资源）
 ```
 
 修改配置后发送 `SIGHUP` 热重载，无需重启服务：
@@ -221,6 +250,13 @@ users:
 # 查看用户资源
 docker-authz-proxy-ctl list-containers --user alice
 docker-authz-proxy-ctl list-images     --user alice
+docker-authz-proxy-ctl list-networks   --user alice
+docker-authz-proxy-ctl list-volumes    --user alice
+
+# Swarm 资源（需 Swarm 模式已启用）
+docker-authz-proxy-ctl list-services --user alice
+docker-authz-proxy-ctl list-secrets  --user alice
+docker-authz-proxy-ctl list-configs  --user alice
 
 # 镜像公共化（所有用户可见）
 docker-authz-proxy-ctl set-public   --image nginx:latest

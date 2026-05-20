@@ -82,6 +82,60 @@ if !found {
 
 ---
 
+## 二·五、Swarm 资源归属与隔离
+
+### 2.5 Service / Secret / Config 所有者追踪
+
+与容器、镜像类似，Swarm 资源通过 OwnershipDB 追踪所有者，分别记录在三张表中：
+
+| 表名 | 主键字段 | 记录时机 |
+|------|----------|----------|
+| `swarm_services` | `service_id` | `POST /services/create` 响应成功后 |
+| `swarm_secrets` | `secret_id` | `POST /secrets/create` 响应成功后 |
+| `swarm_configs` | `config_id` | `POST /configs/create` 响应成功后 |
+
+每行记录 `owner_uid`（int）和 `owner_username`（string）。创建时由代理自动写入：
+
+```go
+p.db.SetServiceOwner(serviceID, serviceName, identity)
+p.db.SetSecretOwner(secretID, secretName, identity)
+p.db.SetConfigOwner(configID, configName, identity)
+```
+
+### 2.6 列表响应过滤
+
+对非特权用户（`IsPrivileged() == false`），代理在列表响应阶段过滤：
+
+| API 路径 | 过滤函数 | 行为 |
+|----------|----------|------|
+| `GET /services` | `FilterServiceListResponse` | 仅返回该用户创建的 Service |
+| `GET /secrets` | `FilterSecretListResponse` | 仅返回该用户创建的 Secret |
+| `GET /configs` | `FilterConfigListResponse` | 仅返回该用户创建的 Config |
+
+过滤基于 DB 中的 `owner_uid`，与 Docker daemon 的响应 JSON 中的 ID 字段匹配。
+
+### 2.7 删除权限检查（归属验证）
+
+非 owner 用户尝试删除他人的 Swarm 资源时，`checkOwnershipPreRequest` 在请求转发前拦截：
+
+1. 从 URL 中提取资源 ID（`ExtractServiceID` / `ExtractSecretID` / `ExtractConfigID`）
+2. 查询 DB 中的 `owner_uid`
+3. 若 `owner_uid != realUID`，直接返回 403 Forbidden
+
+**注意**：Swarm 资源目前不支持虚拟删除（与镜像不同），直接返回权限错误。
+
+### 2.8 Node / Swarm 集群管理
+
+Node 管理（`node_update`、`node_rm`）和集群管理（`swarm_init`、`swarm_join`、`swarm_leave`）属于集群级管理操作，对非特权用户直接返回 403，不区分资源归属。管理员可通过 `policy.yaml` 的 `deny_rules` 进一步限制这些操作。
+
+### 2.9 JoinTokens 安全说明
+
+`GET /swarm`（swarm inspect）响应中包含 `JoinTokens`（Worker/Manager 加入令牌）。非特权用户如有权访问该接口（policy 未禁止 `swarm_inspect`），可获取集群加入凭据。
+
+建议在 `policy.yaml` 中对普通用户禁止 `swarm_inspect`，或在 `deny: [swarm]` 时全部禁止。
+
+---
+
 ## 三、构建策略拦截
 
 ### 3.1 BuildKit docker-container 驱动
@@ -241,15 +295,32 @@ Docker daemon 返回的错误信息中含有内部资源名（如 `sudo_test_u10
 
 ### 5.2 操作别名
 
-| policy 中的名称 | 实际映射 | 说明 |
-|----------------|---------|------|
+部分操作名是别名，代理在 `IsDenied` 检查时自动展开：
+
+| policy 中的名称 | 展开为 | 说明 |
+|----------------|--------|------|
 | `run` | `create_container` + `start` | docker run 拆分为两个 action |
-| `history` | `history` | docker image history |
+| `swarm` | `swarm_inspect/init/join/leave/update/unlock` + `node_ls/inspect/update/rm` + `service_ls/create/inspect/update/rm/logs` + `task_ls/inspect` + `secret_ls/create/inspect/update/rm` + `config_ls/create/inspect/update/rm` | 禁止所有 Swarm 集群操作 |
+| `secret` | `secret_ls/create/inspect/update/rm` | 禁止所有 Secret 操作 |
+| `config` | `config_ls/create/inspect/update/rm` | 禁止所有 Config 操作 |
+| `plugin` | `plugin_ls/inspect/install/rm/enable/disable/upgrade/set/push/create` | 禁止所有插件操作 |
+| `history` | `history` | docker image history（无展开） |
 | `kill` | `kill` | 独立 action，不合并到 `stop` |
 | `pause` | `pause` | 独立 action，不合并到 `stop` |
 | `unpause` | `unpause` | 独立 action，不合并到 `stop` |
 
 `kill`/`pause`/`unpause` 与 `stop` 相互独立，禁止其中一个不影响其他。
+
+细粒度 Swarm 操作常量（可在 `deny_rules` 中直接使用）：
+
+```
+swarm_inspect / swarm_init / swarm_join / swarm_leave / swarm_update / swarm_unlock
+node_ls / node_inspect / node_update / node_rm
+service_ls / service_create / service_inspect / service_update / service_rm / service_logs
+task_ls / task_inspect
+secret_ls / secret_create / secret_inspect / secret_update / secret_rm
+config_ls / config_create / config_inspect / config_update / config_rm
+```
 
 ### 5.3 命令级覆盖
 
@@ -283,7 +354,9 @@ var cmdActionOverrides = map[string]string{
 |------|------|
 | `internal/auth/identity.go` | 身份识别（SO_PEERCRED + loginuid） |
 | `internal/authz/policy.go` | 策略加载、操作分类（ClassifyAction）、路径匹配 |
-| `internal/authz/ownership.go` | 归属数据库（SQLite）CRUD |
+| `internal/authz/ownership.go` | 归属数据库（SQLite）CRUD，含 Swarm Service/Secret/Config 归属方法 |
+| `internal/isolation/ownership.go` | `OwnershipReader` 接口（避免 isolation → authz 循环依赖） |
+| `internal/isolation/filter.go` | 响应过滤函数（容器/镜像/Service/Secret/Config 列表过滤） |
 | `internal/isolation/network.go` | 网络/容器名称前缀注入、URL 重写、列表过滤 |
 | `internal/isolation/netbridge.go` | 跨用户网络互通（BridgeManager）、容器网络注入（InjectUserNetwork） |
 | `internal/isolation/quota.go` | 资源配额检查与注入 |
