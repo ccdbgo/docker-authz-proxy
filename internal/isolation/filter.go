@@ -356,37 +356,66 @@ func NewResponseScanner(r io.Reader) *bufio.Scanner {
 // 特权用户直接返回原始响应体；普通用户只保留自己的容器、镜像（含公共镜像）、卷。
 // LayersSize 置为 0（无法精确计算用户级别的 layer 共享大小）。
 //
-// Docker system df 响应结构（Docker 29.x）：
+// Docker system df 有两种响应格式：
 //
-//	{
-//	  "LayersSize":     int64,
-//	  "Images":         [...],   // 旧版 CLI 读此字段
-//	  "Containers":     [...],   // 旧版 CLI 读此字段
-//	  "Volumes":        [...],   // 旧版 CLI 读此字段
-//	  "BuildCache":     [...],
-//	  "ImageUsage":     {"Items":[...],"TotalCount":N,"ActiveCount":N,"TotalSize":N},  // Docker 29+ CLI 读此字段
-//	  "ContainerUsage": {"Items":[...],"TotalCount":N,"Reclaimable":N,"TotalSize":N}, // Docker 29+ CLI 读此字段
-//	  "VolumeUsage":    {"Items":[...],"TotalCount":N,"ActiveCount":N,"TotalSize":N},  // Docker 29+ CLI 读此字段
-//	}
+//	非 verbose（旧版 / Docker 29.x 默认）：
+//	  顶层同时含 Images[]/Containers[]/Volumes[]/BuildCache[] 和 *Usage{} 汇总字段。
+//	  CLI 读 *Usage.TotalCount 显示条数，读顶层数组渲染详情。
+//
+//	verbose（Docker 29.x -v）：
+//	  顶层仅含 *Usage{Items:[...]} 字段（无 Images[]/Containers[]/Volumes[]）。
+//	  CLI 直接读 *Usage.Items 渲染详情表格。
+//	  旧版 Docker 的 BuildCache[] → verbose 时变为 BuildCacheUsage{Items:[...]}。
 func FilterSystemDFResponse(body []byte, realUID int, privileged bool, db OwnershipReader) ([]byte, error) {
 	if privileged {
 		return body, nil
 	}
 
-	// 解析原始响应（同时解析 Docker 29.x 新增的 *Usage 汇总字段）
-	var raw struct {
-		LayersSize     int64             `json:"LayersSize"`
-		Images         []json.RawMessage `json:"Images"`
-		Containers     []json.RawMessage `json:"Containers"`
-		Volumes        []json.RawMessage `json:"Volumes"`
-		BuildCache     []json.RawMessage `json:"BuildCache"`
-		ImageUsage     json.RawMessage   `json:"ImageUsage"`
-		ContainerUsage json.RawMessage   `json:"ContainerUsage"`
-		VolumeUsage    json.RawMessage   `json:"VolumeUsage"`
-	}
-	if err := json.Unmarshal(body, &raw); err != nil {
-		// 解析失败原样透传
+	// 用 map 解析以精确检测哪些顶层字段实际存在（nil = key 缺失，与空数组不同）
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(body, &rawMap); err != nil {
 		return body, nil
+	}
+
+	// extractItems 从 *Usage JSON 字段中提取 Items 数组
+	extractItems := func(usageRaw json.RawMessage) []json.RawMessage {
+		if len(usageRaw) == 0 {
+			return nil
+		}
+		var u struct {
+			Items []json.RawMessage `json:"Items"`
+		}
+		_ = json.Unmarshal(usageRaw, &u)
+		return u.Items
+	}
+
+	// 解析各字段的原始值
+	var imagesArr, containersArr, volumesArr, buildCacheArr []json.RawMessage
+	_ = json.Unmarshal(rawMap["Images"], &imagesArr)
+	_ = json.Unmarshal(rawMap["Containers"], &containersArr)
+	_ = json.Unmarshal(rawMap["Volumes"], &volumesArr)
+	_ = json.Unmarshal(rawMap["BuildCache"], &buildCacheArr)
+
+	imageUsageRaw := rawMap["ImageUsage"]
+	containerUsageRaw := rawMap["ContainerUsage"]
+	volumeUsageRaw := rawMap["VolumeUsage"]
+	buildCacheUsageRaw := rawMap["BuildCacheUsage"]
+
+	// Docker 29.x verbose 格式：顶层无 Images 字段，数据在 *Usage.Items 中
+	isVerboseFormat := rawMap["Images"] == nil && imageUsageRaw != nil
+
+	// 待过滤的条目：优先用顶层数组，缺失时降级到 *Usage.Items（verbose 格式）
+	imageItems := imagesArr
+	if len(imageItems) == 0 && len(imageUsageRaw) > 0 {
+		imageItems = extractItems(imageUsageRaw)
+	}
+	containerItems := containersArr
+	if len(containerItems) == 0 && len(containerUsageRaw) > 0 {
+		containerItems = extractItems(containerUsageRaw)
+	}
+	volumeItems := volumesArr
+	if len(volumeItems) == 0 && len(volumeUsageRaw) > 0 {
+		volumeItems = extractItems(volumeUsageRaw)
 	}
 
 	// ── 过滤容器 ────────────────────────────────────────────────────────────
@@ -402,7 +431,7 @@ func FilterSystemDFResponse(body []byte, realUID int, privileged bool, db Owners
 		}
 	}
 	var filteredContainers []json.RawMessage
-	for _, rawItem := range raw.Containers {
+	for _, rawItem := range containerItems {
 		var c struct {
 			ID string `json:"Id"`
 		}
@@ -419,7 +448,7 @@ func FilterSystemDFResponse(body []byte, realUID int, privileged bool, db Owners
 
 	// ── 过滤镜像（用户自己的 + 公共镜像） ───────────────────────────────────
 	var filteredImages []json.RawMessage
-	for _, rawItem := range raw.Images {
+	for _, rawItem := range imageItems {
 		var img struct {
 			ID string `json:"Id"`
 		}
@@ -448,7 +477,7 @@ func FilterSystemDFResponse(body []byte, realUID int, privileged bool, db Owners
 	// docker volume ls 通过前缀仍可见该卷；此处同步该逻辑以保证计数一致。
 	volPrefix := UserVolumePrefix(realUID)
 	var filteredVolumes []json.RawMessage
-	for _, rawItem := range raw.Volumes {
+	for _, rawItem := range volumeItems {
 		var v struct {
 			Name string `json:"Name"`
 		}
@@ -473,21 +502,37 @@ func FilterSystemDFResponse(body []byte, realUID int, privileged bool, db Owners
 		filteredVolumes = []json.RawMessage{}
 	}
 
-	// BuildCache 不做用户级过滤（纯构建缓存层，无法准确归属）
-	buildCache := raw.BuildCache
+	// ── 重建 *Usage 汇总字段 ─────────────────────────────────────────────────
+	// rebuildUsageField 在 orig==nil 时返回 nil（omitempty 省略），
+	// 在 orig 非空时用过滤结果重建 TotalCount/Items 等字段。
+	imageUsage, _ := rebuildUsageField(imageUsageRaw, filteredImages, "image")
+	containerUsage, _ := rebuildUsageField(containerUsageRaw, filteredContainers, "container")
+	volumeUsage, _ := rebuildUsageField(volumeUsageRaw, filteredVolumes, "volume")
+
+	// ── 输出：按照 daemon 使用的格式回写 ────────────────────────────────────
+	if isVerboseFormat {
+		// Docker 29.x verbose：只输出 *Usage 字段，BuildCacheUsage 原样透传
+		out := map[string]json.RawMessage{}
+		if imageUsage != nil {
+			out["ImageUsage"] = imageUsage
+		}
+		if containerUsage != nil {
+			out["ContainerUsage"] = containerUsage
+		}
+		if volumeUsage != nil {
+			out["VolumeUsage"] = volumeUsage
+		}
+		if buildCacheUsageRaw != nil {
+			out["BuildCacheUsage"] = buildCacheUsageRaw
+		}
+		return json.Marshal(out)
+	}
+
+	// 非 verbose / 旧版 Docker：输出顶层数组 + *Usage 字段
+	buildCache := buildCacheArr
 	if buildCache == nil {
 		buildCache = []json.RawMessage{}
 	}
-
-	// ── 重建 Docker 29.x *Usage 汇总字段 ────────────────────────────────────
-	// 仅当 daemon 原始响应中存在该字段时才重建（rebuildUsageField 在 orig==nil 时返回 nil）：
-	//   非 verbose：daemon 返回 *Usage，代理用过滤结果重建 TotalCount/Items（CLI 读此显示数量）。
-	//   verbose=1 ：daemon 不返回 *Usage，返回 nil（omitempty 省略），CLI 读顶层数组渲染详情。
-	//   旧版 Docker：同 verbose，不返回 *Usage，同样 omitempty 省略。
-	imageUsage, _ := rebuildUsageField(raw.ImageUsage, filteredImages, "image")
-	containerUsage, _ := rebuildUsageField(raw.ContainerUsage, filteredContainers, "container")
-	volumeUsage, _ := rebuildUsageField(raw.VolumeUsage, filteredVolumes, "volume")
-
 	out := struct {
 		LayersSize     int64             `json:"LayersSize"`
 		Images         []json.RawMessage `json:"Images"`
