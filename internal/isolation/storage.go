@@ -238,29 +238,47 @@ func (m *StorageManager) runCleanup(
 	volumesRemoved := 0
 	dirsRemoved := 0
 
-	// ── 1. 清理孤立 Docker Volume（有用户前缀且无容器在用） ────────────────
-	volumes, err := m.listDanglingVolumes(ctx)
+	// ── 1. 清理孤立 Docker Volume（有用户前缀 且 DB 中无归属记录） ──────────
+	//
+	// 安全顺序：先取 DB 归属快照，再取 Docker dangling 列表。
+	// 任何在快照时刻之前已写入 DB 的 volume 都受保护。
+	// DB 查询失败时采用保守策略：放弃本次 volume 清理，不删任何 volume。
+	ownedVols, err := db.GetAllVolumeNames()
 	if err != nil {
-		logger.Warn("storage_cleanup_list_volumes_failed", zap.Error(err))
+		logger.Warn("storage_cleanup_skip_volumes_db_unavailable", zap.Error(err))
 	} else {
-		for _, v := range volumes {
-			// 只处理符合用户 volume 命名规范的 volume：user-{digits}-volume-*
-			if !isUserVolumePrefix(v.Name) {
-				continue
-			}
-			if err := m.removeVolume(ctx, v.Name); err != nil {
-				logger.Warn("storage_cleanup_volume_remove_failed",
-					zap.String("volume", v.Name),
-					zap.Error(err))
-				continue
-			}
-			_ = db.DeleteVolume(v.Name)
-			volumesRemoved++
-			logger.Info("storage_cleanup_volume_removed", zap.String("volume", v.Name))
-			if auditLog != nil {
-				auditLog.Log("system", 0, "system",
-					"volume_cleanup", "/volumes/"+v.Name, "allow",
-					"orphaned_volume_removed", v.Name, http.StatusNoContent)
+		ownedSet := make(map[string]struct{}, len(ownedVols))
+		for _, n := range ownedVols {
+			ownedSet[n] = struct{}{}
+		}
+
+		volumes, err := m.listDanglingVolumes(ctx)
+		if err != nil {
+			logger.Warn("storage_cleanup_list_volumes_failed", zap.Error(err))
+		} else {
+			for _, v := range volumes {
+				// 只处理符合用户 volume 命名规范的 volume：user-{digits}-volume-*
+				if !isUserVolumePrefix(v.Name) {
+					continue
+				}
+				// 跳过 DB 中有归属记录的 volume（用户显式创建，未挂载 ≠ 孤立）
+				if _, owned := ownedSet[v.Name]; owned {
+					continue
+				}
+				if err := m.removeVolume(ctx, v.Name); err != nil {
+					logger.Warn("storage_cleanup_volume_remove_failed",
+						zap.String("volume", v.Name),
+						zap.Error(err))
+					continue
+				}
+				_ = db.DeleteVolume(v.Name)
+				volumesRemoved++
+				logger.Info("storage_cleanup_orphan_volume_removed", zap.String("volume", v.Name))
+				if auditLog != nil {
+					auditLog.Log("system", 0, "system",
+						"volume_cleanup", "/volumes/"+v.Name, "allow",
+						"orphaned_volume_removed", v.Name, http.StatusNoContent)
+				}
 			}
 		}
 	}

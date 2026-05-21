@@ -799,6 +799,26 @@ func (o *OwnershipDB) DeleteVolume(name string) error {
 	return err
 }
 
+// GetAllVolumeNames 返回 DB 中所有已注册的 volume 内部名称。
+// 供清理协程一次性批量获取归属快照，避免逐 volume 查询（N+1 问题）。
+// 调用方应在查询失败时放弃本次清理（保守策略），而非继续删除。
+func (o *OwnershipDB) GetAllVolumeNames() ([]string, error) {
+	rows, err := o.DB.Query(`SELECT name FROM volumes`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	return names, rows.Err()
+}
+
 // GetVolumeNamesByOwner 返回用户拥有的所有 Volume 名称
 func (o *OwnershipDB) GetVolumeNamesByOwner(uid int) ([]string, error) {
 	rows, err := o.DB.Query(`SELECT name FROM volumes WHERE owner_uid = ?`, uid)
