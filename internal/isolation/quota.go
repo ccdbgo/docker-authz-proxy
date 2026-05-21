@@ -26,10 +26,10 @@ var builtinAllowedDevices = []string{
 
 // QuotaConfig quota.yaml 顶层结构
 type QuotaConfig struct {
-	Version  int                   `yaml:"version"`
-	Defaults QuotaEntry            `yaml:"defaults"`
-	Users    map[string]QuotaEntry `yaml:"users"`
-	Groups   map[string]QuotaEntry `yaml:"groups"`
+	Version  int                         `yaml:"version"`
+	Defaults QuotaEntry                  `yaml:"defaults"`
+	Users    map[string]quotaEntryRaw    `yaml:"users"`
+	Groups   map[string]quotaEntryRaw    `yaml:"groups"`
 }
 
 // QuotaEntry 单条配额（0 表示不限制）
@@ -40,6 +40,60 @@ type QuotaEntry struct {
 	MaxContainers  int      `yaml:"max_containers"`  // 用户最多同时存在的容器数（含已停止）
 	TmpfsSizeMB    int      `yaml:"tmpfs_size_mb"`   // 单个 tmpfs 挂载最大内存（MB），0 不限制，默认 512
 	AllowedDevices []string `yaml:"allowed_devices"` // 允许挂载的设备 glob 模式列表（追加到内置白名单）
+}
+
+// quotaEntryRaw YAML 解析专用：指针字段区分"未填写（nil，继承上级配额）"与"显式 0（不限制）"。
+// 直接使用 QuotaEntry 时，Go YAML 会把缺省字段解析为零值，导致 0 覆盖上级配置的非零值。
+type quotaEntryRaw struct {
+	CPUCores       *float64 `yaml:"cpu_cores"`
+	MemMB          *int     `yaml:"mem_mb"`
+	StorageGB      *int     `yaml:"storage_gb"`
+	MaxContainers  *int     `yaml:"max_containers"`
+	TmpfsSizeMB    *int     `yaml:"tmpfs_size_mb"`
+	AllowedDevices []string `yaml:"allowed_devices"`
+}
+
+func derefFloat64(p *float64, fallback float64) float64 {
+	if p == nil {
+		return fallback
+	}
+	return *p
+}
+
+func derefInt(p *int, fallback int) int {
+	if p == nil {
+		return fallback
+	}
+	return *p
+}
+
+// rawToEntry 将 quotaEntryRaw 转为 QuotaEntry（nil 指针回退为 0）
+func rawToEntry(r quotaEntryRaw) QuotaEntry {
+	return QuotaEntry{
+		CPUCores:       derefFloat64(r.CPUCores, 0),
+		MemMB:          derefInt(r.MemMB, 0),
+		StorageGB:      derefInt(r.StorageGB, 0),
+		MaxContainers:  derefInt(r.MaxContainers, 0),
+		TmpfsSizeMB:    derefInt(r.TmpfsSizeMB, 0),
+		AllowedDevices: r.AllowedDevices,
+	}
+}
+
+// entryToRaw 将 QuotaEntry 转为 quotaEntryRaw（每字段独立堆分配，避免悬空指针）
+func entryToRaw(e QuotaEntry) quotaEntryRaw {
+	cpu := e.CPUCores
+	mem := e.MemMB
+	stor := e.StorageGB
+	mc := e.MaxContainers
+	tmp := e.TmpfsSizeMB
+	return quotaEntryRaw{
+		CPUCores:       &cpu,
+		MemMB:          &mem,
+		StorageGB:      &stor,
+		MaxContainers:  &mc,
+		TmpfsSizeMB:    &tmp,
+		AllowedDevices: e.AllowedDevices,
+	}
 }
 
 // UserQuota 运行期单用户有效配额（0 表示不限制）
@@ -143,8 +197,8 @@ func effectiveCPUNanos(req *containerCreateRequest) int64 {
 type QuotaManager struct {
 	mu       sync.RWMutex
 	defaults QuotaEntry
-	users    map[string]QuotaEntry // key: username
-	groups   map[string]QuotaEntry // key: groupname
+	users    map[string]quotaEntryRaw // key: username
+	groups   map[string]quotaEntryRaw // key: groupname
 }
 
 func LoadQuotaManager(path string) (*QuotaManager, error) {
@@ -158,8 +212,8 @@ func LoadQuotaManager(path string) (*QuotaManager, error) {
 	}
 	m := &QuotaManager{
 		defaults: cfg.Defaults,
-		users:    make(map[string]QuotaEntry),
-		groups:   make(map[string]QuotaEntry),
+		users:    make(map[string]quotaEntryRaw),
+		groups:   make(map[string]quotaEntryRaw),
 	}
 	for k, v := range cfg.Users {
 		m.users[k] = v
@@ -173,8 +227,8 @@ func LoadQuotaManager(path string) (*QuotaManager, error) {
 // DefaultQuotaManager 无配额文件时的兜底（全部不限制）
 func DefaultQuotaManager() *QuotaManager {
 	return &QuotaManager{
-		users:  make(map[string]QuotaEntry),
-		groups: make(map[string]QuotaEntry),
+		users:  make(map[string]quotaEntryRaw),
+		groups: make(map[string]quotaEntryRaw),
 	}
 }
 
@@ -193,20 +247,20 @@ func (m *QuotaManager) GetQuota(identity *auth.CallerIdentity) UserQuota {
 			continue
 		}
 		if ge, ok := m.groups[groupName]; ok {
-			if ge.CPUCores == 0 || ge.CPUCores > q.CPUCores {
-				q.CPUCores = ge.CPUCores
+			if ge.CPUCores != nil && (*ge.CPUCores == 0 || *ge.CPUCores > q.CPUCores) {
+				q.CPUCores = *ge.CPUCores
 			}
-			if ge.MemMB == 0 || ge.MemMB > q.MemMB {
-				q.MemMB = ge.MemMB
+			if ge.MemMB != nil && (*ge.MemMB == 0 || *ge.MemMB > q.MemMB) {
+				q.MemMB = *ge.MemMB
 			}
-			if ge.StorageGB == 0 || ge.StorageGB > q.StorageGB {
-				q.StorageGB = ge.StorageGB
+			if ge.StorageGB != nil && (*ge.StorageGB == 0 || *ge.StorageGB > q.StorageGB) {
+				q.StorageGB = *ge.StorageGB
 			}
-			if ge.MaxContainers == 0 || ge.MaxContainers > q.MaxContainers {
-				q.MaxContainers = ge.MaxContainers
+			if ge.MaxContainers != nil && (*ge.MaxContainers == 0 || *ge.MaxContainers > q.MaxContainers) {
+				q.MaxContainers = *ge.MaxContainers
 			}
-			if ge.TmpfsSizeMB == 0 || ge.TmpfsSizeMB > q.TmpfsSizeMB {
-				q.TmpfsSizeMB = ge.TmpfsSizeMB
+			if ge.TmpfsSizeMB != nil && (*ge.TmpfsSizeMB == 0 || *ge.TmpfsSizeMB > q.TmpfsSizeMB) {
+				q.TmpfsSizeMB = *ge.TmpfsSizeMB
 			}
 			if len(ge.AllowedDevices) > 0 {
 				q.AllowedDevices = append(q.AllowedDevices, ge.AllowedDevices...)
@@ -214,13 +268,23 @@ func (m *QuotaManager) GetQuota(identity *auth.CallerIdentity) UserQuota {
 		}
 	}
 
-	// 用户配置（最高优先级，直接覆盖，包括 0=不限制）
+	// 用户配置（最高优先级）：只覆盖 YAML 中显式填写的字段（nil=未填写，继承上级配额）
 	if ue, ok := m.users[identity.RealUsername]; ok {
-		q.CPUCores = ue.CPUCores
-		q.MemMB = ue.MemMB
-		q.StorageGB = ue.StorageGB
-		q.MaxContainers = ue.MaxContainers
-		q.TmpfsSizeMB = ue.TmpfsSizeMB
+		if ue.CPUCores != nil {
+			q.CPUCores = *ue.CPUCores
+		}
+		if ue.MemMB != nil {
+			q.MemMB = *ue.MemMB
+		}
+		if ue.StorageGB != nil {
+			q.StorageGB = *ue.StorageGB
+		}
+		if ue.MaxContainers != nil {
+			q.MaxContainers = *ue.MaxContainers
+		}
+		if ue.TmpfsSizeMB != nil {
+			q.TmpfsSizeMB = *ue.TmpfsSizeMB
+		}
 		if len(ue.AllowedDevices) > 0 {
 			q.AllowedDevices = append(q.AllowedDevices, ue.AllowedDevices...)
 		}
@@ -253,7 +317,7 @@ func (m *QuotaManager) GetQuota(identity *auth.CallerIdentity) UserQuota {
 func (m *QuotaManager) SetUserQuota(username string, entry QuotaEntry) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.users[username] = entry
+	m.users[username] = entryToRaw(entry)
 }
 
 // DeleteUserQuota 删除用户配额（恢复为组/默认配额）
@@ -269,14 +333,17 @@ func (m *QuotaManager) GetUserQuota(username string) (QuotaEntry, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	e, ok := m.users[username]
-	return e, ok
+	if !ok {
+		return QuotaEntry{}, false
+	}
+	return rawToEntry(e), true
 }
 
 // SetGroupQuota 动态设置组配额
 func (m *QuotaManager) SetGroupQuota(groupname string, entry QuotaEntry) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.groups[groupname] = entry
+	m.groups[groupname] = entryToRaw(entry)
 }
 
 // DeleteGroupQuota 删除组配额
@@ -328,18 +395,20 @@ func (m *QuotaManager) Reload(path string) error {
 			cfg.Defaults.CPUCores, cfg.Defaults.MemMB, cfg.Defaults.StorageGB)
 	}
 	for name, e := range cfg.Users {
-		if e.CPUCores < 0 || e.MemMB < 0 || e.StorageGB < 0 {
+		if (e.CPUCores != nil && *e.CPUCores < 0) ||
+			(e.MemMB != nil && *e.MemMB < 0) ||
+			(e.StorageGB != nil && *e.StorageGB < 0) {
 			return fmt.Errorf("quota reload: user %q has negative value: cpu=%.2f mem=%d storage=%d",
-				name, e.CPUCores, e.MemMB, e.StorageGB)
+				name, derefFloat64(e.CPUCores, 0), derefInt(e.MemMB, 0), derefInt(e.StorageGB, 0))
 		}
 	}
 
 	// 锁外预分配，避免在持锁区间触发内存分配
-	newUsers := make(map[string]QuotaEntry, len(cfg.Users))
+	newUsers := make(map[string]quotaEntryRaw, len(cfg.Users))
 	for k, v := range cfg.Users {
 		newUsers[k] = v
 	}
-	newGroups := make(map[string]QuotaEntry, len(cfg.Groups))
+	newGroups := make(map[string]quotaEntryRaw, len(cfg.Groups))
 	for k, v := range cfg.Groups {
 		newGroups[k] = v
 	}
