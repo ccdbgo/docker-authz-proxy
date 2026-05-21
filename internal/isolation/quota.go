@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"runtime"
 	"sync"
 
 	"docker-authz-proxy/internal/auth"
@@ -299,6 +300,59 @@ func (m *QuotaManager) GetDefaultQuota() QuotaEntry {
 	return m.defaults
 }
 
+// Reload 热重载配额配置文件，原地替换内部状态。
+// 两阶段策略：I/O 与解析在锁外完成，持锁期间仅做内存交换（μs 级），
+// 不阻塞并发 GetQuota 调用。
+// defaults/users/groups 三字段在同一把写锁内原子替换，GetQuota 不会读到新旧混合状态。
+// 若文件读取或解析失败，原配置完整保留，不产生部分更新。
+// 注意：Reload 会覆盖运行时通过 SetUserQuota/SetGroupQuota 设置的临时配额，
+// 行为与重启一致（见 SetUserQuota 注释）。
+func (m *QuotaManager) Reload(path string) error {
+	if path == "" {
+		return fmt.Errorf("quota reload: file path is empty")
+	}
+
+	// 阶段一：锁外完成 I/O 与解析
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var cfg QuotaConfig
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return fmt.Errorf("parse quota.yaml: %w", err)
+	}
+
+	// 值域校验：防止手误负数静默关闭配额
+	if cfg.Defaults.CPUCores < 0 || cfg.Defaults.MemMB < 0 || cfg.Defaults.StorageGB < 0 {
+		return fmt.Errorf("quota reload: defaults contains negative value: cpu=%.2f mem=%d storage=%d",
+			cfg.Defaults.CPUCores, cfg.Defaults.MemMB, cfg.Defaults.StorageGB)
+	}
+	for name, e := range cfg.Users {
+		if e.CPUCores < 0 || e.MemMB < 0 || e.StorageGB < 0 {
+			return fmt.Errorf("quota reload: user %q has negative value: cpu=%.2f mem=%d storage=%d",
+				name, e.CPUCores, e.MemMB, e.StorageGB)
+		}
+	}
+
+	// 锁外预分配，避免在持锁区间触发内存分配
+	newUsers := make(map[string]QuotaEntry, len(cfg.Users))
+	for k, v := range cfg.Users {
+		newUsers[k] = v
+	}
+	newGroups := make(map[string]QuotaEntry, len(cfg.Groups))
+	for k, v := range cfg.Groups {
+		newGroups[k] = v
+	}
+
+	// 阶段二：持写锁，三字段原子替换
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.defaults = cfg.Defaults
+	m.users = newUsers
+	m.groups = newGroups
+	return nil
+}
+
 // ── 配额校验 ──────────────────────────────────────────────────
 
 // ContainerCounter 供 CheckQuotaPreCreate 查询用户当前容器数
@@ -405,6 +459,27 @@ func CheckAndInjectQuota(body []byte, quota UserQuota, uid int, db ContainerCoun
 			result.DeniedRequested = fmt.Sprintf("%.2f cores", float64(reqNano)/1e9)
 			result.DeniedLimit = fmt.Sprintf("%.2f cores", quota.CPUCores)
 			result.DeniedExcess = fmt.Sprintf("+%.2f cores", float64(reqNano-limitNano)/1e9)
+			return body, result, &QuotaExceededError{
+				Resource:  "cpu",
+				Requested: result.DeniedRequested,
+				Limit:     result.DeniedLimit,
+				Excess:    result.DeniedExcess,
+			}
+		}
+	}
+
+	// 3b. 物理核数检查：CpuQuota/CpuPeriod 透传时 Docker Daemon 不做等价换算校验，
+	//     代理必须主动拦截，防止绕过宿主机物理 CPU 上限。
+	//     条件：仅当请求使用 CpuQuota/CpuPeriod（而非 NanoCpus）时才检查，
+	//     因为 NanoCpus 路径已由 Daemon 自身校验物理核数。
+	if req.HostConfig.NanoCPUs == 0 && req.HostConfig.CpuQuota > 0 && reqNano > 0 {
+		physNano := int64(runtime.NumCPU()) * 1e9
+		if reqNano > physNano {
+			result.Allowed = false
+			result.DeniedResource = "cpu"
+			result.DeniedRequested = fmt.Sprintf("%.2f cores", float64(reqNano)/1e9)
+			result.DeniedLimit = fmt.Sprintf("%d cores (physical)", runtime.NumCPU())
+			result.DeniedExcess = fmt.Sprintf("+%.2f cores", float64(reqNano-physNano)/1e9)
 			return body, result, &QuotaExceededError{
 				Resource:  "cpu",
 				Requested: result.DeniedRequested,
