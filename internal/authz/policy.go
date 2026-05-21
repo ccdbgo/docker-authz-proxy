@@ -612,10 +612,9 @@ func pathMatchesN(path, prefix, suffix string) bool {
 	if slashIdx < 0 {
 		return false
 	}
-	// 要求 prefix 之后恰好是 <ID单段> + suffix，不允许额外路径段。
-	// 注：容器/exec/volume 的 ID 均为不含斜杠的十六进制串；镜像名若含斜杠
-	// （如 registry.io/user/image）在 Docker HTTP API 路径中以字面斜杠出现，
-	// 但该场景由 ClassifyAction 中更精确的 pathHasPrefix+HasSuffix 兜底处理。
+	// 严格单段匹配：prefix 之后仅允许不含斜杠的 ID + suffix。
+	// 多段镜像名（如 registry.io/user/nginx）的端点当前返回 ActionOther，
+	// 不受 pathMatchesN 处理，调用方需知晓此限制。
 	tail := rest[slashIdx:]
 	return strings.TrimRight(tail, "/") == strings.TrimRight(suffix, "/")
 }
