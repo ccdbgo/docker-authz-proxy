@@ -612,21 +612,12 @@ func pathMatchesN(path, prefix, suffix string) bool {
 	if slashIdx < 0 {
 		return false
 	}
-	// 快速路径：镜像名不含斜杠（如 /images/alpine/push）
+	// 要求 prefix 之后恰好是 <ID单段> + suffix，不允许额外路径段。
+	// 注：容器/exec/volume 的 ID 均为不含斜杠的十六进制串；镜像名若含斜杠
+	// （如 registry.io/user/image）在 Docker HTTP API 路径中以字面斜杠出现，
+	// 但该场景由 ClassifyAction 中更精确的 pathHasPrefix+HasSuffix 兜底处理。
 	tail := rest[slashIdx:]
-	if strings.TrimRight(tail, "/") == strings.TrimRight(suffix, "/") {
-		return true
-	}
-	// 镜像名含斜杠（如 /images/docker.io/library/alpine/push）：
-	// 检查 path 在 prefix 之后是否以 /{id...}{suffix} 结尾，且 suffix 是最后一段。
-	suffixClean := "/" + strings.Trim(suffix, "/")
-	pathClean := strings.TrimRight(path, "/")
-	if !strings.HasSuffix(pathClean, suffixClean) {
-		return false
-	}
-	// 确保 suffix 之前还有内容（即 ID 段非空）
-	before := pathClean[:len(pathClean)-len(suffixClean)]
-	return strings.HasPrefix(before+"/", prefix)
+	return strings.TrimRight(tail, "/") == strings.TrimRight(suffix, "/")
 }
 
 func pathHasPrefix(path, prefix string) bool {

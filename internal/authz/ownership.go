@@ -517,6 +517,7 @@ func (o *OwnershipDB) RemoveUserImageAccess(imageID string, uid int) (shouldDele
 
 // GetImageRefCount 返回当前引用该镜像的用户数（image_access 行数）
 func (o *OwnershipDB) GetImageRefCount(imageID string) (int, error) {
+	imageID = normalizeImageID(imageID)
 	var count int
 	err := o.DB.QueryRow(`SELECT COUNT(*) FROM image_access WHERE image_id = ?`, imageID).Scan(&count)
 	return count, err
@@ -524,6 +525,7 @@ func (o *OwnershipDB) GetImageRefCount(imageID string) (int, error) {
 
 // GetImageRefUsers 返回所有引用该镜像的用户 UID 列表（用于错误提示）
 func (o *OwnershipDB) GetImageRefUsers(imageID string) ([]int, error) {
+	imageID = normalizeImageID(imageID)
 	rows, err := o.DB.Query(`SELECT user_uid FROM image_access WHERE image_id = ?`, imageID)
 	if err != nil {
 		return nil, err
