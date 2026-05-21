@@ -251,12 +251,19 @@ func main() {
 
 	// 启动配置文件监控（定期检查文件修改时间）
 	var lastModTime time.Time
+	var lastQuotaModTime time.Time
 	if stat, err := os.Stat(*policyFile); err == nil {
 		lastModTime = stat.ModTime()
 		logger.Info("watching configuration file for changes",
 			zap.String("policy_file", *policyFile),
 			zap.Time("last_modified", lastModTime))
-
+	}
+	if *quotaFile != "" {
+		if stat, err := os.Stat(*quotaFile); err == nil {
+			lastQuotaModTime = stat.ModTime()
+		}
+	}
+	if _, err := os.Stat(*policyFile); err == nil {
 		go func() {
 			ticker := time.NewTicker(2 * time.Second)
 			defer ticker.Stop()
@@ -286,6 +293,22 @@ func main() {
 
 					proxy.UpdatePolicy(newPolicy)
 					logPolicyLoadResult(logger, *policyFile, newPolicy)
+				}
+
+				// 与 policy 同频监视 quota 文件变化
+				if *quotaFile != "" {
+					qStat, err := os.Stat(*quotaFile)
+					if err == nil && qStat.ModTime().After(lastQuotaModTime) {
+						lastQuotaModTime = qStat.ModTime()
+						if err := quota.Reload(*quotaFile); err != nil {
+							logger.Error("reload quota failed, keeping old quota",
+								zap.String("quota_file", *quotaFile),
+								zap.Error(err))
+						} else {
+							logger.Info("quota config reloaded",
+								zap.String("quota_file", *quotaFile))
+						}
+					}
 				}
 			}
 		}()
@@ -332,7 +355,7 @@ func main() {
 			}
 
 		case syscall.SIGHUP:
-			logger.Info("received SIGHUP, reloading policy configuration",
+			logger.Info("received SIGHUP, reloading configurations",
 				zap.String("policy_file", *policyFile))
 
 			newPolicy, err := authz.LoadPolicy(*policyFile)
@@ -345,6 +368,20 @@ func main() {
 
 			proxy.UpdatePolicy(newPolicy)
 			logPolicyLoadResult(logger, *policyFile, newPolicy)
+
+			// SIGHUP 同步重载 quota（不更新 lastQuotaModTime——该变量只属于
+			// ticker goroutine，跨 goroutine 写会引入 data race；
+			// ticker 若随后检测到 modtime 变化会再 reload 一次，幂等无害）
+			if *quotaFile != "" {
+				if err := quota.Reload(*quotaFile); err != nil {
+					logger.Error("reload quota failed, keeping old quota",
+						zap.String("quota_file", *quotaFile),
+						zap.Error(err))
+				} else {
+					logger.Info("quota config reloaded",
+						zap.String("quota_file", *quotaFile))
+				}
+			}
 
 		case syscall.SIGINT, syscall.SIGTERM:
 			logger.Info("shutting down", zap.String("signal", sig.String()))

@@ -88,16 +88,13 @@ users:
     mem_mb: 1024
 `
 
-// ── 1. Red Test：复现 Bug ────────────────────────────────────────────────────
+// ── 1. Reload 核心回归：文件变更后调用 Reload，GetQuota 必须返回新值 ─────────
 //
-// 触发路径：
-//   1. 代理启动，从 quota.yaml 加载 QuotaManager（alice.cpu_cores=1.0）
-//   2. 管理员编辑 quota.yaml，将 alice.cpu_cores 改为 4.0
-//   3. 管理员发送 SIGHUP 或等待文件监视器触发（期望热重载生效）
-//   4. 实际行为：SIGHUP 只重载 policy，quota.yaml 变更被完全忽略
-//   5. GetQuota(alice).CPUCores 仍返回 1.0
-//
-// 此测试在 Bug 修复前必须 FAIL（断言 4.0 但实际得到 1.0）。
+// 修复验证：
+//   1. 代理启动，加载 QuotaManager（alice.cpu_cores=1.0）
+//   2. 管理员编辑 quota.yaml → alice.cpu_cores=4.0
+//   3. 触发热重载（ticker/SIGHUP 调用 quota.Reload）
+//   4. GetQuota(alice).CPUCores 应返回 4.0
 func TestBug_AliceCPUQuota_FileEditNotReloaded_Red(t *testing.T) {
 	path := writeTempQuotaYAML(t, yamlAlice1)
 
@@ -118,41 +115,26 @@ func TestBug_AliceCPUQuota_FileEditNotReloaded_Red(t *testing.T) {
 	// 步骤 2：管理员编辑 quota.yaml → alice.cpu_cores = 4.0
 	overwriteQuotaYAML(t, path, yamlAlice4)
 
-	// 步骤 3：模拟 SIGHUP 热重载（当前实现仅重载 policy，quota 不被刷新）
-	// 正确的修复路径：
-	//   newQM, _ := LoadQuotaManager(path)
-	//   proxy.UpdateQuota(newQM)   ← 此方法目前不存在
-	// 当前 proxyQM 没有被重载，故意不做任何操作来还原 Bug 现场。
+	// 步骤 3：ticker/SIGHUP 触发热重载（调用 Reload，原地替换内部状态）
+	if err := proxyQM.Reload(path); err != nil {
+		t.Fatalf("Reload failed: %v", err)
+	}
 
 	// 步骤 4：查询配额
 	got := proxyQM.GetQuota(alice)
 
-	// ── 断言：配额变更后应生效，GetQuota 应返回 4.0 ──────────────────────────
-	// Bug 修复前此断言 FAIL（got=1.0）——稳定复现"限制仍为 1.0"。
+	// ── 断言：Reload 后 GetQuota 必须返回新值 4.0 ────────────────────────────
 	if got.CPUCores != 4.0 {
 		t.Errorf(
-			"BUG REPRODUCED: GetQuota().CPUCores = %.2f, want 4.0\n"+
-				"\n"+
-				"  触发条件: 编辑 quota.yaml alice.cpu_cores 1.0 → 4.0\n"+
-				"  预期行为: GetQuota 返回 4.0（用户专属条目已更新）\n"+
-				"  实际行为: GetQuota 返回 %.2f（内存中的 QuotaManager 未重载）\n"+
-				"\n"+
-				"  根本原因:\n"+
-				"    main.go SIGHUP handler 只调用 proxy.UpdatePolicy(newPolicy)，\n"+
-				"    没有对应的 proxy.UpdateQuota(newQM) 调用；\n"+
-				"    文件监视 ticker 同样只监视 *policyFile，忽略 *quotaFile 变化。\n"+
-				"\n"+
-				"  修复方案:\n"+
-				"    1. QuotaManager 增加 Reload(path string) error 方法\n"+
-				"    2. ProxyServer 增加 UpdateQuota(m *QuotaManager) 方法\n"+
-				"    3. main.go SIGHUP + ticker 补充 quota 重载逻辑",
-			got.CPUCores, got.CPUCores,
+			"after Reload: GetQuota().CPUCores = %.2f, want 4.0\n"+
+				"  Reload did not update alice's user-specific entry",
+			got.CPUCores,
 		)
 	}
 
-	// 额外断言：默认值 2.0 不应"漏出"（即使 user entry 失效也不应退回到 default）
+	// 默认值 2.0 不应干扰（用户专属条目优先）
 	if got.CPUCores == 2.0 {
-		t.Errorf("default quota 2.0 leaked out; user-specific entry should have priority")
+		t.Errorf("default quota 2.0 leaked out after Reload; user entry should take priority")
 	}
 }
 
