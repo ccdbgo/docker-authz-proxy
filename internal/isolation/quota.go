@@ -537,6 +537,126 @@ func CheckAndInjectQuota(body []byte, quota UserQuota, uid int, db ContainerCoun
 	return injected, result, nil
 }
 
+// containerUpdateRequest 对应 Docker Engine API POST /containers/{id}/update 的请求体
+// 资源字段位于顶层（不嵌套在 HostConfig 下），只提取与配额相关的参数
+type containerUpdateRequest struct {
+	NanoCpus  int64 `json:"NanoCpus"`
+	CpuQuota  int64 `json:"CpuQuota"`
+	CpuPeriod int64 `json:"CpuPeriod"`
+	Memory    int64 `json:"Memory"`
+}
+
+// effectiveUpdateCPUNanos 将 container update 请求中各种 CPU 参数换算为 NanoCPUs
+// 优先级：NanoCpus > CpuQuota/CpuPeriod > 0（未指定）
+func effectiveUpdateCPUNanos(req *containerUpdateRequest) int64 {
+	if req.NanoCpus > 0 {
+		return req.NanoCpus
+	}
+	if req.CpuQuota > 0 {
+		period := req.CpuPeriod
+		if period <= 0 {
+			period = 100000
+		}
+		return req.CpuQuota * 1e9 / period
+	}
+	return 0
+}
+
+// CheckUpdateQuota 校验 container update 请求的 CPU/内存配额。
+//
+// 与 CheckAndInjectQuota 的关键区别：
+//   - 请求体为顶层 flat JSON（无 HostConfig 包裹）
+//   - 只校验，不注入默认值（update 只修改用户显式指定的字段）
+//   - 同时检查用户配额上限和宿主机物理 CPU 上限，防止通过
+//     CpuQuota/CpuPeriod 绕过物理核数限制
+//
+// 返回值：
+//   - *QuotaCheckResult：校验摘要（Allowed=true 表示通过）
+//   - error：*QuotaExceededError 或 nil
+func CheckUpdateQuota(body []byte, quota UserQuota) (*QuotaCheckResult, error) {
+	result := &QuotaCheckResult{
+		QuotaCPUCores: quota.CPUCores,
+		QuotaMemMB:    quota.MemMB,
+		Allowed:       true,
+	}
+
+	if len(body) == 0 {
+		return result, nil
+	}
+
+	var req containerUpdateRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		// 解析失败不阻断
+		return result, nil
+	}
+
+	reqNano := effectiveUpdateCPUNanos(&req)
+	if reqNano > 0 {
+		result.RequestedCPUCores = float64(reqNano) / 1e9
+	}
+	if req.Memory > 0 {
+		result.RequestedMemMB = req.Memory / 1024 / 1024
+	}
+
+	// 1. 用户 CPU 配额检查
+	if quota.CPUCores > 0 && reqNano > 0 {
+		limitNano := int64(quota.CPUCores * 1e9)
+		if reqNano > limitNano {
+			result.Allowed = false
+			result.DeniedResource = "cpu"
+			result.DeniedRequested = fmt.Sprintf("%.2f cores", float64(reqNano)/1e9)
+			result.DeniedLimit = fmt.Sprintf("%.2f cores", quota.CPUCores)
+			result.DeniedExcess = fmt.Sprintf("+%.2f cores", float64(reqNano-limitNano)/1e9)
+			return result, &QuotaExceededError{
+				Resource:  "cpu",
+				Requested: result.DeniedRequested,
+				Limit:     result.DeniedLimit,
+				Excess:    result.DeniedExcess,
+			}
+		}
+	}
+
+	// 2. 物理核数检查：CpuQuota/CpuPeriod 透传时 Docker Daemon 不做等价换算校验，
+	//    代理必须主动拦截，防止绕过宿主机物理 CPU 上限。
+	//    仅对 CpuQuota/CpuPeriod 路径生效（NanoCpus 由 Daemon 自身校验物理核数）。
+	if req.NanoCpus == 0 && req.CpuQuota > 0 && reqNano > 0 {
+		physNano := int64(runtime.NumCPU()) * 1e9
+		if reqNano > physNano {
+			result.Allowed = false
+			result.DeniedResource = "cpu"
+			result.DeniedRequested = fmt.Sprintf("%.2f cores", float64(reqNano)/1e9)
+			result.DeniedLimit = fmt.Sprintf("%d cores (physical)", runtime.NumCPU())
+			result.DeniedExcess = fmt.Sprintf("+%.2f cores", float64(reqNano-physNano)/1e9)
+			return result, &QuotaExceededError{
+				Resource:  "cpu",
+				Requested: result.DeniedRequested,
+				Limit:     result.DeniedLimit,
+				Excess:    result.DeniedExcess,
+			}
+		}
+	}
+
+	// 3. 内存配额检查
+	if quota.MemMB > 0 && req.Memory > 0 {
+		limitBytes := int64(quota.MemMB) * 1024 * 1024
+		if req.Memory > limitBytes {
+			result.Allowed = false
+			result.DeniedResource = "memory"
+			result.DeniedRequested = fmt.Sprintf("%dMB", req.Memory/1024/1024)
+			result.DeniedLimit = fmt.Sprintf("%dMB", quota.MemMB)
+			result.DeniedExcess = fmt.Sprintf("+%dMB", (req.Memory-limitBytes)/1024/1024)
+			return result, &QuotaExceededError{
+				Resource:  "memory",
+				Requested: result.DeniedRequested,
+				Limit:     result.DeniedLimit,
+				Excess:    result.DeniedExcess,
+			}
+		}
+	}
+
+	return result, nil
+}
+
 // injectionResult 注入结果摘要（内部使用）
 type injectionResult struct {
 	cpuCores  float64

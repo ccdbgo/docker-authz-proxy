@@ -1008,64 +1008,30 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 		}
 	}
 
-	// container update 配额校验：防止通过 update 绕过 CPU/内存限制
+	// container update 配额校验：防止通过 update 绕过 CPU/内存限制（含物理核数上限）
 	if action == authz.ActionUpdate && p.quota != nil {
 		quota := p.quota.GetQuota(id)
 		body, _ := io.ReadAll(r.Body)
 		r.Body.Close()
 		r.Body = io.NopCloser(bytes.NewReader(body))
-		var hc struct {
-			NanoCpus  int64 `json:"NanoCpus"`
-			CpuQuota  int64 `json:"CpuQuota"`
-			CpuPeriod int64 `json:"CpuPeriod"`
-			Memory    int64 `json:"Memory"`
-		}
-		_ = json.Unmarshal(body, &hc)
-		if quota.CPUCores > 0 {
-			reqNano := hc.NanoCpus
-			if reqNano == 0 && hc.CpuQuota > 0 {
-				period := hc.CpuPeriod
-				if period <= 0 {
-					period = 100000
-				}
-				reqNano = hc.CpuQuota * 1e9 / period
-			}
-			if reqNano > 0 {
-				limitNano := int64(quota.CPUCores * 1e9)
-				if reqNano > limitNano {
-					auditID := toAuditIdentity(id)
-					p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "quota_exceeded",
-						fmt.Sprintf("cpu requested=%.2f limit=%.2f", float64(reqNano)/1e9, quota.CPUCores), http.StatusForbidden))
-					p.logger.Warn("quota_exceeded_update",
-						append(audit.LogIdentityFields(auditID),
-							zap.String("resource", "cpu"),
-							zap.Float64("requested_cores", float64(reqNano)/1e9),
-							zap.Float64("limit_cores", quota.CPUCores),
-						)...)
-					writeDockerError(w, http.StatusForbidden, fmt.Sprintf(
-						"quota exceeded: cpu requested=%.2f cores limit=%.2f cores excess=+%.2f cores",
-						float64(reqNano)/1e9, quota.CPUCores, float64(reqNano-limitNano)/1e9))
-					return r, false
-				}
-			}
-		}
-		if quota.MemMB > 0 && hc.Memory > 0 {
-			limitBytes := int64(quota.MemMB) * 1024 * 1024
-			if hc.Memory > limitBytes {
-				auditID := toAuditIdentity(id)
-				p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "quota_exceeded",
-					fmt.Sprintf("memory requested=%dMB limit=%dMB", hc.Memory/1024/1024, quota.MemMB), http.StatusForbidden))
-				p.logger.Warn("quota_exceeded_update",
-					append(audit.LogIdentityFields(auditID),
-						zap.String("resource", "memory"),
-						zap.Int64("requested_mb", hc.Memory/1024/1024),
-						zap.Int("limit_mb", quota.MemMB),
-					)...)
-				writeDockerError(w, http.StatusForbidden, fmt.Sprintf(
-					"quota exceeded: memory requested=%dMB limit=%dMB excess=+%dMB",
-					hc.Memory/1024/1024, quota.MemMB, hc.Memory/1024/1024-int64(quota.MemMB)))
-				return r, false
-			}
+
+		qr, qErr := isolation.CheckUpdateQuota(body, quota)
+		if qErr != nil {
+			auditID := toAuditIdentity(id)
+			p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "quota_exceeded",
+				fmt.Sprintf("%s requested=%s limit=%s", qr.DeniedResource, qr.DeniedRequested, qr.DeniedLimit),
+				http.StatusForbidden))
+			p.logger.Warn("quota_exceeded_update",
+				append(audit.LogIdentityFields(auditID),
+					zap.String("resource", qr.DeniedResource),
+					zap.String("requested", qr.DeniedRequested),
+					zap.String("limit", qr.DeniedLimit),
+					zap.String("excess", qr.DeniedExcess),
+				)...)
+			writeDockerError(w, http.StatusForbidden, fmt.Sprintf(
+				"quota exceeded: %s requested=%s limit=%s excess=%s",
+				qr.DeniedResource, qr.DeniedRequested, qr.DeniedLimit, qr.DeniedExcess))
+			return r, false
 		}
 	}
 
