@@ -385,17 +385,6 @@ func FilterSystemDFResponse(body []byte, realUID int, privileged bool, db Owners
 	}
 
 	// ── 过滤镜像（用户自己的 + 公共镜像） ───────────────────────────────────
-	for _, rawItem := range raw.Images {
-		var img struct {
-			ID string `json:"Id"`
-		}
-		if json.Unmarshal(rawItem, &img) != nil {
-			continue
-		}
-		if db.CanSeeImage(realUID, img.ID) {
-			// filteredImages 已在循环体内收集，提到外层
-		}
-	}
 	var filteredImages []json.RawMessage
 	for _, rawItem := range raw.Images {
 		var img struct {
@@ -421,6 +410,10 @@ func FilterSystemDFResponse(body []byte, realUID int, privileged bool, db Owners
 	for _, name := range ownedVolNames {
 		ownedVols[name] = true
 	}
+	// 前缀兜底：与 FilterVolumeListResponse 保持一致。
+	// 当 volume 带有用户前缀但未入 DB（如 DB 重置/历史遗留）时，
+	// docker volume ls 通过前缀仍可见该卷；此处同步该逻辑以保证计数一致。
+	volPrefix := UserVolumePrefix(realUID)
 	var filteredVolumes []json.RawMessage
 	for _, rawItem := range raw.Volumes {
 		var v struct {
@@ -429,7 +422,17 @@ func FilterSystemDFResponse(body []byte, realUID int, privileged bool, db Owners
 		if json.Unmarshal(rawItem, &v) != nil {
 			continue
 		}
-		if ownedVols[v.Name] {
+		if ownedVols[v.Name] || strings.HasPrefix(v.Name, volPrefix) {
+			// 向用户展示时剥离内部前缀，与 docker volume ls 的显示保持一致
+			if strings.HasPrefix(v.Name, volPrefix) {
+				var item map[string]json.RawMessage
+				if json.Unmarshal(rawItem, &item) == nil {
+					item["Name"], _ = json.Marshal(strings.TrimPrefix(v.Name, volPrefix))
+					if rewritten, err := json.Marshal(item); err == nil {
+						rawItem = rewritten
+					}
+				}
+			}
 			filteredVolumes = append(filteredVolumes, rawItem)
 		}
 	}
