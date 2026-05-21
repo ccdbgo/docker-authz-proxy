@@ -294,6 +294,71 @@ func TestFilterImageListResponse_NotInDB(t *testing.T) {
 	}
 }
 
+// TestFilterImageListResponse_PublicImageDedup
+// 同一公共 ImageId 在 daemon 响应中出现多次（对应多个 Tag），
+// FilterImageListResponse 应按 ImageId 去重，每个 ID 只保留第一条，
+// 防止其他用户的私有 Tag 名称通过相同 ImageId 泄露给当前用户。
+func TestFilterImageListResponse_PublicImageDedup(t *testing.T) {
+	db := newFilterTestDB(t)
+	root := makeFilterIdentity("root", 0, 0)
+	alice := makeFilterIdentity("alice", 1001, 1001)
+
+	// 公共镜像（如 alpine），root 注册，is_public=true
+	_ = db.SetImageOwner("sha256:shared-public", root, true, "pull")
+	// alice 自有私有镜像
+	_ = db.SetImageOwner("sha256:alice-only", alice, false, "pull")
+
+	// daemon 对同一 ImageId 返回两条（模拟 alpine:latest 与 bob 的私有 Tag 共享同一 Id）
+	body := mustMarshalFilter(t, []map[string]interface{}{
+		{"Id": "sha256:shared-public", "RepoTags": []string{"alpine:latest"}},
+		{"Id": "sha256:shared-public", "RepoTags": []string{"localhost:5000/bob:test"}},
+		{"Id": "sha256:alice-only", "RepoTags": []string{"myapp:v1"}},
+	})
+
+	filtered, err := FilterImageListResponse(body, alice.RealUID, false, db)
+	if err != nil {
+		t.Fatalf("FilterImageListResponse: %v", err)
+	}
+	var result []map[string]interface{}
+	if err := json.Unmarshal(filtered, &result); err != nil {
+		t.Fatal(err)
+	}
+	// 期望 2 条：公共镜像去重为 1 条 + alice 自有镜像 1 条
+	// 不应为 3 条（会把 bob 的私有 Tag 名称泄露给 alice）
+	if len(result) != 2 {
+		t.Errorf("公共镜像应去重：期望 2 条，实际 %d 条（公共镜像重复条目不应泄露私有 Tag 名称）",
+			len(result))
+	}
+}
+
+// TestFilterImageListResponse_OwnedMultipleEntries
+// 用户自有镜像即使对应多条响应条目，也应全部保留（不被公共镜像去重逻辑误伤）。
+func TestFilterImageListResponse_OwnedMultipleEntries(t *testing.T) {
+	db := newFilterTestDB(t)
+	alice := makeFilterIdentity("alice", 1001, 1001)
+
+	_ = db.SetImageOwner("sha256:alice-img", alice, false, "build")
+
+	// alice 自有镜像对应两条条目（如 v1 和 latest 两次推送记录）
+	body := mustMarshalFilter(t, []map[string]interface{}{
+		{"Id": "sha256:alice-img", "RepoTags": []string{"myapp:v1"}},
+		{"Id": "sha256:alice-img", "RepoTags": []string{"myapp:latest"}},
+	})
+
+	filtered, err := FilterImageListResponse(body, alice.RealUID, false, db)
+	if err != nil {
+		t.Fatalf("FilterImageListResponse: %v", err)
+	}
+	var result []map[string]interface{}
+	if err := json.Unmarshal(filtered, &result); err != nil {
+		t.Fatal(err)
+	}
+	// 自有镜像：两条全部保留
+	if len(result) != 2 {
+		t.Errorf("自有镜像不应被去重：期望 2 条，实际 %d 条", len(result))
+	}
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 // ── ExtractRequestedNetworks ──────────────────────────────────────────────────

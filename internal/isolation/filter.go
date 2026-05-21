@@ -142,7 +142,10 @@ func parseUID(s string) int {
 	return uid
 }
 
-// FilterImageListResponse 过滤镜像列表响应，只返回用户可见的镜像
+// FilterImageListResponse 过滤镜像列表响应，只返回用户可见的镜像。
+// 对于用户自有镜像（owner_uid = realUID）：保留全部条目（含多 Tag）。
+// 对于仅通过 is_public=1 可见的镜像：按 ImageId 去重，每个 ID 只保留一条，
+// 防止其他用户推送到同一 ImageId 的私有 Tag 名称泄露给当前用户。
 func FilterImageListResponse(body []byte, realUID int, privileged bool, db OwnershipReader) ([]byte, error) {
 	if privileged {
 		return body, nil
@@ -153,7 +156,18 @@ func FilterImageListResponse(body []byte, realUID int, privileged bool, db Owner
 		return emptyJSONArray, err
 	}
 
+	// 获取用户自有镜像 ID，区分"自有"与"仅公共可见"
+	ownedIDs, err := db.GetImageIDsByOwner(realUID)
+	if err != nil {
+		ownedIDs = nil // DB 故障降级：等同原有 CanSeeImage 行为
+	}
+	ownedSet := make(map[string]bool, len(ownedIDs))
+	for _, id := range ownedIDs {
+		ownedSet[id] = true
+	}
+
 	var filtered []json.RawMessage
+	publicSeen := make(map[string]bool)
 	for _, raw := range images {
 		var item struct {
 			ID string `json:"Id"`
@@ -161,7 +175,20 @@ func FilterImageListResponse(body []byte, realUID int, privileged bool, db Owner
 		if err := json.Unmarshal(raw, &item); err != nil {
 			continue
 		}
-		if db.CanSeeImage(realUID, item.ID) {
+		if !db.CanSeeImage(realUID, item.ID) {
+			continue
+		}
+		// DB 存储时通过 normalizeImageID 去掉了 "sha256:" 前缀，
+		// 但响应体中的 Id 字段可能带 "sha256:" 前缀，需要两端对齐后再查 ownedSet。
+		normID := strings.TrimPrefix(item.ID, "sha256:")
+		if ownedSet[normID] {
+			// 自有镜像：不去重，保留全部条目
+			filtered = append(filtered, raw)
+			continue
+		}
+		// 公共镜像：按 ImageId 去重，防止私有 Tag 名称跨用户泄露
+		if !publicSeen[item.ID] {
+			publicSeen[item.ID] = true
 			filtered = append(filtered, raw)
 		}
 	}
@@ -329,27 +356,33 @@ func NewResponseScanner(r io.Reader) *bufio.Scanner {
 // 特权用户直接返回原始响应体；普通用户只保留自己的容器、镜像（含公共镜像）、卷。
 // LayersSize 置为 0（无法精确计算用户级别的 layer 共享大小）。
 //
-// Docker system df 响应结构：
+// Docker system df 响应结构（Docker 29.x）：
 //
 //	{
-//	  "LayersSize": int64,
-//	  "Images":     [{"Id","ParentId","RepoTags","RepoDigests","Created","SharedSize","UniqueSize","Containers",...}],
-//	  "Containers": [{"Id","Names","Image","ImageID","SizeRootFs","SizeRw",...}],
-//	  "Volumes":    [{"Name","Driver","Mountpoint","UsageData":{"Size","RefCount"}}],
-//	  "BuildCache": [...]
+//	  "LayersSize":     int64,
+//	  "Images":         [...],   // 旧版 CLI 读此字段
+//	  "Containers":     [...],   // 旧版 CLI 读此字段
+//	  "Volumes":        [...],   // 旧版 CLI 读此字段
+//	  "BuildCache":     [...],
+//	  "ImageUsage":     {"Items":[...],"TotalCount":N,"ActiveCount":N,"TotalSize":N},  // Docker 29+ CLI 读此字段
+//	  "ContainerUsage": {"Items":[...],"TotalCount":N,"Reclaimable":N,"TotalSize":N}, // Docker 29+ CLI 读此字段
+//	  "VolumeUsage":    {"Items":[...],"TotalCount":N,"ActiveCount":N,"TotalSize":N},  // Docker 29+ CLI 读此字段
 //	}
 func FilterSystemDFResponse(body []byte, realUID int, privileged bool, db OwnershipReader) ([]byte, error) {
 	if privileged {
 		return body, nil
 	}
 
-	// 解析原始响应
+	// 解析原始响应（同时解析 Docker 29.x 新增的 *Usage 汇总字段）
 	var raw struct {
-		LayersSize int64               `json:"LayersSize"`
-		Images     []json.RawMessage   `json:"Images"`
-		Containers []json.RawMessage   `json:"Containers"`
-		Volumes    []json.RawMessage   `json:"Volumes"`
-		BuildCache []json.RawMessage   `json:"BuildCache"`
+		LayersSize     int64             `json:"LayersSize"`
+		Images         []json.RawMessage `json:"Images"`
+		Containers     []json.RawMessage `json:"Containers"`
+		Volumes        []json.RawMessage `json:"Volumes"`
+		BuildCache     []json.RawMessage `json:"BuildCache"`
+		ImageUsage     json.RawMessage   `json:"ImageUsage"`
+		ContainerUsage json.RawMessage   `json:"ContainerUsage"`
+		VolumeUsage    json.RawMessage   `json:"VolumeUsage"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
 		// 解析失败原样透传
@@ -446,18 +479,32 @@ func FilterSystemDFResponse(body []byte, realUID int, privileged bool, db Owners
 		buildCache = []json.RawMessage{}
 	}
 
+	// ── 重建 Docker 29.x *Usage 汇总字段 ────────────────────────────────────
+	// Docker 29.x CLI 读取 ImageUsage/ContainerUsage/VolumeUsage 的 TotalCount
+	// 来显示资源数量，旧版 Images/Containers/Volumes 数组仅供旧版 CLI 使用。
+	// 必须将过滤后的条目同步写入 Items 并更新 TotalCount，否则 CLI 显示全零。
+	imageUsage, _ := rebuildUsageField(raw.ImageUsage, filteredImages, "image")
+	containerUsage, _ := rebuildUsageField(raw.ContainerUsage, filteredContainers, "container")
+	volumeUsage, _ := rebuildUsageField(raw.VolumeUsage, filteredVolumes, "volume")
+
 	out := struct {
-		LayersSize int64             `json:"LayersSize"`
-		Images     []json.RawMessage `json:"Images"`
-		Containers []json.RawMessage `json:"Containers"`
-		Volumes    []json.RawMessage `json:"Volumes"`
-		BuildCache []json.RawMessage `json:"BuildCache"`
+		LayersSize     int64             `json:"LayersSize"`
+		Images         []json.RawMessage `json:"Images"`
+		Containers     []json.RawMessage `json:"Containers"`
+		Volumes        []json.RawMessage `json:"Volumes"`
+		BuildCache     []json.RawMessage `json:"BuildCache"`
+		ImageUsage     json.RawMessage   `json:"ImageUsage,omitempty"`
+		ContainerUsage json.RawMessage   `json:"ContainerUsage,omitempty"`
+		VolumeUsage    json.RawMessage   `json:"VolumeUsage,omitempty"`
 	}{
-		LayersSize: 0, // 用户级别无法精确计算共享层大小
-		Images:     filteredImages,
-		Containers: filteredContainers,
-		Volumes:    filteredVolumes,
-		BuildCache: buildCache,
+		LayersSize:     0, // 用户级别无法精确计算共享层大小
+		Images:         filteredImages,
+		Containers:     filteredContainers,
+		Volumes:        filteredVolumes,
+		BuildCache:     buildCache,
+		ImageUsage:     imageUsage,
+		ContainerUsage: containerUsage,
+		VolumeUsage:    volumeUsage,
 	}
 	return json.Marshal(out)
 }
@@ -486,6 +533,55 @@ func FilterSwarmInspectResponse(body []byte, privileged bool) ([]byte, error) {
 	raw["JoinTokens"] = masked
 
 	return json.Marshal(raw)
+}
+
+// rebuildUsageField 根据过滤后的 items 重建 Docker 29.x *Usage 汇总字段。
+// 原始字段（orig）可能为 nil（旧版 Docker 守护进程不返回此字段）；
+// 此时若 items 非空则构造最小结构，否则返回 nil 使输出字段被 omitempty 省略。
+// kind 仅用于区分不同资源的字段名差异（"image"/"container"/"volume"）。
+func rebuildUsageField(orig json.RawMessage, items []json.RawMessage, kind string) (json.RawMessage, error) {
+	// 若原始字段不存在且过滤后也无条目，不输出该字段（保持旧版 Docker 兼容）
+	if len(orig) == 0 && len(items) == 0 {
+		return nil, nil
+	}
+
+	// 解析原始字段为通用 map，保留所有原始数值字段
+	var m map[string]json.RawMessage
+	if len(orig) > 0 {
+		if err := json.Unmarshal(orig, &m); err != nil {
+			m = make(map[string]json.RawMessage)
+		}
+	} else {
+		m = make(map[string]json.RawMessage)
+	}
+
+	// 用过滤后的条目数覆盖 TotalCount（CLI 用此字段显示数量）
+	totalCount, _ := json.Marshal(len(items))
+	m["TotalCount"] = totalCount
+
+	// Items 同步替换为过滤后的条目
+	if items == nil {
+		items = []json.RawMessage{}
+	}
+	itemsRaw, _ := json.Marshal(items)
+	m["Items"] = itemsRaw
+
+	// ActiveCount（镜像/卷使用）：不超过 TotalCount
+	if _, ok := m["ActiveCount"]; ok {
+		m["ActiveCount"] = totalCount
+	}
+
+	// container 特有：Reclaimable 保持原值（无法精确计算用户级别，置 0）
+	if kind == "container" {
+		zero, _ := json.Marshal(int64(0))
+		m["Reclaimable"] = zero
+	}
+
+	// TotalSize 置 0（用户级别无法精确计算共享层）
+	zero, _ := json.Marshal(int64(0))
+	m["TotalSize"] = zero
+
+	return json.Marshal(m)
 }
 
 // EmptySystemDFBody 返回空的 system df 响应（DB 故障时 fail-secure，供外部包使用）
