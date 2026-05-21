@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"docker-authz-proxy/internal/auth"
@@ -109,6 +110,18 @@ func RewriteNetworkURL(r *http.Request, identity *auth.CallerIdentity) *http.Req
 	}
 	// hex ID（12位或64位纯十六进制）直接透传，不加前缀
 	if isHexID(netName) {
+		return r
+	}
+	// 系统托管网络由代理创建，名称不含 {username}_u{uid}_ 用户前缀，直接透传。
+	// 1. 用户专属桥接网络：user-{uid}-bridge
+	// 2. 用户间 peer 互通网络：peer-{uidA}-{uidB}（当前用户 uid 出现在 peer- 后的任意段）
+	// ownership check 层持有 DB，负责最终归属验证，此处只做前缀豁免。
+	uidStr := strconv.Itoa(identity.RealUID)
+	if netName == UserBridgeName(identity.RealUID) ||
+		(strings.HasPrefix(netName, "peer-") &&
+			(strings.HasPrefix(netName[len("peer-"):], uidStr+"-") ||
+				strings.Contains(netName, "-"+uidStr+"-") ||
+				strings.HasSuffix(netName, "-"+uidStr))) {
 		return r
 	}
 	prefix := UserResourcePrefix(identity)

@@ -1073,14 +1073,21 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 	case authz.ActionNetworkInspect, authz.ActionNetworkConnect, authz.ActionNetworkDisconnect, authz.ActionNetworkRemove:
 		networkName := isolation.ExtractNetworkID(r.URL.Path)
 		if networkName != "" && !id.IsPrivileged() {
-			// networkName 此时已是重写后的内部名（含用户前缀），用于 DB 查询
-			// userVisibleName 是剥除前缀后的用户可见名，用于错误信息
+			// networkName：用户自建网络已由 RewriteNetworkURL 补全 {username}_u{uid}_ 前缀；
+			// 桥接/peer 等系统托管网络被 RewriteNetworkURL 豁免改写，此处为原始名称。
+			// userVisibleName：剥除前缀后的可见名；若无前缀（系统网络），与 networkName 相同。
 			prefix := isolation.UserResourcePrefix(id)
 			userVisibleName := strings.TrimPrefix(networkName, prefix)
 
 			lookupID := networkName
 			if docID, found := p.db.GetNetworkIDByName(networkName); found {
 				lookupID = docID
+			} else if userVisibleName != networkName {
+				// RewriteNetworkURL 已补前缀，但 DB 中该网络可能以无前缀的原始名存储。
+				// 若豁免逻辑将来有遗漏，此处给予第二次机会，避免将合法资源误拒。
+				if docID, found := p.db.GetNetworkIDByName(userVisibleName); found {
+					lookupID = docID
+				}
 			}
 			ok, err := p.db.CanUserAccessNetwork(lookupID, id.RealUID)
 			if err != nil || !ok {
