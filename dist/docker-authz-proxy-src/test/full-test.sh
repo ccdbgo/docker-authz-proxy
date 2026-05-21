@@ -63,9 +63,9 @@ echo "================================================================"
 
 # 重置 DB，确保每次测试从干净状态开始
 echo -e "${CYAN}[准备] 重置 ownership DB...${NC}"
-systemctl stop docker-authz-proxy 2>/dev/null || true
+systemctl stop docker-authz 2>/dev/null || true
 rm -f /var/lib/docker-authz/owners.db /var/lib/docker-authz/owners.db-shm /var/lib/docker-authz/owners.db-wal
-systemctl start docker-authz-proxy 2>/dev/null || true
+systemctl start docker-authz 2>/dev/null || true
 sleep 1
 
 # 预先拉取基础镜像并标记为 public（以 root 身份，带 authz.public=true 参数）

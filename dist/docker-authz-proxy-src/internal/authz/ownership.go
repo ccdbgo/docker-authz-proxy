@@ -16,6 +16,7 @@ type OwnerInfo struct {
 	Username string
 	UID      int
 	GID      int
+	Source   string // 镜像来源：pull / build / load / import / commit
 }
 
 // OwnershipDB 容器/镜像归属持久化存储
@@ -24,10 +25,12 @@ type OwnershipDB struct {
 }
 
 func NewOwnershipDB(path string) (*OwnershipDB, error) {
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("sqlite", path+"?_busy_timeout=5000")
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
+	// SQLite 写操作串行化：只允许一个写连接，避免 SQLITE_BUSY
+	db.SetMaxOpenConns(1)
 	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
 		return nil, fmt.Errorf("set WAL mode: %w", err)
 	}
@@ -133,6 +136,36 @@ func initSchema(db *sql.DB) error {
 			PRIMARY KEY (container_id, grantee_uid)
 		);
 		CREATE INDEX IF NOT EXISTS idx_volumes_from_container ON volumes_from_access(container_id);
+
+		-- Swarm 服务归属表
+		CREATE TABLE IF NOT EXISTS swarm_services (
+			service_id     TEXT PRIMARY KEY,
+			name           TEXT NOT NULL,
+			owner_uid      INT  NOT NULL,
+			owner_username TEXT NOT NULL,
+			created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE INDEX IF NOT EXISTS idx_swarm_services_owner ON swarm_services(owner_uid);
+
+		-- Swarm secret 归属表
+		CREATE TABLE IF NOT EXISTS swarm_secrets (
+			secret_id      TEXT PRIMARY KEY,
+			name           TEXT NOT NULL,
+			owner_uid      INT  NOT NULL,
+			owner_username TEXT NOT NULL,
+			created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE INDEX IF NOT EXISTS idx_swarm_secrets_owner ON swarm_secrets(owner_uid);
+
+		-- Swarm config 归属表
+		CREATE TABLE IF NOT EXISTS swarm_configs (
+			config_id      TEXT PRIMARY KEY,
+			name           TEXT NOT NULL,
+			owner_uid      INT  NOT NULL,
+			owner_username TEXT NOT NULL,
+			created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE INDEX IF NOT EXISTS idx_swarm_configs_owner ON swarm_configs(owner_uid);
 	`)
 	if err != nil {
 		return err
@@ -175,6 +208,31 @@ func initSchema(db *sql.DB) error {
 		PRIMARY KEY (container_id, grantee_uid)
 	)`)
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_volumes_from_container ON volumes_from_access(container_id)`)
+	// 迁移：swarm 相关表（幂等）
+	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS swarm_services (
+		service_id     TEXT PRIMARY KEY,
+		name           TEXT NOT NULL,
+		owner_uid      INT  NOT NULL,
+		owner_username TEXT NOT NULL,
+		created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
+	)`)
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_swarm_services_owner ON swarm_services(owner_uid)`)
+	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS swarm_secrets (
+		secret_id      TEXT PRIMARY KEY,
+		name           TEXT NOT NULL,
+		owner_uid      INT  NOT NULL,
+		owner_username TEXT NOT NULL,
+		created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
+	)`)
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_swarm_secrets_owner ON swarm_secrets(owner_uid)`)
+	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS swarm_configs (
+		config_id      TEXT PRIMARY KEY,
+		name           TEXT NOT NULL,
+		owner_uid      INT  NOT NULL,
+		owner_username TEXT NOT NULL,
+		created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
+	)`)
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_swarm_configs_owner ON swarm_configs(owner_uid)`)
 	return nil
 }
 
@@ -293,8 +351,15 @@ func (o *OwnershipDB) SetImageOwner(imageID string, identity *auth.CallerIdentit
 		publicInt = 1
 	}
 	_, err := o.DB.Exec(
-		`INSERT OR IGNORE INTO images(image_id, owner_username, owner_uid, owner_gid, is_public, source, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO images(image_id, owner_username, owner_uid, owner_gid, is_public, source, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(image_id) DO UPDATE SET
+		     owner_username = excluded.owner_username,
+		     owner_uid      = excluded.owner_uid,
+		     owner_gid      = excluded.owner_gid,
+		     source         = excluded.source,
+		     created_at     = excluded.created_at
+		 WHERE images.source = 'build' AND excluded.source = 'pull'`,
 		imageID,
 		identity.RealUsername,
 		identity.RealUID,
@@ -354,8 +419,8 @@ func (o *OwnershipDB) GetImageOwner(imageID string) (*OwnerInfo, bool, bool) {
 	var info OwnerInfo
 	var isPublicInt int
 	err := o.DB.QueryRow(
-		`SELECT owner_username, owner_uid, owner_gid, is_public FROM images WHERE image_id = ?`, resolvedID,
-	).Scan(&info.Username, &info.UID, &info.GID, &isPublicInt)
+		`SELECT owner_username, owner_uid, owner_gid, is_public, COALESCE(source, '') FROM images WHERE image_id = ?`, resolvedID,
+	).Scan(&info.Username, &info.UID, &info.GID, &isPublicInt, &info.Source)
 	if err != nil {
 		return nil, false, false
 	}
@@ -498,6 +563,11 @@ func (o *OwnershipDB) EnsureImageAccess(imageID string, uid int) error {
 
 // DeleteImage 删除镜像归属记录
 func (o *OwnershipDB) DeleteImage(imageID string) error {
+	if resolved := o.resolveImageIDInDB(imageID); resolved != "" {
+		imageID = resolved
+	} else {
+		imageID = normalizeImageID(imageID)
+	}
 	_, _ = o.DB.Exec(`DELETE FROM image_access WHERE image_id = ?`, imageID)
 	_, err := o.DB.Exec(`DELETE FROM images WHERE image_id = ?`, imageID)
 	return err
@@ -727,6 +797,28 @@ func (o *OwnershipDB) GetVolumeOwner(name string) (*OwnerInfo, bool) {
 func (o *OwnershipDB) DeleteVolume(name string) error {
 	_, err := o.DB.Exec(`DELETE FROM volumes WHERE name = ?`, name)
 	return err
+}
+
+// GetAllVolumeNames 返回 DB 中所有已注册的 volume 内部名称。
+// 供清理协程一次性批量获取归属快照，避免逐 volume 查询（N+1 问题）。
+// 调用方应在查询失败时放弃本次清理（保守策略），而非继续删除。
+// 注意：全量加载，适用于 volume 总数在万级以下的部署场景。
+// 超大规模部署（10w+ volumes）需改为分批游标查询。
+func (o *OwnershipDB) GetAllVolumeNames() ([]string, error) {
+	rows, err := o.DB.Query(`SELECT name FROM volumes`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	return names, rows.Err()
 }
 
 // GetVolumeNamesByOwner 返回用户拥有的所有 Volume 名称
@@ -1111,4 +1203,148 @@ func (o *OwnershipDB) ListVolumesFromGrants(containerID string) ([]VolumesFromGr
 		result = append(result, g)
 	}
 	return result, rows.Err()
+}
+
+// ── Swarm service 归属 ───────────────────────────────────────
+
+// SetServiceOwner 记录 Swarm service 归属
+func (o *OwnershipDB) SetServiceOwner(serviceID, name string, identity *auth.CallerIdentity) error {
+	_, err := o.DB.Exec(
+		`INSERT OR REPLACE INTO swarm_services(service_id, name, owner_uid, owner_username, created_at)
+		 VALUES (?, ?, ?, ?, ?)`,
+		serviceID, name, identity.RealUID, identity.RealUsername, time.Now().UTC(),
+	)
+	return err
+}
+
+// GetServiceOwner 返回 Swarm service 归属信息
+func (o *OwnershipDB) GetServiceOwner(serviceID string) (*OwnerInfo, bool) {
+	var info OwnerInfo
+	err := o.DB.QueryRow(
+		`SELECT owner_username, owner_uid FROM swarm_services WHERE service_id = ?`, serviceID,
+	).Scan(&info.Username, &info.UID)
+	if err != nil {
+		return nil, false
+	}
+	return &info, true
+}
+
+// DeleteService 删除 Swarm service 归属记录
+func (o *OwnershipDB) DeleteService(serviceID string) error {
+	_, err := o.DB.Exec(`DELETE FROM swarm_services WHERE service_id = ?`, serviceID)
+	return err
+}
+
+// GetServiceIDsByOwner 返回某用户拥有的所有 service ID
+func (o *OwnershipDB) GetServiceIDsByOwner(uid int) ([]string, error) {
+	rows, err := o.DB.Query(`SELECT service_id FROM swarm_services WHERE owner_uid = ?`, uid)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// ── Swarm secret 归属 ────────────────────────────────────────
+
+// SetSecretOwner 记录 Swarm secret 归属
+func (o *OwnershipDB) SetSecretOwner(secretID, name string, identity *auth.CallerIdentity) error {
+	_, err := o.DB.Exec(
+		`INSERT OR REPLACE INTO swarm_secrets(secret_id, name, owner_uid, owner_username, created_at)
+		 VALUES (?, ?, ?, ?, ?)`,
+		secretID, name, identity.RealUID, identity.RealUsername, time.Now().UTC(),
+	)
+	return err
+}
+
+// GetSecretOwner 返回 Swarm secret 归属信息
+func (o *OwnershipDB) GetSecretOwner(secretID string) (*OwnerInfo, bool) {
+	var info OwnerInfo
+	err := o.DB.QueryRow(
+		`SELECT owner_username, owner_uid FROM swarm_secrets WHERE secret_id = ?`, secretID,
+	).Scan(&info.Username, &info.UID)
+	if err != nil {
+		return nil, false
+	}
+	return &info, true
+}
+
+// DeleteSecret 删除 Swarm secret 归属记录
+func (o *OwnershipDB) DeleteSecret(secretID string) error {
+	_, err := o.DB.Exec(`DELETE FROM swarm_secrets WHERE secret_id = ?`, secretID)
+	return err
+}
+
+// GetSecretIDsByOwner 返回某用户拥有的所有 secret ID
+func (o *OwnershipDB) GetSecretIDsByOwner(uid int) ([]string, error) {
+	rows, err := o.DB.Query(`SELECT secret_id FROM swarm_secrets WHERE owner_uid = ?`, uid)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// ── Swarm config 归属 ────────────────────────────────────────
+
+// SetConfigOwner 记录 Swarm config 归属
+func (o *OwnershipDB) SetConfigOwner(configID, name string, identity *auth.CallerIdentity) error {
+	_, err := o.DB.Exec(
+		`INSERT OR REPLACE INTO swarm_configs(config_id, name, owner_uid, owner_username, created_at)
+		 VALUES (?, ?, ?, ?, ?)`,
+		configID, name, identity.RealUID, identity.RealUsername, time.Now().UTC(),
+	)
+	return err
+}
+
+// GetConfigOwner 返回 Swarm config 归属信息
+func (o *OwnershipDB) GetConfigOwner(configID string) (*OwnerInfo, bool) {
+	var info OwnerInfo
+	err := o.DB.QueryRow(
+		`SELECT owner_username, owner_uid FROM swarm_configs WHERE config_id = ?`, configID,
+	).Scan(&info.Username, &info.UID)
+	if err != nil {
+		return nil, false
+	}
+	return &info, true
+}
+
+// DeleteConfig 删除 Swarm config 归属记录
+func (o *OwnershipDB) DeleteConfig(configID string) error {
+	_, err := o.DB.Exec(`DELETE FROM swarm_configs WHERE config_id = ?`, configID)
+	return err
+}
+
+// GetConfigIDsByOwner 返回某用户拥有的所有 config ID
+func (o *OwnershipDB) GetConfigIDsByOwner(uid int) ([]string, error) {
+	rows, err := o.DB.Query(`SELECT config_id FROM swarm_configs WHERE owner_uid = ?`, uid)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }

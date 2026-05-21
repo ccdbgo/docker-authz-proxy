@@ -56,7 +56,7 @@ func InjectNetworkNamePrefix(body []byte, identity *auth.CallerIdentity) ([]byte
 	return result, err
 }
 
-// InjectNetworkNamePrefixWithName 向网络创建请求体注入用户前缀，同时返回注入后的实际网络名
+// InjectNetworkNamePrefixWithName 向网络创建请求体注入用户前缀，同时返回注入后的实际网络名。
 func InjectNetworkNamePrefixWithName(body []byte, identity *auth.CallerIdentity) ([]byte, string, error) {
 	var req map[string]json.RawMessage
 	if err := json.Unmarshal(body, &req); err != nil {
@@ -75,6 +75,25 @@ func InjectNetworkNamePrefixWithName(body []byte, identity *auth.CallerIdentity)
 		req["Name"] = raw
 	}
 
+	// 重写 ConfigFrom.Network（--config-from 引用的配置源网络名）
+	// docker network create --config-from <src> <dst> 将源网络名放在 ConfigFrom.Network 中，
+	// 需同样注入用户前缀，否则 Docker 找不到内部名称（如 bob_u1002_xxx）
+	if cfRaw, ok := req["ConfigFrom"]; ok {
+		var configFrom map[string]json.RawMessage
+		if err := json.Unmarshal(cfRaw, &configFrom); err == nil {
+			var cfNetwork string
+			if nRaw, ok := configFrom["Network"]; ok {
+				_ = json.Unmarshal(nRaw, &cfNetwork)
+			}
+			if cfNetwork != "" && !strings.HasPrefix(cfNetwork, prefix) {
+				newName, _ := json.Marshal(prefix + cfNetwork)
+				configFrom["Network"] = newName
+				newCFRaw, _ := json.Marshal(configFrom)
+				req["ConfigFrom"] = newCFRaw
+			}
+		}
+	}
+
 	result, err := json.Marshal(req)
 	if err != nil {
 		return body, actualName, nil
@@ -85,7 +104,11 @@ func InjectNetworkNamePrefixWithName(body []byte, identity *auth.CallerIdentity)
 // RewriteNetworkURL 将请求 URL 中的网络名补全用户前缀（未带前缀时）
 func RewriteNetworkURL(r *http.Request, identity *auth.CallerIdentity) *http.Request {
 	netName := ExtractNetworkID(r.URL.Path)
-	if netName == "" {
+	if netName == "" || netName == "create" || netName == "prune" {
+		return r
+	}
+	// hex ID（12位或64位纯十六进制）直接透传，不加前缀
+	if isHexID(netName) {
 		return r
 	}
 	prefix := UserResourcePrefix(identity)
@@ -182,6 +205,25 @@ var containerSpecialIDs = map[string]bool{
 // 只对看起来是名称的部分补前缀（跳过十六进制 ID 和保留路径片段）
 func RewriteContainerURL(r *http.Request, uid int) *http.Request {
 	p := authz.StripAPIVersion(r.URL.Path)
+	prefix := UserContainerPrefix(uid)
+
+	// POST /commit?container={name}：docker commit 通过 query 参数传递容器名，不在路径中
+	if p == "/commit" {
+		containerParam := r.URL.Query().Get("container")
+		if containerParam != "" &&
+			!strings.HasPrefix(containerParam, prefix) &&
+			!isHexID(containerParam) {
+			newURL := *r.URL
+			q := newURL.Query()
+			q.Set("container", prefix+containerParam)
+			newURL.RawQuery = q.Encode()
+			newReq := r.Clone(r.Context())
+			newReq.URL = &newURL
+			return newReq
+		}
+		return r
+	}
+
 	const containersPrefix = "/containers/"
 	if !strings.HasPrefix(p, containersPrefix) {
 		return r
@@ -200,7 +242,6 @@ func RewriteContainerURL(r *http.Request, uid int) *http.Request {
 	if strings.ContainsAny(containerID, ":/") {
 		return r
 	}
-	prefix := UserContainerPrefix(uid)
 	if strings.HasPrefix(containerID, prefix) {
 		return r // 已有前缀
 	}

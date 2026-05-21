@@ -130,7 +130,7 @@ for user in alice bob; do
 done
 
 # 检查代理服务是否运行
-if ! systemctl is-active --quiet docker-authz-proxy.service; then
+if ! systemctl is-active --quiet docker-authz.service; then
     log_error "代理服务未运行，请先安装并启动服务"
     exit 1
 fi
@@ -315,7 +315,7 @@ assert_success "alice 通过代理创建容器" \
 
 # 检查日志确认身份识别正确（真实用户应为 alice，而非 root）
 sleep 1
-if journalctl -u docker-authz-proxy -n 50 --no-pager | grep -q "user=alice.*sudo=true"; then
+if journalctl -u docker-authz -n 50 --no-pager | grep -q "user=alice.*sudo=true"; then
     echo -e "  ${GREEN}✓${NC} PASS: 日志正确识别 sudo 用户为 alice"
     ((PASS++))
 else

@@ -500,18 +500,13 @@ func injectQuotaLimits(body []byte, req *containerCreateRequest, quota UserQuota
 			hostConfig["NanoCpus"] = b
 			result.cpuCores = quota.CPUCores
 		} else {
-			// 已指定且不超限：保持原值，但清除 CpuQuota/CpuPeriod 避免冲突
-			// （NanoCPUs 与 CpuQuota 不能同时设置）
+			// 已指定且不超限：保持原值，不做任何转换。
+			// hostConfig 中 NanoCpus/CpuQuota/CpuPeriod 均来自原始请求，无需修改。
+			// Docker 约束为 NanoCpus≠0 与 CpuQuota≠0 不能共存；
+			// Docker CLI 保证两组参数互斥，代理透传即可，不存在冲突。
 			if req.HostConfig.NanoCPUs > 0 {
 				result.cpuCores = float64(req.HostConfig.NanoCPUs) / 1e9
 			} else {
-				// 将 CpuQuota/CpuPeriod 转换为 NanoCPUs，统一表示
-				b, _ := json.Marshal(currentNano)
-				hostConfig["NanoCpus"] = b
-				// 清除 CpuQuota/CpuPeriod，避免 Docker 报冲突错误
-				zero, _ := json.Marshal(int64(0))
-				hostConfig["CpuQuota"] = zero
-				hostConfig["CpuPeriod"] = zero
 				result.cpuCores = float64(currentNano) / 1e9
 			}
 		}

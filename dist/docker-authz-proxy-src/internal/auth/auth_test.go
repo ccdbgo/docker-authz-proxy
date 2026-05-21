@@ -162,6 +162,26 @@ func TestParseDockerCommand(t *testing.T) {
 		{"", ""},
 		{"bash -c docker", ""},
 		{"docker -H tcp://host:2376 run nginx", "tcp://host:2376"},
+		// 复合命令组：返回 "group/subcommand"
+		{"docker system info", "system/info"},
+		{"docker system df", "system/df"},
+		{"docker system prune", "system/prune"},
+		{"docker system events", "system/events"},
+		{"docker system version", "system/version"},
+		{"docker container ls", "container/ls"},
+		{"docker container stop foo", "container/stop"},
+		{"docker container run -d nginx", "container/run"},
+		{"docker image ls", "image/ls"},
+		{"docker image rm nginx:latest", "image/rm"},
+		{"docker network create mynet", "network/create"},
+		{"docker network ls", "network/ls"},
+		{"docker volume rm myvol", "volume/rm"},
+		{"docker volume ls", "volume/ls"},
+		{"docker plugin ls", "plugin/ls"},
+		{"docker builder prune", "builder/prune"},
+		// 裸组名（无子命令），返回组名
+		{"docker system", "system"},
+		{"docker container", "container"},
 	}
 	for _, tt := range tests {
 		got := parseDockerCommand(tt.cmdline)

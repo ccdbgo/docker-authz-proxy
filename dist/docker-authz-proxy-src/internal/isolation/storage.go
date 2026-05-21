@@ -238,29 +238,59 @@ func (m *StorageManager) runCleanup(
 	volumesRemoved := 0
 	dirsRemoved := 0
 
-	// ── 1. 清理孤立 Docker Volume（有用户前缀且无容器在用） ────────────────
-	volumes, err := m.listDanglingVolumes(ctx)
+	// ── 1. 清理孤立 Docker Volume（有用户前缀 且 DB 中无归属记录） ──────────
+	//
+	// 两阶段保护策略：
+	//   阶段一（批量）：取 DB 全量快照作为主过滤，O(1) 判断，避免 N+1 查询。
+	//   阶段二（逐条）：删除前再做一次点查询，将 TOCTOU 竞态窗口从
+	//                  "HTTP 往返级（~50ms）"收缩到"函数调用级（~1μs）"。
+	// DB 查询失败时采用保守策略：放弃本次 volume 清理，不删任何 volume。
+	ownedVols, err := db.GetAllVolumeNames()
 	if err != nil {
-		logger.Warn("storage_cleanup_list_volumes_failed", zap.Error(err))
+		logger.Warn("storage_cleanup_skip_volumes_db_unavailable", zap.Error(err))
 	} else {
-		for _, v := range volumes {
-			// 只处理符合用户 volume 命名规范的 volume：user-{digits}-volume-*
-			if !isUserVolumePrefix(v.Name) {
-				continue
-			}
-			if err := m.removeVolume(ctx, v.Name); err != nil {
-				logger.Warn("storage_cleanup_volume_remove_failed",
-					zap.String("volume", v.Name),
-					zap.Error(err))
-				continue
-			}
-			_ = db.DeleteVolume(v.Name)
-			volumesRemoved++
-			logger.Info("storage_cleanup_volume_removed", zap.String("volume", v.Name))
-			if auditLog != nil {
-				auditLog.Log("system", 0, "system",
-					"volume_cleanup", "/volumes/"+v.Name, "allow",
-					"orphaned_volume_removed", v.Name, http.StatusNoContent)
+		ownedSet := make(map[string]struct{}, len(ownedVols))
+		for _, n := range ownedVols {
+			ownedSet[n] = struct{}{}
+		}
+
+		volumes, err := m.listDanglingVolumes(ctx)
+		if err != nil {
+			logger.Warn("storage_cleanup_list_volumes_failed", zap.Error(err))
+		} else {
+			for _, v := range volumes {
+				// 只处理符合用户 volume 命名规范的 volume：user-{digits}-volume-*
+				if !isUserVolumePrefix(v.Name) {
+					continue
+				}
+				// Phase 1: snapshot filter (skip volumes owned before snapshot was taken)
+				if _, owned := ownedSet[v.Name]; owned {
+					continue
+				}
+				// Phase 2: point-query re-check to narrow TOCTOU window (skip volumes created after snapshot)
+				if _, found := db.GetVolumeOwner(v.Name); found {
+					logger.Debug("storage_cleanup_skip_toctou_protected",
+						zap.String("volume", v.Name))
+					continue
+				}
+				if err := m.removeVolume(ctx, v.Name); err != nil {
+					logger.Warn("storage_cleanup_volume_remove_failed",
+						zap.String("volume", v.Name),
+						zap.Error(err))
+					continue
+				}
+				if err := db.DeleteVolume(v.Name); err != nil {
+					logger.Warn("storage_cleanup_db_delete_failed",
+						zap.String("volume", v.Name),
+						zap.Error(err))
+				}
+				volumesRemoved++
+				logger.Info("storage_cleanup_orphan_volume_removed", zap.String("volume", v.Name))
+				if auditLog != nil {
+					auditLog.Log("system", 0, "system",
+						"volume_cleanup", "/volumes/"+v.Name, "allow",
+						"orphaned_volume_removed", v.Name, http.StatusNoContent)
+				}
 			}
 		}
 	}

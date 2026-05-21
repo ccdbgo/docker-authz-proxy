@@ -12,7 +12,7 @@
 # 注意：本配置文件目前为文档说明用途。
 #       实际的网络共享授权通过以下方式实现：
 #       1. root 创建网络后，使用管理工具：
-#          docker-authz-admin network share <network_id> --users alice,bob
+#          docker-authz-proxy-ctl allow-network-peer --user1 alice --user2 bob
 #       2. 或在代理数据库中直接操作 network_access 表
 
 version: 1

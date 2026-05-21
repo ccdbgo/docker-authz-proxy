@@ -72,6 +72,56 @@ func (p *Policy) resolve() {
 			case "run":
 				r.Actions[ActionCreateContainer] = true
 				r.Actions[ActionStartContainer] = true
+			case "stop":
+				// docker kill 是比 stop 更强制的停止方式，语义上应一并禁止
+				r.Actions[ActionStop] = true
+				r.Actions[ActionKill] = true
+			case "plugin":
+				// plugin 别名：展开为所有 plugin 子操作
+				r.Actions[ActionPluginList] = true
+				r.Actions[ActionPluginInspect] = true
+				r.Actions[ActionPluginInstall] = true
+				r.Actions[ActionPluginRemove] = true
+				r.Actions[ActionPluginEnable] = true
+				r.Actions[ActionPluginDisable] = true
+				r.Actions[ActionPluginUpgrade] = true
+				r.Actions[ActionPluginSet] = true
+				r.Actions[ActionPluginPush] = true
+				r.Actions[ActionPluginCreate] = true
+			case "swarm":
+				// swarm 别名：展开为所有 swarm/service/node/task 子操作
+				r.Actions[ActionSwarmInspect] = true
+				r.Actions[ActionSwarmInit] = true
+				r.Actions[ActionSwarmJoin] = true
+				r.Actions[ActionSwarmLeave] = true
+				r.Actions[ActionSwarmUpdate] = true
+				r.Actions[ActionSwarmUnlock] = true
+				r.Actions[ActionNodeList] = true
+				r.Actions[ActionNodeInspect] = true
+				r.Actions[ActionNodeUpdate] = true
+				r.Actions[ActionNodeRemove] = true
+				r.Actions[ActionServiceList] = true
+				r.Actions[ActionServiceCreate] = true
+				r.Actions[ActionServiceInspect] = true
+				r.Actions[ActionServiceUpdate] = true
+				r.Actions[ActionServiceRemove] = true
+				r.Actions[ActionServiceLogs] = true
+				r.Actions[ActionTaskList] = true
+				r.Actions[ActionTaskInspect] = true
+			case "secret":
+				// secret 别名：展开为所有 secret 子操作
+				r.Actions[ActionSecretList] = true
+				r.Actions[ActionSecretCreate] = true
+				r.Actions[ActionSecretInspect] = true
+				r.Actions[ActionSecretUpdate] = true
+				r.Actions[ActionSecretRemove] = true
+			case "config":
+				// config 别名：展开为所有 config 子操作
+				r.Actions[ActionConfigList] = true
+				r.Actions[ActionConfigCreate] = true
+				r.Actions[ActionConfigInspect] = true
+				r.Actions[ActionConfigUpdate] = true
+				r.Actions[ActionConfigRemove] = true
 			case "history":
 				// docker image history → GET /images/{id}/history → ActionHistory
 				r.Actions[ActionHistory] = true
@@ -132,6 +182,9 @@ const (
 	ActionStartContainer  = "start"
 	ActionRestart         = "restart"
 	ActionStop            = "stop"
+	ActionKill            = "kill"
+	ActionPause           = "pause"
+	ActionUnpause         = "unpause"
 	ActionRename          = "rename"
 	ActionUpdate          = "update"
 	ActionRemoveContainer = "rm"
@@ -178,10 +231,83 @@ const (
 	ActionSystemEvents  = "events"
 	ActionSystemLogin   = "login"
 
-	ActionSwarm  = "swarm"
-	ActionPlugin = "plugin"
-	ActionSecret = "secret"
-	ActionConfig = "config"
+	ActionSwarm = "swarm" // 兜底别名，展开为所有 swarm 子操作
+
+	// swarm 集群管理
+	ActionSwarmInspect = "swarm_inspect" // GET  /swarm
+	ActionSwarmInit    = "swarm_init"    // POST /swarm/init
+	ActionSwarmJoin    = "swarm_join"    // POST /swarm/join
+	ActionSwarmLeave   = "swarm_leave"   // POST /swarm/leave
+	ActionSwarmUpdate  = "swarm_update"  // POST /swarm/update / unlock-key / ca
+	ActionSwarmUnlock  = "swarm_unlock"  // POST /swarm/unlock
+
+	// node 管理（集群管理员操作）
+	ActionNodeList    = "node_ls"      // GET    /nodes
+	ActionNodeInspect = "node_inspect" // GET    /nodes/{id}
+	ActionNodeUpdate  = "node_update"  // POST   /nodes/{id}/update
+	ActionNodeRemove  = "node_rm"      // DELETE /nodes/{id}
+
+	// service 操作
+	ActionServiceList    = "service_ls"      // GET    /services
+	ActionServiceCreate  = "service_create"  // POST   /services/create
+	ActionServiceInspect = "service_inspect" // GET    /services/{id}
+	ActionServiceUpdate  = "service_update"  // POST   /services/{id}/update
+	ActionServiceRemove  = "service_rm"      // DELETE /services/{id}
+	ActionServiceLogs    = "service_logs"    // GET    /services/{id}/logs
+
+	// task 操作
+	ActionTaskList    = "task_ls"      // GET /tasks
+	ActionTaskInspect = "task_inspect" // GET /tasks/{id}
+
+	// secret 操作
+	ActionSecretList    = "secret_ls"      // GET    /secrets
+	ActionSecretCreate  = "secret_create"  // POST   /secrets/create
+	ActionSecretInspect = "secret_inspect" // GET    /secrets/{id}
+	ActionSecretUpdate  = "secret_update"  // POST   /secrets/{id}/update
+	ActionSecretRemove  = "secret_rm"      // DELETE /secrets/{id}
+
+	// config 操作
+	ActionConfigList    = "config_ls"      // GET    /configs
+	ActionConfigCreate  = "config_create"  // POST   /configs/create
+	ActionConfigInspect = "config_inspect" // GET    /configs/{id}
+	ActionConfigUpdate  = "config_update"  // POST   /configs/{id}/update
+	ActionConfigRemove  = "config_rm"      // DELETE /configs/{id}
+
+	// plugin 细粒度子操作
+	ActionPlugin        = "plugin"         // 别名：禁止所有 plugin 操作
+	ActionPluginList    = "plugin_ls"      // docker plugin ls
+	ActionPluginInspect = "plugin_inspect" // docker plugin inspect
+	ActionPluginInstall = "plugin_install" // docker plugin install
+	ActionPluginRemove  = "plugin_rm"      // docker plugin rm
+	ActionPluginEnable  = "plugin_enable"  // docker plugin enable
+	ActionPluginDisable = "plugin_disable" // docker plugin disable
+	ActionPluginUpgrade = "plugin_upgrade" // docker plugin upgrade
+	ActionPluginSet     = "plugin_set"     // docker plugin set
+	ActionPluginPush    = "plugin_push"    // docker plugin push
+	ActionPluginCreate  = "plugin_create"  // docker plugin create
+
+	ActionSecret = "secret" // 兜底别名，展开为所有 secret 子操作
+	ActionConfig = "config" // 兜底别名，展开为所有 config 子操作
+
+	// builder 管理操作（buildx 专用，不经过 Docker daemon）
+	ActionBuilderManage = "builder_manage" // docker builder create/ls/rm/stop/use/inspect
+
+	// context 管理操作（纯客户端本地操作，不经过 Docker daemon）
+	ActionContextList    = "context_ls"
+	ActionContextCreate  = "context_create"
+	ActionContextRemove  = "context_rm"
+	ActionContextInspect = "context_inspect"
+	ActionContextUpdate  = "context_update"
+	ActionContextExport  = "context_export"
+	ActionContextImport  = "context_import"
+	ActionContextUse     = "context_use"
+
+	// manifest 管理操作（直连 registry，不经过 Docker daemon）
+	ActionManifestInspect  = "manifest_inspect"
+	ActionManifestCreate   = "manifest_create"
+	ActionManifestPush     = "manifest_push"
+	ActionManifestAnnotate = "manifest_annotate"
+	ActionManifestRemove   = "manifest_rm"
 
 	ActionOther = "other"
 )
@@ -189,7 +315,8 @@ const (
 // cmdActionOverrides 记录"同一 API、不同命令"需要覆盖 action 的映射。
 // 当 DockerCommand 在此表中时，用对应的 action 替换 ClassifyAction 的结果。
 var cmdActionOverrides = map[string]string{
-	"port": ActionPort,
+	"port":           ActionPort,
+	"container/port": ActionPort,
 }
 
 // OverrideActionByCommand 根据 DockerCommand 将通用 action 替换为更具体的 action。
@@ -222,11 +349,14 @@ func ClassifyAction(method, uri string) string {
 		return ActionStartContainer
 	case method == "POST" && pathMatchesN(path, "/containers/", "/restart"):
 		return ActionRestart
-	case method == "POST" && (pathMatchesN(path, "/containers/", "/stop") ||
-		pathMatchesN(path, "/containers/", "/kill") ||
-		pathMatchesN(path, "/containers/", "/pause") ||
-		pathMatchesN(path, "/containers/", "/unpause")):
+	case method == "POST" && pathMatchesN(path, "/containers/", "/stop"):
 		return ActionStop
+	case method == "POST" && pathMatchesN(path, "/containers/", "/kill"):
+		return ActionKill
+	case method == "POST" && pathMatchesN(path, "/containers/", "/pause"):
+		return ActionPause
+	case method == "POST" && pathMatchesN(path, "/containers/", "/unpause"):
+		return ActionUnpause
 	case method == "POST" && pathMatchesN(path, "/containers/", "/rename"):
 		return ActionRename
 	case method == "POST" && pathMatchesN(path, "/containers/", "/update"):
@@ -283,7 +413,8 @@ func ClassifyAction(method, uri string) string {
 	case method == "POST" && pathMatches(path, "/images/load"):
 		return ActionLoad
 	case method == "POST" && (pathMatches(path, "/build") ||
-		pathMatches(path, "/images/build")):
+		pathMatches(path, "/images/build") ||
+		pathMatches(path, "/grpc")):
 		return ActionBuild
 	case method == "POST" && pathMatches(path, "/build/prune"):
 		return ActionPrune
@@ -343,19 +474,103 @@ func ClassifyAction(method, uri string) string {
 	case method == "POST" && pathMatches(path, "/system/prune"):
 		return ActionPrune
 
-	case pathHasPrefix(path, "/swarm") ||
-		pathHasPrefix(path, "/nodes") ||
-		pathHasPrefix(path, "/services") ||
-		pathHasPrefix(path, "/tasks"):
-		return ActionSwarm
+	// swarm 集群管理
+	case method == "GET" && pathMatches(path, "/swarm"):
+		return ActionSwarmInspect
+	case method == "POST" && pathMatches(path, "/swarm/init"):
+		return ActionSwarmInit
+	case method == "POST" && pathMatches(path, "/swarm/join"):
+		return ActionSwarmJoin
+	case method == "POST" && pathMatches(path, "/swarm/leave"):
+		return ActionSwarmLeave
+	case method == "POST" && pathMatches(path, "/swarm/update"):
+		return ActionSwarmUpdate
+	case method == "POST" && pathMatches(path, "/swarm/unlock"):
+		return ActionSwarmUnlock
+	case method == "GET" && pathMatchesN(path, "/swarm/", "/unlockkey"):
+		return ActionSwarmUpdate
+	case pathHasPrefix(path, "/swarm"):
+		return ActionSwarmInspect // 兜底
 
+	// node 操作
+	case method == "GET" && pathMatches(path, "/nodes"):
+		return ActionNodeList
+	case method == "DELETE" && pathHasPrefix(path, "/nodes/"):
+		return ActionNodeRemove
+	case method == "POST" && pathMatchesN(path, "/nodes/", "/update"):
+		return ActionNodeUpdate
+	case pathHasPrefix(path, "/nodes/"):
+		return ActionNodeInspect // 兜底
+
+	// service 操作
+	case method == "GET" && pathMatches(path, "/services"):
+		return ActionServiceList
+	case method == "POST" && pathMatches(path, "/services/create"):
+		return ActionServiceCreate
+	case method == "DELETE" && pathHasPrefix(path, "/services/"):
+		return ActionServiceRemove
+	case method == "POST" && pathMatchesN(path, "/services/", "/update"):
+		return ActionServiceUpdate
+	case method == "GET" && pathMatchesN(path, "/services/", "/logs"):
+		return ActionServiceLogs
+	case pathHasPrefix(path, "/services/"):
+		return ActionServiceInspect // 兜底
+
+	// task 操作
+	case method == "GET" && pathMatches(path, "/tasks"):
+		return ActionTaskList
+	case pathHasPrefix(path, "/tasks/"):
+		return ActionTaskInspect
+
+	// secret 操作
+	case method == "GET" && pathMatches(path, "/secrets"):
+		return ActionSecretList
+	case method == "POST" && pathMatches(path, "/secrets/create"):
+		return ActionSecretCreate
+	case method == "DELETE" && pathHasPrefix(path, "/secrets/"):
+		return ActionSecretRemove
+	case method == "POST" && pathMatchesN(path, "/secrets/", "/update"):
+		return ActionSecretUpdate
+	case pathHasPrefix(path, "/secrets/"):
+		return ActionSecretInspect // 兜底
+
+	// config 操作
+	case method == "GET" && pathMatches(path, "/configs"):
+		return ActionConfigList
+	case method == "POST" && pathMatches(path, "/configs/create"):
+		return ActionConfigCreate
+	case method == "DELETE" && pathHasPrefix(path, "/configs/"):
+		return ActionConfigRemove
+	case method == "POST" && pathMatchesN(path, "/configs/", "/update"):
+		return ActionConfigUpdate
+	case pathHasPrefix(path, "/configs/"):
+		return ActionConfigInspect // 兜底
+
+	// plugin 细粒度分类
+	case method == "GET" && pathMatches(path, "/plugins"):
+		return ActionPluginList
+	case method == "GET" && pathMatchesN(path, "/plugins/", "/json"):
+		return ActionPluginInspect
+	case method == "POST" && pathMatches(path, "/plugins/pull"):
+		return ActionPluginInstall
+	case method == "DELETE" && pathHasPrefix(path, "/plugins/"):
+		return ActionPluginRemove
+	case method == "POST" && pathMatchesN(path, "/plugins/", "/enable"):
+		return ActionPluginEnable
+	case method == "POST" && pathMatchesN(path, "/plugins/", "/disable"):
+		return ActionPluginDisable
+	case method == "POST" && pathMatchesN(path, "/plugins/", "/upgrade"):
+		return ActionPluginUpgrade
+	case method == "POST" && pathMatchesN(path, "/plugins/", "/set"):
+		return ActionPluginSet
+	case method == "POST" && pathMatchesN(path, "/plugins/", "/push"):
+		return ActionPluginPush
+	case method == "POST" && pathMatches(path, "/plugins/create"):
+		return ActionPluginCreate
 	case pathHasPrefix(path, "/plugins"):
-		return ActionPlugin
+		// 兜底：未匹配的 plugin 路径归为 plugin_inspect（只读语义）
+		return ActionPluginInspect
 
-	case pathHasPrefix(path, "/secrets"):
-		return ActionSecret
-	case pathHasPrefix(path, "/configs"):
-		return ActionConfig
 	}
 	return ActionOther
 }
@@ -397,8 +612,21 @@ func pathMatchesN(path, prefix, suffix string) bool {
 	if slashIdx < 0 {
 		return false
 	}
+	// 快速路径：镜像名不含斜杠（如 /images/alpine/push）
 	tail := rest[slashIdx:]
-	return strings.TrimRight(tail, "/") == strings.TrimRight(suffix, "/")
+	if strings.TrimRight(tail, "/") == strings.TrimRight(suffix, "/") {
+		return true
+	}
+	// 镜像名含斜杠（如 /images/docker.io/library/alpine/push）：
+	// 检查 path 在 prefix 之后是否以 /{id...}{suffix} 结尾，且 suffix 是最后一段。
+	suffixClean := "/" + strings.Trim(suffix, "/")
+	pathClean := strings.TrimRight(path, "/")
+	if !strings.HasSuffix(pathClean, suffixClean) {
+		return false
+	}
+	// 确保 suffix 之前还有内容（即 ID 段非空）
+	before := pathClean[:len(pathClean)-len(suffixClean)]
+	return strings.HasPrefix(before+"/", prefix)
 }
 
 func pathHasPrefix(path, prefix string) bool {
@@ -442,6 +670,37 @@ func ExtractImageID(uri string) string {
 	}
 	return rest
 }
+
+// extractSwarmResourceID 从形如 /<resource>/<id>[/...] 的路径中提取资源 ID
+func extractSwarmResourceID(uri, resourcePrefix string) string {
+	path := StripAPIVersion(uri)
+	if idx := strings.Index(path, "?"); idx >= 0 {
+		path = path[:idx]
+	}
+	if !strings.HasPrefix(path, resourcePrefix) {
+		return ""
+	}
+	rest := path[len(resourcePrefix):]
+	if rest == "" || rest == "create" || rest == "prune" {
+		return ""
+	}
+	if idx := strings.Index(rest, "/"); idx >= 0 {
+		return rest[:idx]
+	}
+	return rest
+}
+
+// ExtractServiceID 从路径中提取 Swarm service ID
+func ExtractServiceID(uri string) string { return extractSwarmResourceID(uri, "/services/") }
+
+// ExtractSecretID 从路径中提取 Swarm secret ID
+func ExtractSecretID(uri string) string { return extractSwarmResourceID(uri, "/secrets/") }
+
+// ExtractConfigID 从路径中提取 Swarm config ID
+func ExtractConfigID(uri string) string { return extractSwarmResourceID(uri, "/configs/") }
+
+// ExtractNodeID 从路径中提取 Swarm node ID
+func ExtractNodeID(uri string) string { return extractSwarmResourceID(uri, "/nodes/") }
 
 // DefaultAllowPolicy 策略文件缺失时的兜底策略（白名单模式，全部允许）
 func DefaultAllowPolicy() *Policy {
