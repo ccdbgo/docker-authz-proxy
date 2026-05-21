@@ -2942,8 +2942,18 @@ func isAuxiliaryCall(dockerCmd, action, method, path string) bool {
 		return true
 	}
 
+	// 其他命令（如 docker run、docker ps 等）附带触发的 info/version 请求
+	// 属于辅助调用，跳过策略检查；用户直接执行 docker info/version/system info/system version 则走正常检查。
+	// 注意：此判断必须在 dockerCmd=="" 早返回之前，否则 SDK 直调或 curl 触发的
+	// GET /info、GET /version 会被错误地标记为非辅助调用（BUG-1 修复）。
+	if (action == authz.ActionSystemInfo || action == authz.ActionSystemVersion) &&
+		dockerCmd != "info" && dockerCmd != "version" &&
+		dockerCmd != "system/info" && dockerCmd != "system/version" {
+		return true
+	}
+
 	if dockerCmd == "" {
-		// 无法识别命令来源时，只放行 _ping（健康检查），其余走正常策略检查
+		// 无法识别命令来源时，只放行 _ping（健康检查）和 info/version（已在上方处理），其余走正常策略检查
 		return false
 	}
 
@@ -3174,14 +3184,6 @@ func isAuxiliaryCall(dockerCmd, action, method, path string) bool {
 		"stack/rm":      {authz.ActionServiceRemove, authz.ActionNetworkRemove, authz.ActionSecretRemove, authz.ActionConfigRemove},
 		"stack/remove":  {authz.ActionServiceRemove, authz.ActionNetworkRemove, authz.ActionSecretRemove, authz.ActionConfigRemove},
 		"stack/config":  {authz.ActionServiceInspect},
-	}
-
-	// 其他命令（如 docker run、docker ps 等）附带触发的 info/version 请求
-	// 属于辅助调用，跳过策略检查；用户直接执行 docker info/version/system info/system version 则走正常检查
-	if (action == authz.ActionSystemInfo || action == authz.ActionSystemVersion) &&
-		dockerCmd != "info" && dockerCmd != "version" &&
-		dockerCmd != "system/info" && dockerCmd != "system/version" {
-		return true
 	}
 
 	targetActions, known := cmdTargetActions[dockerCmd]
@@ -3926,18 +3928,9 @@ func extractImageRefFromBody(r *http.Request) string {
 // truncID 截取容器/镜像 ID 前 12 位用于日志显示
 func truncID(id string) string {
 	id = strings.TrimPrefix(id, "sha256:")
-	// 只截断看起来像 sha256 的十六进制 ID（至少 12 位十六进制字符）
+	// 截断到 12 字符用于日志展示。Docker ID 及资源名均为 ASCII，byte 切片安全。
 	if len(id) > 12 {
-		isHex := true
-		for _, c := range id[:12] {
-			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
-				isHex = false
-				break
-			}
-		}
-		if isHex {
-			return id[:12]
-		}
+		return id[:12]
 	}
 	return id
 }

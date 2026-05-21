@@ -37,12 +37,20 @@ type BridgeManager struct {
 }
 
 func NewBridgeManager(upstreamSock string) *BridgeManager {
+	// 空 socket = 禁用模式（no-op）：生产环境 socket 路径必然非空；
+	// 测试中传 "" 表示不依赖 Docker daemon，所有 bridge 操作静默成功。
+	if upstreamSock == "" {
+		return &BridgeManager{client: nil}
+	}
 	return &BridgeManager{client: newDockerClient(upstreamSock)}
 }
 
 // EnsureUserBridge 确保用户专属桥接网络存在，不存在则创建
 // 返回网络 ID（已存在或新建）
 func (m *BridgeManager) EnsureUserBridge(uid int, username string) (string, error) {
+	if m.client == nil {
+		return "", nil // no-op 禁用模式
+	}
 	name := UserBridgeName(uid)
 
 	if id, err := m.client.findNetworkByName(name); err == nil && id != "" {

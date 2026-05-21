@@ -2,6 +2,7 @@ package forward
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,18 +12,24 @@ import (
 	"docker-authz-proxy/internal/authz"
 )
 
+// scenarioContID 返回供场景测试使用的 64 位伪 hex 容器 ID（n=1~99）。
+// hex 格式确保 RewriteContainerURL 将其识别为 Docker container ID 而非名称，
+// 与生产中 Docker 分配真实 hex ID 的行为一致，从而避免 URL 重写影响 ownership 检查。
+func scenarioContID(n int) string {
+	return fmt.Sprintf("%064x", n)
+}
+
 // ── 场景测试：容器创建流程 ────────────────────────────────────────────────────
 
 // 场景：容器创建成功后，归属记录写入 DB
 func TestServeHTTP_ContainerCreate_RecordsOwnership(t *testing.T) {
-	var capturedBody []byte
+	contID := scenarioContID(1)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
-		_, _ = w.Write([]byte(`{"Id":"new-cont-abc","Warnings":[]}`))
+		_, _ = w.Write([]byte(`{"Id":"` + contID + `","Warnings":[]}`))
 	}))
 	defer upstream.Close()
-	_ = capturedBody
 
 	p := newTestProxy(t, upstream, nil)
 
@@ -37,7 +44,7 @@ func TestServeHTTP_ContainerCreate_RecordsOwnership(t *testing.T) {
 	}
 
 	// 容器归属应已写入 DB
-	owner, found := p.db.GetContainerOwner("new-cont-abc")
+	owner, found := p.db.GetContainerOwner(contID)
 	if !found {
 		t.Error("container ownership should be recorded after create")
 	} else if owner.UID != 1001 {
@@ -54,11 +61,12 @@ func TestServeHTTP_ContainerDelete_RemovesOwnership(t *testing.T) {
 
 	p := newTestProxy(t, upstream, nil)
 
+	contID := scenarioContID(2)
 	// 预先注册容器归属
 	alice := &auth.CallerIdentity{RealUID: 1001, RealUsername: "alice"}
-	_ = p.db.SetContainerOwner("del-cont-1", alice, "")
+	_ = p.db.SetContainerOwner(contID, alice, "")
 
-	req := httptest.NewRequest("DELETE", "/containers/del-cont-1", nil)
+	req := httptest.NewRequest("DELETE", "/containers/"+contID, nil)
 	req = injectIdentity(req, makeTestIdentityProxy("alice", 1001))
 	rw := httptest.NewRecorder()
 	p.ServeHTTP(rw, req)
@@ -68,7 +76,7 @@ func TestServeHTTP_ContainerDelete_RemovesOwnership(t *testing.T) {
 	}
 
 	// 归属记录应已删除
-	_, found := p.db.GetContainerOwner("del-cont-1")
+	_, found := p.db.GetContainerOwner(contID)
 	if found {
 		t.Error("container ownership should be removed after delete")
 	}
@@ -83,18 +91,21 @@ func TestServeHTTP_ContainerDelete_NotOwner_Returns403(t *testing.T) {
 
 	p := newTestProxy(t, upstream, nil)
 
+	contID := scenarioContID(3)
 	// alice 拥有容器
 	alice := &auth.CallerIdentity{RealUID: 1001, RealUsername: "alice"}
-	_ = p.db.SetContainerOwner("alice-cont", alice, "")
+	_ = p.db.SetContainerOwner(contID, alice, "")
 
 	// bob 尝试删除 alice 的容器
-	req := httptest.NewRequest("DELETE", "/containers/alice-cont", nil)
+	req := httptest.NewRequest("DELETE", "/containers/"+contID, nil)
 	req = injectIdentity(req, makeTestIdentityProxy("bob", 1002))
 	rw := httptest.NewRecorder()
 	p.ServeHTTP(rw, req)
 
-	if rw.Code != http.StatusForbidden {
-		t.Errorf("status = %d, want 403 (bob cannot delete alice's container)", rw.Code)
+	// 代理对非所有者容器操作返回 404（Not Found）而非 403，
+	// 防止攻击者通过响应码探测容器是否存在。
+	if rw.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404 (bob cannot delete alice's container)", rw.Code)
 	}
 }
 
@@ -294,17 +305,20 @@ func TestServeHTTP_ContainerStop_NotOwner_Returns403(t *testing.T) {
 
 	p := newTestProxy(t, upstream, nil)
 
+	contID := scenarioContID(4)
 	alice := &auth.CallerIdentity{RealUID: 1001, RealUsername: "alice"}
-	_ = p.db.SetContainerOwner("alice-cont-3", alice, "")
+	_ = p.db.SetContainerOwner(contID, alice, "")
 
 	// bob 尝试 stop alice 的容器
-	req := httptest.NewRequest("POST", "/containers/alice-cont-3/stop", nil)
+	req := httptest.NewRequest("POST", "/containers/"+contID+"/stop", nil)
 	req = injectIdentity(req, makeTestIdentityProxy("bob", 1002))
 	rw := httptest.NewRecorder()
 	p.ServeHTTP(rw, req)
 
-	if rw.Code != http.StatusForbidden {
-		t.Errorf("status = %d, want 403 (bob cannot stop alice's container)", rw.Code)
+	// 代理对非所有者容器操作返回 404（Not Found）而非 403，
+	// 防止攻击者通过响应码探测容器是否存在。
+	if rw.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404 (bob cannot stop alice's container)", rw.Code)
 	}
 }
 

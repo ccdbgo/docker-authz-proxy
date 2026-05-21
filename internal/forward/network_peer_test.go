@@ -15,12 +15,13 @@ import (
 // 测试前提：
 //   - alice uid=1001，bob uid=1002
 //   - 互通通过 db.AddNetworkPeer 直接预置（绕过 BridgeManager，单元测试不依赖 Docker）
-//   - 共享辅助网络 ID 用常量 "peer-net-id-001" 代替
+//   - 共享辅助网络 ID 必须为合法 hex（12位或64位），否则 RewriteNetworkURL 会误判为
+//     用户自定义网络名并添加用户前缀，导致 upstream 返回 404。
 
 const (
-	aliceUID = 1001
-	bobUID   = 1002
-	peerNetID = "peer-net-id-001"
+	aliceUID  = 1001
+	bobUID    = 1002
+	peerNetID = "aabbccddeeff" // 12 位纯 hex：isHexID=true → RewriteNetworkURL 直接透传
 )
 
 // setupPeer 在 DB 中预置 alice<->bob 用户级互通记录，并注册辅助网络归属
@@ -68,7 +69,7 @@ func TestNetworkPeer_AfterAllow_BobCanInspectPeerNetwork(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"Id":"peer-net-id-001","Name":"peer-1001-1002"}`))
+		_, _ = w.Write([]byte(`{"Id":"` + peerNetID + `","Name":"peer-1001-1002"}`))
 	}))
 	defer upstream.Close()
 
