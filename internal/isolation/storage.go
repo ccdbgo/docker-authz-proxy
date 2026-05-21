@@ -1,4 +1,4 @@
-package isolation
+﻿package isolation
 
 import (
 	"context"
@@ -240,8 +240,10 @@ func (m *StorageManager) runCleanup(
 
 	// ── 1. 清理孤立 Docker Volume（有用户前缀 且 DB 中无归属记录） ──────────
 	//
-	// 安全顺序：先取 DB 归属快照，再取 Docker dangling 列表。
-	// 任何在快照时刻之前已写入 DB 的 volume 都受保护。
+	// 两阶段保护策略：
+	//   阶段一（批量）：取 DB 全量快照作为主过滤，O(1) 判断，避免 N+1 查询。
+	//   阶段二（逐条）：删除前再做一次点查询，将 TOCTOU 竞态窗口从
+	//                  "HTTP 往返级（~50ms）"收缩到"函数调用级（~1μs）"。
 	// DB 查询失败时采用保守策略：放弃本次 volume 清理，不删任何 volume。
 	ownedVols, err := db.GetAllVolumeNames()
 	if err != nil {
@@ -261,8 +263,14 @@ func (m *StorageManager) runCleanup(
 				if !isUserVolumePrefix(v.Name) {
 					continue
 				}
-				// 跳过 DB 中有归属记录的 volume（用户显式创建，未挂载 ≠ 孤立）
+				// Phase 1: snapshot filter (skip volumes owned before snapshot was taken)
 				if _, owned := ownedSet[v.Name]; owned {
+					continue
+				}
+				// Phase 2: point-query re-check to narrow TOCTOU window (skip volumes created after snapshot)
+				if _, found := db.GetVolumeOwner(v.Name); found {
+					logger.Debug("storage_cleanup_skip_toctou_protected",
+						zap.String("volume", v.Name))
 					continue
 				}
 				if err := m.removeVolume(ctx, v.Name); err != nil {
@@ -271,7 +279,11 @@ func (m *StorageManager) runCleanup(
 						zap.Error(err))
 					continue
 				}
-				_ = db.DeleteVolume(v.Name)
+				if err := db.DeleteVolume(v.Name); err != nil {
+					logger.Warn("storage_cleanup_db_delete_failed",
+						zap.String("volume", v.Name),
+						zap.Error(err))
+				}
 				volumesRemoved++
 				logger.Info("storage_cleanup_orphan_volume_removed", zap.String("volume", v.Name))
 				if auditLog != nil {

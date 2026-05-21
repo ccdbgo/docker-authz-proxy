@@ -802,6 +802,8 @@ func (o *OwnershipDB) DeleteVolume(name string) error {
 // GetAllVolumeNames 返回 DB 中所有已注册的 volume 内部名称。
 // 供清理协程一次性批量获取归属快照，避免逐 volume 查询（N+1 问题）。
 // 调用方应在查询失败时放弃本次清理（保守策略），而非继续删除。
+// 注意：全量加载，适用于 volume 总数在万级以下的部署场景。
+// 超大规模部署（10w+ volumes）需改为分批游标查询。
 func (o *OwnershipDB) GetAllVolumeNames() ([]string, error) {
 	rows, err := o.DB.Query(`SELECT name FROM volumes`)
 	if err != nil {

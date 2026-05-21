@@ -208,7 +208,7 @@ func TestCleanup_Regression_SkipsNonUserPrefixVolumes(t *testing.T) {
 //       且 proxy 未向 DB 写入归属（例如容器由 root 直接创建绕过 proxy）。
 //       修复后此类 volume 仍应被清理。
 func TestCleanup_Regression_DeletesTrulyOrphanedVolume(t *testing.T) {
-	const orphanVol = "user-1001-volume-orphan-lefover"
+	const orphanVol = "user-1001-volume-orphan-leftover"
 	// 关键：不向 DB 注册，模拟 DB 中无归属记录的孤立 volume
 
 	db := newCleanupTestDB(t)
