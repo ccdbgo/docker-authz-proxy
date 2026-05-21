@@ -411,8 +411,14 @@ func TestNetworkPrune_DBError_ReturnsEmptyAndDoesNotForwardToDocker(t *testing.T
 
 	p := newTestProxy(t, upstream, nil)
 
-	// 关闭 DB 以模拟故障
-	p.db.Close()
+	// [L1] 用一个独立的已关闭 DB 替换 p.db，模拟查询故障。
+	// 不直接关闭 newTestProxy 内部注册了 t.Cleanup 的原始 DB，避免 double-close。
+	brokenDB, err := authz.NewOwnershipDB(":memory:")
+	if err != nil {
+		t.Fatalf("NewOwnershipDB(broken): %v", err)
+	}
+	brokenDB.Close() // 立即关闭，使后续所有操作返回 error
+	p.db = brokenDB
 
 	req := httptest.NewRequest("POST", "/networks/prune", nil)
 	req = injectIdentity(req, makeTestIdentityProxy("bob", bobUID))

@@ -587,7 +587,7 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 非特权用户的 network prune：只清理自己未使用的网络
 	if action == authz.ActionPrune &&
 		strings.HasPrefix(authz.StripAPIVersion(r.URL.Path), "/networks/prune") {
-		if p.handleNetworkPrune(w, identity) {
+		if p.handleNetworkPrune(w, r, identity) {
 			return
 		}
 	}
@@ -595,7 +595,7 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 非特权用户的 system prune：调用上述全部清理逻辑
 	if action == authz.ActionPrune &&
 		strings.HasPrefix(authz.StripAPIVersion(r.URL.Path), "/system/prune") {
-		if p.handleSystemPrune(w, identity) {
+		if p.handleSystemPrune(w, r, identity) {
 			return
 		}
 	}
@@ -3931,6 +3931,20 @@ func truncID(id string) string {
 	return id
 }
 
+// isValidHexID 校验 Docker 资源 ID 是否为合法十六进制字符串（1-64字节）。
+// 防御 DB 数据被篡改后通过 URL 拼接造成路径注入 / SSRF。
+func isValidHexID(id string) bool {
+	if len(id) == 0 || len(id) > 64 {
+		return false
+	}
+	for _, c := range id {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
 // parseImageRefFromURI 从 docker pull 的请求 URI 中提取镜像引用
 func parseImageRefFromURI(requestURI string) string {
 	idx := strings.Index(requestURI, "?")
@@ -5092,7 +5106,7 @@ func writeImagePruneEmptyResponse(w http.ResponseWriter) {
 // handleNetworkPrune 拦截非特权用户的 POST /networks/prune 请求。
 // 只删除该用户拥有的、当前没有容器连接的网络（DELETE /networks/{id}，有活跃端点时 Docker 返回 403/409 跳过）。
 // 返回 true 表示已拦截处理，调用方应直接 return；返回 false 表示放行正常流程。
-func (p *ProxyServer) handleNetworkPrune(w http.ResponseWriter, id *auth.CallerIdentity) bool {
+func (p *ProxyServer) handleNetworkPrune(w http.ResponseWriter, r *http.Request, id *auth.CallerIdentity) bool {
 	if id.IsPrivileged() {
 		return false
 	}
@@ -5112,7 +5126,14 @@ func (p *ProxyServer) handleNetworkPrune(w http.ResponseWriter, id *auth.CallerI
 
 	var deleted []string
 	for _, netID := range ownedNetworkIDs {
-		delReq, err := http.NewRequest("DELETE", "http://docker/networks/"+netID, nil)
+		// [C2] 防御 DB 数据污染导致的路径注入：Docker ID 只含十六进制字符
+		if !isValidHexID(netID) {
+			p.logger.Warn("network_prune_invalid_id_skipped",
+				zap.String("network_id", netID), zap.Int("uid", id.RealUID))
+			continue
+		}
+		// [M1] 使用原始请求 context，客户端断开后 RoundTrip 可被取消
+		delReq, err := http.NewRequestWithContext(r.Context(), "DELETE", "http://docker/networks/"+netID, nil)
 		if err != nil {
 			continue
 		}
@@ -5121,9 +5142,15 @@ func (p *ProxyServer) handleNetworkPrune(w http.ResponseWriter, id *auth.CallerI
 			p.logger.Warn("network_prune_delete_failed", zap.String("network_id", truncID(netID)), zap.Error(err))
 			continue
 		}
+		// [C1] drain body 后再 Close，使 Transport 能复用底层连接
+		_, _ = io.Copy(io.Discard, delResp.Body)
 		delResp.Body.Close()
 		if delResp.StatusCode == http.StatusNoContent || delResp.StatusCode == http.StatusOK {
-			_ = p.db.DeleteNetwork(netID)
+			// [H1] 记录 DB 删除失败，防止幽灵记录静默堆积
+			if dbErr := p.db.DeleteNetwork(netID); dbErr != nil {
+				p.logger.Error("network_prune_db_delete_failed",
+					zap.String("network_id", truncID(netID)), zap.Error(dbErr))
+			}
 			deleted = append(deleted, netID)
 			p.logger.Info("network_pruned",
 				zap.String("user", fmt.Sprintf("%s(uid=%d)", id.RealUsername, id.RealUID)),
@@ -5149,7 +5176,7 @@ func (p *ProxyServer) handleNetworkPrune(w http.ResponseWriter, id *auth.CallerI
 // 依次调用 container / image / network / volume prune，各自只清理用户自己的资源，
 // 合并结果后返回与 Docker 原生 system prune 格式一致的响应。
 // 返回 true 表示已拦截处理，调用方应直接 return；返回 false 表示放行正常流程。
-func (p *ProxyServer) handleSystemPrune(w http.ResponseWriter, id *auth.CallerIdentity) bool {
+func (p *ProxyServer) handleSystemPrune(w http.ResponseWriter, r *http.Request, id *auth.CallerIdentity) bool {
 	if id.IsPrivileged() {
 		return false
 	}
@@ -5219,7 +5246,13 @@ func (p *ProxyServer) handleSystemPrune(w http.ResponseWriter, id *auth.CallerId
 	var networksDeleted []string
 	if ownedNetIDs, err := p.db.GetNetworkIDsByOwner(id.RealUID); err == nil {
 		for _, netID := range ownedNetIDs {
-			req, _ := http.NewRequest("DELETE", "http://docker/networks/"+netID, nil)
+			// [C2] 防御路径注入
+			if !isValidHexID(netID) {
+				p.logger.Warn("system_prune_invalid_network_id", zap.String("id", netID))
+				continue
+			}
+			// [M1] 传播 context
+			req, _ := http.NewRequestWithContext(r.Context(), "DELETE", "http://docker/networks/"+netID, nil)
 			if req == nil {
 				continue
 			}
@@ -5227,9 +5260,15 @@ func (p *ProxyServer) handleSystemPrune(w http.ResponseWriter, id *auth.CallerId
 			if err != nil {
 				continue
 			}
+			// [C1] drain body 复用连接
+			_, _ = io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
 			if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
-				_ = p.db.DeleteNetwork(netID)
+				// [H1] 记录 DB 删除失败
+				if dbErr := p.db.DeleteNetwork(netID); dbErr != nil {
+					p.logger.Error("system_prune_db_delete_network_failed",
+						zap.String("id", truncID(netID)), zap.Error(dbErr))
+				}
 				networksDeleted = append(networksDeleted, netID)
 			}
 		}
