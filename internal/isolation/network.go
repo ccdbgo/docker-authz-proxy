@@ -338,10 +338,11 @@ func ExtractNetworkID(path string) string {
 }
 
 // StripContainerInspectNetworkPrefix 剥除容器 inspect 响应中
-// NetworkSettings.Networks 键名及各网络条目 DNSNames 里的用户网络前缀。
-// 格式："{username}_u{uid}_"。出错时原样返回 body，保证安全透传。
-func StripContainerInspectNetworkPrefix(body []byte, netPrefix string) []byte {
-	if len(body) == 0 || netPrefix == "" {
+// NetworkSettings.Networks 键名及各网络条目 DNSNames 里的用户前缀。
+// netPrefix：网络前缀 "{username}_u{uid}_"；containerPrefix："user-{uid}-"。
+// 无实际变化时透传原始 body；出错时同样透传，保证安全。
+func StripContainerInspectNetworkPrefix(body []byte, netPrefix, containerPrefix string) []byte {
+	if len(body) == 0 || (netPrefix == "" && containerPrefix == "") {
 		return body
 	}
 
@@ -374,11 +375,27 @@ func StripContainerInspectNetworkPrefix(body []byte, netPrefix string) []byte {
 		return body
 	}
 
-	// 重建 Networks map：剥除键名前缀，并处理各条目内的 DNSNames
+	// 重建 Networks map：剥除键名前缀，并处理各条目内的 DNSNames。
+	// 用 changed 标记是否有任何实际修改，无修改时直接透传原始 body，
+	// 避免对无用户自定义网络的容器做无意义的全量 JSON 重建。
+	changed := false
 	newNetworks := make(map[string]json.RawMessage, len(networks))
 	for key, entry := range networks {
 		newKey := strings.TrimPrefix(key, netPrefix)
-		newNetworks[newKey] = stripNetworkEntryDNSPrefix(entry, netPrefix)
+		if newKey == "" {
+			newKey = key // 防御：键名等于前缀时保留原键，不产生空字符串键
+		}
+		if newKey != key {
+			changed = true
+		}
+		newEntry, entryChanged := stripNetworkEntryDNSPrefix(entry, netPrefix, containerPrefix)
+		if entryChanged {
+			changed = true
+		}
+		newNetworks[newKey] = newEntry
+	}
+	if !changed {
+		return body // 无任何前缀需要剥除，透传原始 body，保留原始字段顺序
 	}
 
 	newNetworksRaw, err := json.Marshal(newNetworks)
@@ -401,43 +418,48 @@ func StripContainerInspectNetworkPrefix(body []byte, netPrefix string) []byte {
 }
 
 // stripNetworkEntryDNSPrefix 剥除单个网络条目 JSON 中 DNSNames 数组里的用户前缀。
-// 出错或无变化时返回原始 entry。
-func stripNetworkEntryDNSPrefix(entry json.RawMessage, prefix string) json.RawMessage {
+// 按顺序尝试 prefixes 中每个前缀，匹配即剥除，每个 DNS 条目最多剥除一次。
+// 返回 (修改后的 entry, 是否实际发生修改)；出错或无变化时返回原始 entry + false。
+func stripNetworkEntryDNSPrefix(entry json.RawMessage, prefixes ...string) (json.RawMessage, bool) {
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(entry, &obj); err != nil {
-		return entry
+		return entry, false
 	}
 
 	dnsRaw, ok := obj["DNSNames"]
 	if !ok || string(dnsRaw) == "null" {
-		return entry
+		return entry, false
 	}
 
 	var dnsNames []string
 	if err := json.Unmarshal(dnsRaw, &dnsNames); err != nil {
-		return entry
+		return entry, false
 	}
 
 	modified := false
 	for i, dns := range dnsNames {
-		if strings.HasPrefix(dns, prefix) {
-			dnsNames[i] = strings.TrimPrefix(dns, prefix)
-			modified = true
+		for _, p := range prefixes {
+			if p != "" && strings.HasPrefix(dns, p) {
+				dnsNames[i] = strings.TrimPrefix(dns, p)
+				modified = true
+				break // 每个 DNS 条目最多剥除一次，避免级联剥除
+			}
 		}
 	}
 	if !modified {
-		return entry
+		return entry, false
 	}
 
 	newDNSRaw, err := json.Marshal(dnsNames)
 	if err != nil {
-		return entry
+		return entry, false
 	}
 	obj["DNSNames"] = newDNSRaw
 
 	result, err := json.Marshal(obj)
 	if err != nil {
-		return entry
+		return entry, false
 	}
-	return result
+	return result, true
 }
+

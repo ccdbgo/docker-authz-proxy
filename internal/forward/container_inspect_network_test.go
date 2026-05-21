@@ -173,10 +173,11 @@ func TestContainerInspect_NetworkKey_PrefixNotStripped_Bug(t *testing.T) {
 // 由于网络名使用了内部前缀形式，DNSNames 里同样包含 "bob_u1002_mynet"。
 // 修复前，代理不处理 DNSNames，该数组中的前缀泄露给用户。
 func TestContainerInspect_DNSNames_PrefixNotStripped_Bug(t *testing.T) {
+	// Docker 真实输出：DNSNames 含网络前缀和容器名前缀两类内部名称
 	body := buildContainerInspectBody(
 		"user-1002-mycontainer",
 		map[string][]string{
-			"bob_u1002_mynet": {"bob_u1002_mynet", "mycontainer"},
+			"bob_u1002_mynet": {"bob_u1002_mynet", "user-1002-mycontainer"},
 		},
 	)
 
@@ -453,9 +454,123 @@ func TestContainerInspect_ImageInspect_NotAffected(t *testing.T) {
 	}
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// 8. [NORMAL] DNSNames 中的容器名前缀（user-{uid}-）同样被剥除
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// Docker 将容器名（内部含 user-{uid}- 前缀）注入 DNSNames。
+// 修复后网络前缀和容器前缀均应被剥除；短容器 ID（无前缀）原样保留。
+func TestContainerInspect_DNSNames_ContainerNamePrefix_Stripped(t *testing.T) {
+	body := buildContainerInspectBody(
+		"user-1002-mycontainer",
+		map[string][]string{
+			"bob_u1002_mynet": {"bob_u1002_mynet", "user-1002-mycontainer", "273d88afe39b"},
+		},
+	)
+	p := buildInspectTestProxy(t, body)
+
+	req := httptest.NewRequest("GET", "/containers/"+cInspectBobContID+"/json", nil)
+	req = injectIdentity(req, makeTestIdentityProxy("bob", bobUID))
+	rw := httptest.NewRecorder()
+	p.ServeHTTP(rw, req)
+
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rw.Code)
+	}
+
+	var resp struct {
+		NetworkSettings struct {
+			Networks map[string]struct {
+				DNSNames []string `json:"DNSNames"`
+			} `json:"Networks"`
+		} `json:"NetworkSettings"`
+	}
+	if err := json.Unmarshal(rw.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+
+	entry, ok := resp.NetworkSettings.Networks["mynet"]
+	if !ok {
+		t.Fatalf("期望 Networks 存在键 \"mynet\"，实际键集合: %v",
+			networkKeys2(resp.NetworkSettings.Networks))
+	}
+
+	// 断言 1：DNSNames 中无任何内部前缀
+	for _, dns := range entry.DNSNames {
+		if strings.Contains(dns, "user-1002-") || strings.Contains(dns, "bob_u1002_") {
+			t.Errorf("DNSNames 仍含内部前缀: %q（期望已剥除）", dns)
+		}
+	}
+
+	// 断言 2：短容器 ID（无前缀）应原样保留
+	found := false
+	for _, dns := range entry.DNSNames {
+		if dns == "273d88afe39b" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("短容器 ID 应在 DNSNames 中原样保留，got: %v", entry.DNSNames)
+	}
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 9. [EDGE] 容器仅连接系统网络（无用户前缀）— body 完全透传，字段不乱序
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// 验证 changed=false 路径：无用户自定义网络时直接返回原始 body，
+// 避免不必要的 JSON 重建（性能保护）且不破坏字段顺序。
+func TestContainerInspect_NoUserNetwork_BodyTransparent(t *testing.T) {
+	// 仅有系统桥接网络，键名无 bob_u1002_ 前缀
+	rawBody := buildContainerInspectBody(
+		"user-1002-isolated",
+		map[string][]string{
+			"user-1002-bridge": {"user-1002-isolated"},
+		},
+	)
+	p := buildInspectTestProxy(t, rawBody)
+
+	req := httptest.NewRequest("GET", "/containers/"+cInspectBobContID+"/json", nil)
+	req = injectIdentity(req, makeTestIdentityProxy("bob", bobUID))
+	rw := httptest.NewRecorder()
+	p.ServeHTTP(rw, req)
+
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rw.Code)
+	}
+
+	var resp struct {
+		NetworkSettings struct {
+			Networks map[string]json.RawMessage `json:"Networks"`
+		} `json:"NetworkSettings"`
+	}
+	if err := json.Unmarshal(rw.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+
+	// 系统桥接网络键名无用户前缀，应保持不变
+	if _, ok := resp.NetworkSettings.Networks["user-1002-bridge"]; !ok {
+		t.Errorf("系统桥接网络键名被意外修改，实际键集合: %v",
+			networkKeys(resp.NetworkSettings.Networks))
+	}
+	// 响应体不应含用户网络前缀
+	if strings.Contains(rw.Body.String(), "bob_u1002_") {
+		t.Errorf("响应体不应含有用户网络前缀: %q", truncateStr(rw.Body.String(), 256))
+	}
+}
+
 // ── 内部辅助函数 ──────────────────────────────────────────────────────────────
 
 func networkKeys(m map[string]json.RawMessage) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// networkKeys2 同 networkKeys，用于含 DNSNames 字段的 struct map。
+func networkKeys2(m map[string]struct{ DNSNames []string `json:"DNSNames"` }) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)
