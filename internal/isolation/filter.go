@@ -536,12 +536,18 @@ func FilterSwarmInspectResponse(body []byte, privileged bool) ([]byte, error) {
 }
 
 // rebuildUsageField 根据过滤后的 items 重建 Docker 29.x *Usage 汇总字段。
-// 原始字段（orig）可能为 nil（旧版 Docker 守护进程不返回此字段）；
-// 此时若 items 非空则构造最小结构，否则返回 nil 使输出字段被 omitempty 省略。
+//
+// orig 为 nil 的两种情形：
+//  1. 旧版 Docker 守护进程（< 29.x）不返回 *Usage 字段 — 不输出，保持兼容。
+//  2. Docker 29.x ?verbose=1 请求 — daemon 只返回顶层数组，无 *Usage 字段。
+//     若代理此时创建 *Usage 字段，Docker CLI verbose 渲染路径会切换到
+//     读 *Usage.Items，导致 docker system df -v 详情表格全部显示为空。
+//
+// 因此：orig 为 nil 时直接返回 nil，不主动创建字段。
 // kind 仅用于区分不同资源的字段名差异（"image"/"container"/"volume"）。
 func rebuildUsageField(orig json.RawMessage, items []json.RawMessage, kind string) (json.RawMessage, error) {
-	// 若原始字段不存在且过滤后也无条目，不输出该字段（保持旧版 Docker 兼容）
-	if len(orig) == 0 && len(items) == 0 {
+	// 原始字段不存在（旧版 Docker 或 verbose=1 模式）→ 不创建新字段
+	if len(orig) == 0 {
 		return nil, nil
 	}
 

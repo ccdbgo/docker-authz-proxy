@@ -3694,18 +3694,49 @@ func stripInternalPrefixFromErrorMessage(p *ProxyServer, body []byte, id *auth.C
 // extractNetworkNameFromErrorMsg 从 Docker 错误信息中提取网络名。
 // 格式：invalid config for network <name>: ...
 // stripNetworkNamePrefix 将 network inspect 响应体中的 Name 字段值剥除用户前缀。
-// 使用字节替换而非反序列化，保留原始 JSON 结构不变。
+// 用 JSON 解析提取精确值后，以"键:值"整体为替换目标（而非裸值），
+// 防止响应体中其他字段（如 Labels、Containers）碰巧含有相同字符串时被误替换。
+// 同时兼容紧凑格式（"Name":"..."）和带空格格式（"Name": "..."）。
 func stripNetworkNamePrefix(body []byte, prefix string) []byte {
-	// 构造 JSON 中的原始名称片段和替换后的片段，直接做字节替换
-	// 原始："Name":"<prefix><name>"  →  替换为："Name":"<name>"
-	quotedPrefix, _ := json.Marshal(prefix)
-	// quotedPrefix 形如 "alice_u1001_"（含引号），去掉两端引号得到纯前缀字符串
-	prefixStr := string(quotedPrefix[1 : len(quotedPrefix)-1])
-	old := []byte(`"Name":"` + prefixStr)
-	if !bytes.Contains(body, old) {
+	if len(body) == 0 || prefix == "" {
 		return body
 	}
-	return bytes.Replace(body, old, []byte(`"Name":"`), 1)
+	var obj struct {
+		Name       string `json:"Name"`
+		ConfigFrom struct {
+			Network string `json:"Network"`
+		} `json:"ConfigFrom"`
+	}
+	if err := json.Unmarshal(body, &obj); err != nil || !strings.HasPrefix(obj.Name, prefix) {
+		return body
+	}
+	quotedOld, _ := json.Marshal(obj.Name)
+	quotedNew, _ := json.Marshal(strings.TrimPrefix(obj.Name, prefix))
+	result := replaceJSONFieldValue(body, "Name", quotedOld, quotedNew)
+	// 同步剥除 ConfigFrom.Network（docker network create --config-from 时同样被注入前缀）
+	if strings.HasPrefix(obj.ConfigFrom.Network, prefix) {
+		cfOld, _ := json.Marshal(obj.ConfigFrom.Network)
+		cfNew, _ := json.Marshal(strings.TrimPrefix(obj.ConfigFrom.Network, prefix))
+		result = replaceJSONFieldValue(result, "Network", cfOld, cfNew)
+	}
+	return result
+}
+
+// replaceJSONFieldValue 在 JSON 字节流中将指定字段的值从 oldVal 替换为 newVal。
+// 以 "Key":oldVal 或 "Key": oldVal 为整体匹配目标，只替换第一处，保留原始 JSON 结构。
+// 注意：每次循环独立构造 searchPat/replacePat，避免 append 复用底层数组导致数据污染。
+func replaceJSONFieldValue(body []byte, key string, oldVal, newVal []byte) []byte {
+	prefix := `"` + key + `":`
+	for _, sep := range []string{"", " "} {
+		searchPat := []byte(prefix + sep)
+		searchPat = append(searchPat, oldVal...)
+		if bytes.Contains(body, searchPat) {
+			replacePat := []byte(prefix + sep)
+			replacePat = append(replacePat, newVal...)
+			return bytes.Replace(body, searchPat, replacePat, 1)
+		}
+	}
+	return body
 }
 
 // syncMemorySwapForUpdate 将 container update 请求体中的 MemorySwap 同步为 Memory 值。
