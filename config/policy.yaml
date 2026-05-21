@@ -49,15 +49,6 @@ deny_rules:
   - users: [test-docker-g]
     actions: [build, push, commit, load, save, plugin]
 
-  # ── bob：普通开发者，禁止 exec/构建/推送/提交/导入导出 ──────────────────────
-  # 注：swarm/secret/config 操作允许（代理有归属隔离，用户只能操作自己的资源）
-  # 注：prune 操作允许（代理自动限制为只清理自己的资源）
-  - users: [bob]
-    actions: [exec, build, push, commit, load, save, plugin]
-
-  # ── alice：受限用户，禁止 ps/exec/构建/推送/提交/导入导出 ──────────────────
-  - users: [alice]
-    actions: [ps, exec, build, push, commit, load, save, plugin]
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 操作别名展开说明

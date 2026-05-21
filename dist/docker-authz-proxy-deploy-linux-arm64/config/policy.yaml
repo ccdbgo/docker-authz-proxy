@@ -41,23 +41,48 @@ version: 1
 default_action: allow
 
 deny_rules:
-  # ── test-sudo：sudo 组成员，禁止推送镜像和集群/插件/密钥管理 ──────────────
+  # ── test-sudo：sudo 组成员，禁止推送镜像和插件管理 ──────────────────────────
   - users: [test-sudo]
-    actions: [push, swarm, plugin, secret, config]
+    actions: [push, plugin]
 
-  # ── test-docker-g：docker 组成员，禁止构建/推送/提交/导入导出/集群管理 ──────
+  # ── test-docker-g：docker 组成员，禁止构建/推送/提交/导入导出 ──────────────
   - users: [test-docker-g]
-    actions: [build, push, commit, load, save, swarm, plugin, secret, config]
+    actions: [build, push, commit, load, save, plugin]
 
-  # ── bob：普通开发者，禁止 exec/构建/推送/提交/导入导出/集群管理 ──────────────
-  - users: [bob]
-    actions: [exec, build, push, commit, load, save, swarm, plugin, secret, config]
 
-  # ── alice：受限用户，禁止 ps/exec/构建/推送/提交/导入导出/清理/集群管理 ──────
-  - users: [alice]
-    actions: [ps, exec, build, push, commit, load, save, prune, swarm, plugin, secret, config]
+# ══════════════════════════════════════════════════════════════════════════════
+# 操作别名展开说明
+# ──────────────────────────────────────────────────────────────────────────────
+# deny_rules 中的 actions 支持以下别名，代理会自动展开为对应的子操作：
+#
+#   run     →  create_container + start          (docker run 拆分为两步)
+#   swarm   →  swarm_init + swarm_join + swarm_leave + swarm_update +
+#              swarm_unlock + swarm_inspect +
+#              node_ls + node_inspect + node_update + node_rm +
+#              service_ls + service_create + service_inspect + service_update +
+#              service_rm + service_logs +
+#              task_ls + task_inspect +
+#              secret_ls + secret_create + secret_inspect + secret_update + secret_rm +
+#              config_ls + config_create + config_inspect + config_update + config_rm
+#   secret  →  secret_ls + secret_create + secret_inspect + secret_update + secret_rm
+#   config  →  config_ls + config_create + config_inspect + config_update + config_rm
+#   plugin  →  plugin_ls + plugin_inspect + plugin_install + plugin_rm +
+#              plugin_enable + plugin_disable + plugin_upgrade +
+#              plugin_set + plugin_push + plugin_create
+#
+# 如需细粒度控制，可直接使用子操作名。例如：
+#   仅禁止 service_create，但允许 service_ls/inspect/logs：
+#     actions: [service_create]
+#   禁止集群管理，但允许普通用户操作自己的 service/secret/config：
+#     actions: [swarm_init, swarm_join, swarm_leave, swarm_update, swarm_unlock,
+#              node_update, node_rm]
+# ══════════════════════════════════════════════════════════════════════════════
 
-# 操作分类映射（仅供参考，实际映射由程序内部硬编码实现）
+# ⚠️  注意：以下 action_mapping 节仅为文档说明用途，不被程序读取。
+#     实际的 HTTP 路径分类由代码中的 ClassifyAction() 函数硬编码实现
+#     （internal/authz/policy.go），修改此节不会改变代理的行为。
+# ──────────────────────────────────────────────────────────────────────────────
+# 操作分类映射（文档参考，程序不读取此节）
 action_mapping:
   # ── 容器操作 ──────────────────────────────────────────────────────────────
   ps:               ["GET /containers/json"]
@@ -116,8 +141,46 @@ action_mapping:
   events:  ["GET /events"]
   login:   ["POST /auth"]
 
-  # ── Swarm / Service / Node / Task ─────────────────────────────────────────
-  swarm:   ["/swarm/*", "/nodes/*", "/services/*", "/tasks/*"]
+  # ── Swarm 集群管理 ────────────────────────────────────────────────────────
+  # 别名 "swarm" 展开为以下所有子操作（含 node/service/task/secret/config）
+  swarm_inspect:  ["GET /swarm"]
+  swarm_init:     ["POST /swarm/init"]
+  swarm_join:     ["POST /swarm/join"]
+  swarm_leave:    ["POST /swarm/leave"]
+  swarm_update:   ["POST /swarm/update"]
+  swarm_unlock:   ["POST /swarm/unlock"]
+
+  # ── Node 节点管理 ─────────────────────────────────────────────────────────
+  node_ls:      ["GET /nodes"]
+  node_inspect: ["GET /nodes/{id}", "GET /nodes/{id}/json"]
+  node_update:  ["POST /nodes/{id}/update"]
+  node_rm:      ["DELETE /nodes/{id}"]
+
+  # ── Service 服务管理 ──────────────────────────────────────────────────────
+  service_ls:      ["GET /services"]
+  service_create:  ["POST /services/create"]
+  service_inspect: ["GET /services/{id}"]
+  service_update:  ["POST /services/{id}/update"]
+  service_rm:      ["DELETE /services/{id}"]
+  service_logs:    ["GET /services/{id}/logs"]
+
+  # ── Task 任务管理 ─────────────────────────────────────────────────────────
+  task_ls:      ["GET /tasks"]
+  task_inspect: ["GET /tasks/{id}"]
+
+  # ── Secret 密钥管理（别名 "secret" 展开为以下子操作）──────────────────────
+  secret_ls:      ["GET /secrets"]
+  secret_create:  ["POST /secrets/create"]
+  secret_inspect: ["GET /secrets/{id}"]
+  secret_update:  ["POST /secrets/{id}/update"]
+  secret_rm:      ["DELETE /secrets/{id}"]
+
+  # ── Config 配置管理（别名 "config" 展开为以下子操作）──────────────────────
+  config_ls:      ["GET /configs"]
+  config_create:  ["POST /configs/create"]
+  config_inspect: ["GET /configs/{id}"]
+  config_update:  ["POST /configs/{id}/update"]
+  config_rm:      ["DELETE /configs/{id}"]
 
   # ── 插件操作（细粒度）────────────────────────────────────────────────────────
   # 使用 "plugin" 可一次性禁止所有插件操作（等价于列出所有子操作）
