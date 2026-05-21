@@ -628,6 +628,39 @@ func TestFilterSystemDFResponse_Regression_NonVerbose_UsageFieldsRebuilt(t *test
 		t.Errorf("非 verbose 模式 ContainerUsage.TotalCount = %d，期望 1（bob 仅有 1 个容器）",
 			result.ContainerUsage.TotalCount)
 	}
+
+	// 补充：验证 ImageUsage.Items 内容正确，防止 TotalCount 正确但 Items 为空的静默回归
+	var detailed struct {
+		ImageUsage struct {
+			Items []struct {
+				Id string `json:"Id"`
+			} `json:"Items"`
+		} `json:"ImageUsage"`
+	}
+	if err := json.Unmarshal(filtered, &detailed); err != nil {
+		t.Fatalf("解析 ImageUsage.Items 失败: %v", err)
+	}
+	if len(detailed.ImageUsage.Items) != 1 || detailed.ImageUsage.Items[0].Id != "sha256:bob-img-001" {
+		t.Errorf("ImageUsage.Items 内容错误，期望 [{Id:sha256:bob-img-001}]，实际 %+v",
+			detailed.ImageUsage.Items)
+	}
+
+	// 补充：验证 "ImageUsage": null 不会触发 nil map panic
+	// （回归防护：orig 非空但 json.Unmarshal 后 m=nil 的极端情形）
+	nullUsageBody, _ := json.Marshal(map[string]interface{}{
+		"LayersSize":     int64(0),
+		"Images":         []interface{}{},
+		"Containers":     []interface{}{},
+		"Volumes":        []interface{}{},
+		"BuildCache":     []interface{}{},
+		"ImageUsage":     nil, // JSON null → orig=[]byte("null"), len=4>0, Unmarshal→m=nil
+		"ContainerUsage": nil,
+		"VolumeUsage":    nil,
+	})
+	if _, err := FilterSystemDFResponse(nullUsageBody, bob.RealUID, false, db); err != nil {
+		t.Errorf(`"field":null 输入不应返回 error，实际: %v`, err)
+	}
+	// 若 nil map panic，Go test 框架会以 FAIL 捕获（不会 crash 进程）
 }
 
 // TestFilterSystemDFResponse_Regression_VerboseMode_EmptyUser

@@ -480,9 +480,10 @@ func FilterSystemDFResponse(body []byte, realUID int, privileged bool, db Owners
 	}
 
 	// ── 重建 Docker 29.x *Usage 汇总字段 ────────────────────────────────────
-	// Docker 29.x CLI 读取 ImageUsage/ContainerUsage/VolumeUsage 的 TotalCount
-	// 来显示资源数量，旧版 Images/Containers/Volumes 数组仅供旧版 CLI 使用。
-	// 必须将过滤后的条目同步写入 Items 并更新 TotalCount，否则 CLI 显示全零。
+	// 仅当 daemon 原始响应中存在该字段时才重建（rebuildUsageField 在 orig==nil 时返回 nil）：
+	//   非 verbose：daemon 返回 *Usage，代理用过滤结果重建 TotalCount/Items（CLI 读此显示数量）。
+	//   verbose=1 ：daemon 不返回 *Usage，返回 nil（omitempty 省略），CLI 读顶层数组渲染详情。
+	//   旧版 Docker：同 verbose，不返回 *Usage，同样 omitempty 省略。
 	imageUsage, _ := rebuildUsageField(raw.ImageUsage, filteredImages, "image")
 	containerUsage, _ := rebuildUsageField(raw.ContainerUsage, filteredContainers, "container")
 	volumeUsage, _ := rebuildUsageField(raw.VolumeUsage, filteredVolumes, "volume")
@@ -537,27 +538,25 @@ func FilterSwarmInspectResponse(body []byte, privileged bool) ([]byte, error) {
 
 // rebuildUsageField 根据过滤后的 items 重建 Docker 29.x *Usage 汇总字段。
 //
-// orig 为 nil 的两种情形：
-//  1. 旧版 Docker 守护进程（< 29.x）不返回 *Usage 字段 — 不输出，保持兼容。
-//  2. Docker 29.x ?verbose=1 请求 — daemon 只返回顶层数组，无 *Usage 字段。
-//     若代理此时创建 *Usage 字段，Docker CLI verbose 渲染路径会切换到
-//     读 *Usage.Items，导致 docker system df -v 详情表格全部显示为空。
+// orig 为空（absent/nil）的情形：旧版 Docker（< 29.x）或 ?verbose=1 请求时，
+// daemon 不返回 *Usage 字段。若代理此时主动创建该字段，Docker CLI verbose
+// 渲染路径会切换到 *Usage.Items，导致详情表格全空。
+// 因此 orig 为空时直接返回 nil（omitempty 省略该字段）。
 //
-// 因此：orig 为 nil 时直接返回 nil，不主动创建字段。
+// 注意：若 daemon 返回 "ImageUsage": null（JSON null），orig = []byte("null")，
+// len > 0 会通过早期返回检查，Unmarshal 后 m 可能为 nil，
+// 需在写入前显式初始化，防止 nil map panic。
 // kind 仅用于区分不同资源的字段名差异（"image"/"container"/"volume"）。
 func rebuildUsageField(orig json.RawMessage, items []json.RawMessage, kind string) (json.RawMessage, error) {
-	// 原始字段不存在（旧版 Docker 或 verbose=1 模式）→ 不创建新字段
+	// orig 为空：daemon 未返回该字段（旧版 Docker 或 verbose=1）→ 不创建新字段
 	if len(orig) == 0 {
 		return nil, nil
 	}
 
-	// 解析原始字段为通用 map，保留所有原始数值字段
+	// 解析原始字段为通用 map，保留所有原始数值字段。
+	// 若 orig 为 JSON null，Unmarshal 不报错但 m 仍为 nil，需显式初始化防止 nil map panic。
 	var m map[string]json.RawMessage
-	if len(orig) > 0 {
-		if err := json.Unmarshal(orig, &m); err != nil {
-			m = make(map[string]json.RawMessage)
-		}
-	} else {
+	if err := json.Unmarshal(orig, &m); err != nil || m == nil {
 		m = make(map[string]json.RawMessage)
 	}
 
@@ -577,15 +576,16 @@ func rebuildUsageField(orig json.RawMessage, items []json.RawMessage, kind strin
 		m["ActiveCount"] = totalCount
 	}
 
-	// container 特有：Reclaimable 保持原值（无法精确计算用户级别，置 0）
+	// zero 用于置空无法精确计算的用户级数值字段
+	zero, _ := json.Marshal(int64(0))
+
+	// TotalSize 置 0（用户级别无法精确计算共享层大小）
+	m["TotalSize"] = zero
+
+	// container 特有：Reclaimable 置 0（无法精确计算用户级别）
 	if kind == "container" {
-		zero, _ := json.Marshal(int64(0))
 		m["Reclaimable"] = zero
 	}
-
-	// TotalSize 置 0（用户级别无法精确计算共享层）
-	zero, _ := json.Marshal(int64(0))
-	m["TotalSize"] = zero
 
 	return json.Marshal(m)
 }
