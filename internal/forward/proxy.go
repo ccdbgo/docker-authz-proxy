@@ -1911,6 +1911,8 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 			if bytes.Contains(body, old) {
 				body = bytes.Replace(body, old, []byte(`"Name":"/`), 1)
 			}
+			// 剥除 NetworkSettings.Networks 键名及 DNSNames 中的网络前缀
+			body = isolation.StripContainerInspectNetworkPrefix(body, isolation.UserResourcePrefix(id))
 		}
 		isolation.CopyHeaders(w, resp.Header)
 		w.Header().Set("Content-Length", strconv.Itoa(len(body)))

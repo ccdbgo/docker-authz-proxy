@@ -323,3 +323,108 @@ func ExtractNetworkID(path string) string {
 	}
 	return rest
 }
+
+// StripContainerInspectNetworkPrefix 剥除容器 inspect 响应中
+// NetworkSettings.Networks 键名及各网络条目 DNSNames 里的用户网络前缀。
+// 格式："{username}_u{uid}_"。出错时原样返回 body，保证安全透传。
+func StripContainerInspectNetworkPrefix(body []byte, netPrefix string) []byte {
+	if len(body) == 0 || netPrefix == "" {
+		return body
+	}
+
+	var resp map[string]json.RawMessage
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return body
+	}
+
+	nsRaw, ok := resp["NetworkSettings"]
+	if !ok {
+		return body // 镜像 inspect，无 NetworkSettings，直接跳过
+	}
+
+	var ns map[string]json.RawMessage
+	if err := json.Unmarshal(nsRaw, &ns); err != nil {
+		return body
+	}
+
+	networksRaw, ok := ns["Networks"]
+	if !ok {
+		return body
+	}
+
+	var networks map[string]json.RawMessage
+	if err := json.Unmarshal(networksRaw, &networks); err != nil {
+		return body
+	}
+
+	if len(networks) == 0 {
+		return body
+	}
+
+	// 重建 Networks map：剥除键名前缀，并处理各条目内的 DNSNames
+	newNetworks := make(map[string]json.RawMessage, len(networks))
+	for key, entry := range networks {
+		newKey := strings.TrimPrefix(key, netPrefix)
+		newNetworks[newKey] = stripNetworkEntryDNSPrefix(entry, netPrefix)
+	}
+
+	newNetworksRaw, err := json.Marshal(newNetworks)
+	if err != nil {
+		return body
+	}
+	ns["Networks"] = newNetworksRaw
+
+	newNSRaw, err := json.Marshal(ns)
+	if err != nil {
+		return body
+	}
+	resp["NetworkSettings"] = newNSRaw
+
+	result, err := json.Marshal(resp)
+	if err != nil {
+		return body
+	}
+	return result
+}
+
+// stripNetworkEntryDNSPrefix 剥除单个网络条目 JSON 中 DNSNames 数组里的用户前缀。
+// 出错或无变化时返回原始 entry。
+func stripNetworkEntryDNSPrefix(entry json.RawMessage, prefix string) json.RawMessage {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(entry, &obj); err != nil {
+		return entry
+	}
+
+	dnsRaw, ok := obj["DNSNames"]
+	if !ok || string(dnsRaw) == "null" {
+		return entry
+	}
+
+	var dnsNames []string
+	if err := json.Unmarshal(dnsRaw, &dnsNames); err != nil {
+		return entry
+	}
+
+	modified := false
+	for i, dns := range dnsNames {
+		if strings.HasPrefix(dns, prefix) {
+			dnsNames[i] = strings.TrimPrefix(dns, prefix)
+			modified = true
+		}
+	}
+	if !modified {
+		return entry
+	}
+
+	newDNSRaw, err := json.Marshal(dnsNames)
+	if err != nil {
+		return entry
+	}
+	obj["DNSNames"] = newDNSRaw
+
+	result, err := json.Marshal(obj)
+	if err != nil {
+		return entry
+	}
+	return result
+}
