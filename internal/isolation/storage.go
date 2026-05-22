@@ -317,6 +317,11 @@ func (m *StorageManager) runCleanup(
 		zap.Int("empty_dirs_removed", dirsRemoved))
 }
 
+// IsUserVolumePrefix 判断 volume 名称是否匹配 user-{digits}-volume-* 模式（可被外部包调用）。
+func IsUserVolumePrefix(name string) bool {
+	return isUserVolumePrefix(name)
+}
+
 // isUserVolumePrefix 判断 volume 名称是否匹配 user-{digits}-volume-* 模式
 func isUserVolumePrefix(name string) bool {
 	if !strings.HasPrefix(name, "user-") {

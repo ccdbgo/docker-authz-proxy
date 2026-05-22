@@ -1860,7 +1860,8 @@ func (e *upstreamError) Unwrap() error { return e.cause }
 
 // eventBelongsToUser 判断一行 docker events JSON 是否属于指定 uid 的用户。
 // 过滤规则：
-//   - container/volume/image 事件：通过 system.authz.owner.uid 或 user_id 字段判断
+//   - volume 事件：通过卷名前缀 user-{uid}-volume-* 判断（卷 API 不支持自定义 Attributes 标签）
+//   - container/image 事件：通过 system.authz.owner.uid 或 user_id 字段判断
 //   - network 事件：通过网络名前缀 user-<uid>- 或 peer-<uid>- 判断
 //   - 无法判断归属的事件（系统事件、无 uid 字段）一律放行
 func eventBelongsToUser(line []byte, uid int) bool {
@@ -1884,7 +1885,37 @@ func eventBelongsToUser(line []byte, uid int) bool {
 		name := attrs["name"]
 		return strings.HasPrefix(name, "user-"+uidStr+"-") ||
 			strings.HasPrefix(name, "peer-"+uidStr+"-") ||
-			strings.HasPrefix(name, "peer-") && strings.Contains(name, "-"+uidStr+"-")
+			(strings.HasPrefix(name, "peer-") && strings.Contains(name, "-"+uidStr+"-"))
+	}
+
+	// volume 事件：Docker volume Attributes 不携带自定义标签，
+	// 通过卷名前缀 user-{digits}-volume-* 判断归属。
+	// 三条路径：
+	//   1. 名称属于本用户 (user-{uid}-volume-*)      → true
+	//   2. 名称属于其他用户 (user-{other}-volume-*)  → false（隔离）
+	//   3. 非用户格式（系统卷 / 格式非法）            → true（放行，宁滥勿缺）
+	//
+	// 路径 2 的识别与 isUserVolumePrefix（isolation/storage.go）严格对齐：
+	// user- + 纯数字段 + -volume-，严禁用 strings.Contains 等宽松匹配，
+	// 否则格式非法的卷名会走入路径 2，对全部用户静默丢弃事件。
+	if ev.Type == "volume" {
+		name := attrs["name"]
+		ownPrefix := "user-" + uidStr + "-volume-"
+		if strings.HasPrefix(name, ownPrefix) {
+			return true // 路径 1：属于本用户
+		}
+		// 路径 2 / 路径 3：判断是否为其他用户的合法具名卷
+		if strings.HasPrefix(name, "user-") {
+			rest := name[len("user-"):]
+			i := 0
+			for i < len(rest) && rest[i] >= '0' && rest[i] <= '9' {
+				i++
+			}
+			if i > 0 && strings.HasPrefix(rest[i:], "-volume-") {
+				return false // 路径 2：格式合法，但属于其他用户
+			}
+		}
+		return true // 路径 3：系统卷或格式不合法，放行
 	}
 
 	// 其他事件：通过 system.authz.owner.uid 或 user_id 判断
@@ -4898,20 +4929,28 @@ func (p *ProxyServer) checkCreateContainerNetworks(w http.ResponseWriter, r *htt
 	return nil
 }
 
-// handleVolumePrune 拦截非特权用户的 POST /volumes/prune 请求。
+// handleVolumePrune 拦截 POST /volumes/prune 请求。
 // Docker 原生 volume prune 只删匿名 volume，无法删除具名 volume（即使未被使用）。
-// 代理改为：从 DB 查出用户拥有的所有具名 volume，逐个调 DELETE /volumes/{name}，
+// 代理改为：从 DB 查出目标具名 volume 列表，逐个调 DELETE /volumes/{name}，
 // 跳过正在使用的（409 Conflict），构造与 Docker 原生格式一致的响应返回。
+//
+//   - IsPrivileged()==true (root/sudo)：删除所有用户的具名 volume
+//   - IsPrivileged()==false (普通用户)：只删除自己的具名 volume
+//
 // 返回 true 表示已拦截处理，调用方应直接 return；返回 false 表示放行正常流程。
 func (p *ProxyServer) handleVolumePrune(w http.ResponseWriter, id *auth.CallerIdentity) bool {
+	var ownedVols []string
+	var err error
 	if id.IsPrivileged() {
-		return false // root/sudo 用户直接透传，不干预
+		// root/sudo：删除 DB 中所有用户的具名卷
+		ownedVols, err = p.db.GetAllVolumeNames()
+	} else {
+		// 普通用户：只删除自己的具名卷
+		ownedVols, err = p.db.GetVolumeNamesByOwner(id.RealUID)
 	}
-
-	ownedVols, err := p.db.GetVolumeNamesByOwner(id.RealUID)
 	if err != nil {
 		p.logger.Error("volume_prune_db_error",
-			zap.Int("uid", id.RealUID),
+			zap.Int("operator_uid", id.RealUID),
 			zap.Error(err))
 		// DB 故障时回退为空结果，不报错
 		writeVolumePruneEmptyResponse(w)
@@ -4920,6 +4959,10 @@ func (p *ProxyServer) handleVolumePrune(w http.ResponseWriter, id *auth.CallerId
 
 	var deleted []string
 	for _, volName := range ownedVols {
+		// 仅允许代理自身格式的具名卷（防路径注入）
+		if !isolation.IsUserVolumePrefix(volName) {
+			continue
+		}
 		req, err := http.NewRequest("DELETE", "http://docker/volumes/"+volName, nil)
 		if err != nil {
 			continue
@@ -4931,12 +4974,13 @@ func (p *ProxyServer) handleVolumePrune(w http.ResponseWriter, id *auth.CallerId
 				zap.Error(err))
 			continue
 		}
+		_, _ = io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 		if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
 			_ = p.db.DeleteVolume(volName)
 			deleted = append(deleted, volName)
 			p.logger.Info("volume_pruned",
-				zap.String("user", fmt.Sprintf("%s(uid=%d)", id.RealUsername, id.RealUID)),
+				zap.String("operator", fmt.Sprintf("%s(uid=%d)", id.RealUsername, id.RealUID)),
 				zap.String("volume", volName))
 		}
 		// resp.StatusCode == 409: volume 正在被容器使用，跳过（Docker 标准行为）
@@ -5294,10 +5338,15 @@ func (p *ProxyServer) handleSystemPrune(w http.ResponseWriter, r *http.Request, 
 		}
 	}
 
-	// ── 4. 卷 prune（复用 handleVolumePrune 逻辑，直接操作 DB + 逐个删除） ────
+	// ── 4. 卷 prune（system prune 只由非特权用户触发，始终使用 GetVolumeNamesByOwner） ────
+	// 注：IsPrivileged()==true 的用户在函数入口已 return false，不会到达此处。
 	var volumesDeleted []string
 	if ownedVols, err := p.db.GetVolumeNamesByOwner(id.RealUID); err == nil {
 		for _, volName := range ownedVols {
+			// 仅允许代理自身格式的具名卷（防路径注入）
+			if !isolation.IsUserVolumePrefix(volName) {
+				continue
+			}
 			req, _ := http.NewRequest("DELETE", "http://docker/volumes/"+volName, nil)
 			if req == nil {
 				continue
@@ -5306,6 +5355,7 @@ func (p *ProxyServer) handleSystemPrune(w http.ResponseWriter, r *http.Request, 
 			if err != nil {
 				continue
 			}
+			_, _ = io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
 			if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
 				_ = p.db.DeleteVolume(volName)
