@@ -4957,6 +4957,13 @@ func (p *ProxyServer) handleVolumePrune(w http.ResponseWriter, id *auth.CallerId
 		return true
 	}
 
+	// 普通用户路径：预计算前缀，循环内复用，避免每次迭代重复分配。
+	// 特权用户（sudo/root）跨用户删除时，响应中保留内部名便于 admin 审计追踪。
+	var userPrefix string
+	if !id.IsPrivileged() {
+		userPrefix = isolation.UserVolumePrefix(id.RealUID)
+	}
+
 	var deleted []string
 	for _, volName := range ownedVols {
 		// 仅允许代理自身格式的具名卷（防路径注入）
@@ -4978,10 +4985,16 @@ func (p *ProxyServer) handleVolumePrune(w http.ResponseWriter, id *auth.CallerId
 		resp.Body.Close()
 		if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
 			_ = p.db.DeleteVolume(volName)
-			deleted = append(deleted, volName)
+			// 普通用户：剥离 user-{uid}-volume- 前缀，还原用户可见名称
+			// 特权用户（sudo/root）：保留内部名，便于跨用户操作的审计追踪
+			if userPrefix != "" {
+				deleted = append(deleted, strings.TrimPrefix(volName, userPrefix))
+			} else {
+				deleted = append(deleted, volName)
+			}
 			p.logger.Info("volume_pruned",
 				zap.String("operator", fmt.Sprintf("%s(uid=%d)", id.RealUsername, id.RealUID)),
-				zap.String("volume", volName))
+				zap.String("volume", volName)) // 日志始终记录内部名，便于运维追踪
 		}
 		// resp.StatusCode == 409: volume 正在被容器使用，跳过（Docker 标准行为）
 	}
@@ -5342,6 +5355,7 @@ func (p *ProxyServer) handleSystemPrune(w http.ResponseWriter, r *http.Request, 
 	// 注：IsPrivileged()==true 的用户在函数入口已 return false，不会到达此处。
 	var volumesDeleted []string
 	if ownedVols, err := p.db.GetVolumeNamesByOwner(id.RealUID); err == nil {
+		systemPruneVolumePrefix := isolation.UserVolumePrefix(id.RealUID)
 		for _, volName := range ownedVols {
 			// 仅允许代理自身格式的具名卷（防路径注入）
 			if !isolation.IsUserVolumePrefix(volName) {
@@ -5359,7 +5373,8 @@ func (p *ProxyServer) handleSystemPrune(w http.ResponseWriter, r *http.Request, 
 			resp.Body.Close()
 			if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
 				_ = p.db.DeleteVolume(volName)
-				volumesDeleted = append(volumesDeleted, volName)
+				// 剥离前缀，还原用户可见名称（system prune 只由普通用户触发）
+				volumesDeleted = append(volumesDeleted, strings.TrimPrefix(volName, systemPruneVolumePrefix))
 			}
 		}
 	}
