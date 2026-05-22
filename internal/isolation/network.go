@@ -95,6 +95,45 @@ func InjectNetworkNamePrefixWithName(body []byte, identity *auth.CallerIdentity)
 		}
 	}
 
+	// 注入 OS 层桥接器名称，使 brctl show <netname> 在宿主机上直接生效。
+	//
+	// 条件（三者同时满足才注入）：
+	//   1. Driver 为 "bridge" 或缺省（Docker 默认为 bridge）
+	//   2. 用户未通过 --opt com.docker.network.bridge.name=... 显式设置
+	//   3. 用户可见名称非空且 ≤ 15 字节（Linux IFNAMSIZ=16 含 null，上限 15 字节）
+	//
+	// userVisibleName：去掉已有前缀后的原始网络名（name 不含前缀时 TrimPrefix 直接返回 name）。
+	// 注意：len() 在此计算字节长度，与 Linux 内核 IFNAMSIZ 限制一致，勿改为 rune 长度。
+	const bridgeNameOpt = "com.docker.network.bridge.name"
+	userVisibleName := strings.TrimPrefix(name, prefix)
+	if userVisibleName != "" && len(userVisibleName) <= 15 {
+		var driver string
+		if dRaw, ok := req["Driver"]; ok {
+			_ = json.Unmarshal(dRaw, &driver)
+		}
+		if driver == "" || driver == "bridge" {
+			// 用 map[string]json.RawMessage 解析 Options，保留任意值类型（布尔、数字等），
+			// 避免 map[string]string 在遇到非字符串值时静默丢弃全部已有选项。
+			var opts map[string]json.RawMessage
+			if optRaw, ok := req["Options"]; ok {
+				_ = json.Unmarshal(optRaw, &opts)
+			}
+			if opts == nil {
+				opts = make(map[string]json.RawMessage)
+			}
+			// 仅在用户未显式设置时注入，不覆盖 --opt com.docker.network.bridge.name=xxx
+			if _, alreadySet := opts[bridgeNameOpt]; !alreadySet {
+				if v, err := json.Marshal(userVisibleName); err == nil {
+					opts[bridgeNameOpt] = v
+					// 仅在序列化成功时才写回，避免 Marshal 失败时用 nil 覆盖原有 Options
+					if optBytes, err := json.Marshal(opts); err == nil {
+						req["Options"] = optBytes
+					}
+				}
+			}
+		}
+	}
+
 	result, err := json.Marshal(req)
 	if err != nil {
 		return body, actualName, nil
