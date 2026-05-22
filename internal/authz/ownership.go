@@ -523,6 +523,21 @@ func (o *OwnershipDB) GetImageRefCount(imageID string) (int, error) {
 	return count, err
 }
 
+// GetImageRefCountExcluding 以单条原子 SQL 返回引用该镜像的用户数，排除 excludeUID 自身。
+// 相比先调 GetImageRefCount 再调 HasUserImageAccess，本方法：
+//  1. 单次查询，消除两次独立查询之间的 TOCTOU 竞态窗口；
+//  2. 调用方无需处理"自身是否在表中"的分支；
+//  3. 查询次数减半，降低 SQLite 单连接的锁争用。
+func (o *OwnershipDB) GetImageRefCountExcluding(imageID string, excludeUID int) (int, error) {
+	imageID = normalizeImageID(imageID)
+	var count int
+	err := o.DB.QueryRow(
+		`SELECT COUNT(*) FROM image_access WHERE image_id = ? AND user_uid != ?`,
+		imageID, excludeUID,
+	).Scan(&count)
+	return count, err
+}
+
 // GetImageRefUsers 返回所有引用该镜像的用户 UID 列表（用于错误提示）
 func (o *OwnershipDB) GetImageRefUsers(imageID string) ([]int, error) {
 	imageID = normalizeImageID(imageID)

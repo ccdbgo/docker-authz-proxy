@@ -1045,14 +1045,21 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 			prefix := isolation.UserResourcePrefix(id)
 			userVisibleName := strings.TrimPrefix(networkName, prefix)
 
+			rawNetworkName := networkName // 保存 RewriteNetworkURL 写入的名称，用于修正 URL
 			lookupID := networkName
+			// needURLFix：仅当 DB 以无前缀名存储（共享/系统网络）时才需要将
+			// rawNetworkName 改写为真实 Docker ID。用户自建网络以带前缀名存储，
+			// upstream Docker 也用该前缀名路由，无需改写。
+			needURLFix := false
 			if docID, found := p.db.GetNetworkIDByName(networkName); found {
 				lookupID = docID
+				// 带前缀名即 Docker 存储名，URL 已正确，不改写
 			} else if userVisibleName != networkName {
-				// RewriteNetworkURL 已补前缀，但 DB 中该网络可能以无前缀的原始名存储。
-				// 若豁免逻辑将来有遗漏，此处给予第二次机会，避免将合法资源误拒。
+				// RewriteNetworkURL 已补前缀，但 DB 中该网络可能以无前缀的原始名存储
+				// （如共享网络 net_base 被错误添加前缀）。
 				if docID, found := p.db.GetNetworkIDByName(userVisibleName); found {
 					lookupID = docID
+					needURLFix = true // 需将错误前缀名改写为真实 ID
 				}
 			}
 			ok, err := p.db.CanUserAccessNetwork(lookupID, id.RealUID)
@@ -1067,6 +1074,16 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 				p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "network_not_accessible", "", http.StatusNotFound))
 				writeDockerNotFound(w, "network", userVisibleName)
 				return r, false
+			}
+			// 仅当共享网络被错误补前缀时，改写 URL 为真实 Docker ID。
+			// 用户自建网络（带前缀名已存于 Docker）无需改写。
+			if needURLFix && lookupID != rawNetworkName {
+				newPath := strings.Replace(r.URL.Path, "/networks/"+rawNetworkName, "/networks/"+lookupID, 1)
+				newURL := *r.URL
+				newURL.Path = newPath
+				newReq := r.Clone(r.Context())
+				newReq.URL = &newURL
+				r = newReq
 			}
 		}
 	}
@@ -1346,26 +1363,59 @@ func (p *ProxyServer) checkImageRemovePermission(w http.ResponseWriter, r *http.
 		return false
 	}
 
-	// 属主或 root 尝试物理删除时，若其他用户还有引用则阻止
+	// 属主または特権ユーザー（root / sudo）が物理削除を試みる場合、
+	// 他ユーザーの image_access 引用があれば阻止する。
+	//
+	// force-delete 例外（docker rmi -f / SDK の force=true）：
+	//   IsPrivileged()（root または sudo）が ?force=1 または ?force=true を送信した
+	//   場合に限り引用計数チェックをスキップする。
+	//   sudo ユーザーはコードベース全体で root と同等の権限を持つため、
+	//   IsPrivileged() による判断は正しい（id.RealUID==0 に狭めてはならない）。
+	//   Docker CLI は force=1、Go SDK（strconv.FormatBool）は force=true を送信する。
+	//
+	// 自身のコンテナによる使用中チェック（1341行）は force でも解除しない：
+	//   Docker daemon 側でも独立して強制されるため二重保護として残す。
 	isOwner := id.IsPrivileged() || owner.UID == id.RealUID
+	forceParam := r.URL.Query().Get("force")
+	privilegedForceDelete := id.IsPrivileged() && (forceParam == "1" || forceParam == "true")
 	if isOwner && isPublic {
-		refCount, err := p.db.GetImageRefCount(resolvedID)
-		if err != nil {
-			writeDockerError(w, http.StatusInternalServerError, "internal error")
-			return false
-		}
-		if refCount > 1 {
-			refUsers, _ := p.db.GetImageRefUsers(resolvedID)
-			p.logger.Info("image_rmi_blocked_by_refs",
-				append(audit.LogIdentityShortFields(auditID),
-					zap.String("image_id", truncID(resolvedID)),
-					zap.Int("ref_count", refCount),
-					zap.Ints("ref_uids", refUsers),
-				)...)
-			writeDockerError(w, http.StatusConflict,
-				fmt.Sprintf("image '%s' is still referenced by %d other user(s); cannot delete until all references are removed",
-					truncID(resolvedID), refCount-1))
-			return false
+		if privilegedForceDelete {
+			// 强制删除：跳过阻断，但在 DeleteImage() 全量清除 image_access 前
+			// 记录受影响的其他用户，确保事后审计可溯源。
+			// GetImageRefCountExcluding 单条原子 SQL，无 TOCTOU，
+			// 正确排除当前用户自身（root/sudo 未必曾 pull，可能不在 image_access 中）。
+			otherCount, _ := p.db.GetImageRefCountExcluding(resolvedID, id.RealUID)
+			if otherCount > 0 {
+				refUsers, _ := p.db.GetImageRefUsers(resolvedID)
+				p.logger.Warn("image_rmi_force_override_refs",
+					append(audit.LogIdentityShortFields(auditID),
+						zap.String("image_id", truncID(resolvedID)),
+						zap.Int("ref_count", otherCount),
+						zap.Ints("affected_uids", refUsers),
+					)...)
+			}
+		} else {
+			// GetImageRefCountExcluding 单条原子 SQL 直接得到"其他用户"数：
+			// root/sudo 若从未 pull 此镜像则不在 image_access，
+			// 不能用 refCount-1（少报），也不能拆成两次查询（TOCTOU）。
+			otherCount, err := p.db.GetImageRefCountExcluding(resolvedID, id.RealUID)
+			if err != nil {
+				writeDockerError(w, http.StatusInternalServerError, "internal error")
+				return false
+			}
+			if otherCount > 0 {
+				refUsers, _ := p.db.GetImageRefUsers(resolvedID)
+				p.logger.Info("image_rmi_blocked_by_refs",
+					append(audit.LogIdentityShortFields(auditID),
+						zap.String("image_id", truncID(resolvedID)),
+						zap.Int("ref_count", otherCount),
+						zap.Ints("ref_uids", refUsers),
+					)...)
+				writeDockerError(w, http.StatusConflict,
+					fmt.Sprintf("image '%s' is still referenced by %d other user(s); cannot delete until all references are removed",
+						truncID(resolvedID), otherCount))
+				return false
+			}
 		}
 	}
 
