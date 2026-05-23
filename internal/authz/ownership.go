@@ -388,8 +388,9 @@ func (o *OwnershipDB) resolveImageIDInDB(imageID string) string {
 	if err == nil {
 		return stored
 	}
-	// 2. 若 norm 是长 ID（>12 char hex），尝试短 ID（前12 char）前缀匹配
-	if len(norm) > 12 {
+	// 2. 若 norm 是至少 12 char 的 hex，用前12 char 做 LIKE 前缀匹配
+	// 覆盖：12-char 短 ID（docker 默认显示格式）和完整 64-char content ID
+	if len(norm) >= 12 {
 		isHex := true
 		for _, c := range norm[:12] {
 			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {

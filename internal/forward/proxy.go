@@ -2454,26 +2454,43 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 		}
 
 	case authz.ActionRemoveImage:
+		// 读取响应体：需要解析 Deleted 条目以获取 content ID，同时写回给客户端。
+		// Docker rmi 响应格式：[{"Untagged":"name:tag"}, {"Deleted":"sha256:xxx"}, ...]
+		// 只有 Deleted 条目表示物理删除；Untagged 仅解绑 tag，镜像仍存在，不清 DB 记录。
+		// 直接传 tag 名给 DeleteImage 会因 resolveImageIDInDB 无法匹配非 hex 字符串而静默失败。
+		body, err := isolation.ReadFullBody(resp.Body)
+		if err != nil {
+			writeDockerError(w, http.StatusBadGateway, "read upstream response failed")
+			return
+		}
 		if resp.StatusCode == http.StatusOK {
-			imageRef := authz.ExtractImageID(requestURI)
-			if imageRef != "" {
-				// 镜像已被 Docker 删除，resolveImageIDByRef 必然返回空；
-				// 直接传 imageRef，由 DeleteImage 内部通过 DB 前缀匹配解析完整 ID。
-				_ = p.db.DeleteImage(imageRef)
-				p.logger.Info("image_deleted",
-					append(audit.LogIdentityFields(auditID),
-						zap.String("image_id", truncID(imageRef)),
-					)...)
-				p.auditLog.WriteEntry(func() audit.AuditEntry {
-					e := makeAuditEntry(id, r, action, "allow", "physical_delete", imageRef, resp.StatusCode)
-					e.URI = requestURI
-					return e
-				}())
+			var rmiItems []struct {
+				Deleted  string `json:"Deleted"`
+				Untagged string `json:"Untagged"`
 			}
+			if json.Unmarshal(body, &rmiItems) == nil {
+				for _, item := range rmiItems {
+					if item.Deleted == "" {
+						continue // Untagged-only：镜像未被物理删除，保留 DB 记录
+					}
+					// item.Deleted 格式为 "sha256:xxx"，DeleteImage 内 normalizeImageID 去前缀
+					_ = p.db.DeleteImage(item.Deleted)
+					p.logger.Info("image_deleted",
+						append(audit.LogIdentityFields(auditID),
+							zap.String("image_id", truncID(item.Deleted)),
+						)...)
+				}
+			}
+			imageRef := authz.ExtractImageID(requestURI)
+			p.auditLog.WriteEntry(func() audit.AuditEntry {
+				e := makeAuditEntry(id, r, action, "allow", "physical_delete", imageRef, resp.StatusCode)
+				e.URI = requestURI
+				return e
+			}())
 		}
 		isolation.CopyHeaders(w, resp.Header)
 		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, resp.Body)
+		_, _ = w.Write(body)
 
 	case authz.ActionNetworkCreate:
 		body, err := isolation.ReadFullBody(resp.Body)
