@@ -2234,14 +2234,15 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 				}
 			} else if strings.HasPrefix(requestURI, "/system") {
 				// docker system prune [--volumes] → POST /system/prune
-				// 响应中同时包含 containers / images / volumes 三类已删除资源
+				// 响应中同时包含 containers / images / volumes / networks 四类已删除资源
 				var pruneResp struct {
 					ContainersDeleted []string `json:"ContainersDeleted"`
 					ImagesDeleted     []struct {
 						Deleted  string `json:"Deleted"`
 						Untagged string `json:"Untagged"`
 					} `json:"ImagesDeleted"`
-					VolumesDeleted []string `json:"VolumesDeleted"`
+					VolumesDeleted  []string `json:"VolumesDeleted"`
+					NetworksDeleted []string `json:"NetworksDeleted"`
 				}
 				if json.Unmarshal(body, &pruneResp) == nil {
 					for _, cid := range pruneResp.ContainersDeleted {
@@ -2255,6 +2256,9 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 					}
 					for _, vol := range pruneResp.VolumesDeleted {
 						_ = p.db.DeleteVolume(vol)
+					}
+					for _, nid := range pruneResp.NetworksDeleted {
+						_ = p.db.DeleteNetwork(nid)
 					}
 				}
 			}
@@ -4867,13 +4871,14 @@ func (p *ProxyServer) StartDockerEventListener(ctx context.Context) {
 						continue
 					}
 					if event.Action == "destroy" {
-						// 容器彻底删除时释放端口记录
+						// 容器彻底删除时清除归属记录并释放端口映射
+						_ = p.db.DeleteContainer(containerID)
 						if err := p.db.ReleasePortMappings(containerID); err != nil {
 							p.logger.Warn("release_port_mappings_event_failed",
 								zap.String("container_id", containerID[:min(12, len(containerID))]),
 								zap.Error(err))
 						} else {
-							p.logger.Debug("port_mappings_released_by_event",
+							p.logger.Debug("container_cleaned_by_event",
 								zap.String("container_id", containerID[:min(12, len(containerID))]),
 							)
 						}
