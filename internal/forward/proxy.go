@@ -2257,8 +2257,19 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 					for _, vol := range pruneResp.VolumesDeleted {
 						_ = p.db.DeleteVolume(vol)
 					}
-					for _, nid := range pruneResp.NetworksDeleted {
-						_ = p.db.DeleteNetwork(nid)
+					// NetworksDeleted 中是网络 name，DB 以 hex network_id 为主键，
+					// 需先经 GetNetworkIDByName 解析，否则 DELETE 0 行静默失败。
+					for _, netName := range pruneResp.NetworksDeleted {
+						realID, found := p.db.GetNetworkIDByName(netName)
+						if !found {
+							continue // Docker 内置网络 bridge/host/none 不在 DB 中，跳过
+						}
+						if err := p.db.DeleteNetwork(realID); err != nil {
+							p.logger.Warn("system_prune_delete_network_failed",
+								zap.String("name", netName),
+								zap.String("id", truncID(realID)),
+								zap.Error(err))
+						}
 					}
 				}
 			}
@@ -4871,14 +4882,18 @@ func (p *ProxyServer) StartDockerEventListener(ctx context.Context) {
 						continue
 					}
 					if event.Action == "destroy" {
-						// 容器彻底删除时清除归属记录并释放端口映射
-						_ = p.db.DeleteContainer(containerID)
+						// 先清子表 port_mappings，再删父记录 containers
 						if err := p.db.ReleasePortMappings(containerID); err != nil {
-							p.logger.Warn("release_port_mappings_event_failed",
+							p.logger.Warn("event_release_port_mappings_failed",
+								zap.String("container_id", containerID[:min(12, len(containerID))]),
+								zap.Error(err))
+						}
+						if err := p.db.DeleteContainer(containerID); err != nil {
+							p.logger.Warn("event_delete_container_failed",
 								zap.String("container_id", containerID[:min(12, len(containerID))]),
 								zap.Error(err))
 						} else {
-							p.logger.Debug("container_cleaned_by_event",
+							p.logger.Debug("container_cleaned_by_destroy_event",
 								zap.String("container_id", containerID[:min(12, len(containerID))]),
 							)
 						}
