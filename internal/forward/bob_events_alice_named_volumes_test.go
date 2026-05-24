@@ -103,7 +103,7 @@ func TestBug_BobEvents_SeeAliceNamedVolumePrune(t *testing.T) {
 	// ── RED ASSERTION A：bob 不应收到 alice 的 data1-alice 卷删除事件 ─────
 	// 修复前 FAIL: eventBelongsToUser(aliceVol1Event, bobUID) == true
 	// 修复后 PASS: uid 段 1001 ≠ 1002 → return false
-	aliceVol1Event := makeVolumeEventWithAction("destroy", aliceVol1)
+	aliceVol1Event := makeVolumeEvent("destroy", aliceVol1)
 	if eventBelongsToUser(aliceVol1Event, bobUID2) {
 		t.Errorf(
 			"BUG [bob events → alice prune]:\n"+
@@ -119,7 +119,7 @@ func TestBug_BobEvents_SeeAliceNamedVolumePrune(t *testing.T) {
 	// ── RED ASSERTION B：bob 不应收到 alice 的 data2-alice 卷删除事件 ─────
 	// 修复前 FAIL: 同上根因，两个卷均泄漏
 	// 修复后 PASS: user-1001-volume-data2-alice → uid 段 1001 ≠ 1002 → false
-	aliceVol2Event := makeVolumeEventWithAction("destroy", aliceVol2)
+	aliceVol2Event := makeVolumeEvent("destroy", aliceVol2)
 	if eventBelongsToUser(aliceVol2Event, bobUID2) {
 		t.Errorf(
 			"BUG [bob events → alice prune]:\n"+
@@ -131,7 +131,7 @@ func TestBug_BobEvents_SeeAliceNamedVolumePrune(t *testing.T) {
 	}
 
 	// ── 正向断言（不被修复破坏）：bob 本人的 data1-bob 必须对 bob 可见 ────
-	bobVol1Event := makeVolumeEventWithAction("destroy", bobVol1)
+	bobVol1Event := makeVolumeEvent("destroy", bobVol1)
 	if !eventBelongsToUser(bobVol1Event, bobUID2) {
 		t.Errorf(
 			"回归断言失败: bob(uid=%d) 应收到自己的卷删除事件\n"+
