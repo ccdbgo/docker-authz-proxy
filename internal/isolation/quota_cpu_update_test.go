@@ -29,6 +29,7 @@ package isolation
 import (
 	"encoding/json"
 	"os"
+	"runtime"
 	"testing"
 
 	"docker-authz-proxy/internal/auth"
@@ -210,12 +211,20 @@ func TestRegression_CheckAndInjectQuota_AfterReload_Injects4Cores(t *testing.T) 
 		t.Fatalf("unmarshal: %v", e)
 	}
 
-	wantNano := int64(4.0 * 1e9)
+	// 注入值 = min(quota=4.0, physical=numCPU)。
+	// 若物理核数 < 4，Docker 会拒绝注入 4e9，故代理应取物理上限。
+	quotaNano := int64(4.0 * 1e9)
+	physNano := int64(runtime.NumCPU()) * 1e9
+	wantNano := quotaNano
+	if physNano < wantNano {
+		wantNano = physNano
+	}
 	if req.HostConfig.NanoCPUs != wantNano {
 		t.Errorf(
-			"injected NanoCpus = %d (%.2f cores), want %d (4.00 cores)\n"+
-				"  after reload, container should be capped at 4.0 cores, not 1.0",
-			req.HostConfig.NanoCPUs, float64(req.HostConfig.NanoCPUs)/1e9, wantNano,
+			"injected NanoCpus = %d (%.2f cores), want %d (%.2f cores)\n"+
+				"  after reload, container should inject min(quota=4.0, physical=%d) cores, not old 1.0",
+			req.HostConfig.NanoCPUs, float64(req.HostConfig.NanoCPUs)/1e9,
+			wantNano, float64(wantNano)/1e9, runtime.NumCPU(),
 		)
 	}
 	if qr.QuotaCPUCores != 4.0 {
