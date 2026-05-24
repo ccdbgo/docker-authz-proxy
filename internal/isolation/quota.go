@@ -759,16 +759,10 @@ func injectQuotaLimits(body []byte, req *containerCreateRequest, quota UserQuota
 		currentNano := effectiveCPUNanos(req)
 
 		if currentNano == 0 {
-			// 未指定：注入配额上限，但不得超过物理 CPU 上限。
-			// 若配额 > 物理核数，Docker daemon 会拒绝（"range of CPUs is from 0.01 to N"）。
-			physNano := int64(runtime.NumCPU()) * 1e9
-			injectedNano := quotaNano
-			if injectedNano > physNano {
-				injectedNano = physNano
-			}
-			b, _ := json.Marshal(injectedNano)
+			// 未指定：注入配额上限
+			b, _ := json.Marshal(quotaNano)
 			hostConfig["NanoCpus"] = b
-			result.cpuCores = float64(injectedNano) / 1e9
+			result.cpuCores = quota.CPUCores
 		} else {
 			// 已指定且不超限：保持原值，不做任何转换。
 			// hostConfig 中 NanoCpus/CpuQuota/CpuPeriod 均来自原始请求，无需修改。
