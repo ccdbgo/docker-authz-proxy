@@ -132,7 +132,7 @@ func TestBug_BobNoCPUFlag_InjectsQuotaCeilingInsteadOfDefault_Red(t *testing.T) 
 	// bob 仅指定内存，未指定 --cpus（复现生产场景）
 	body := []byte(`{"HostConfig":{"Memory":2147483648}}`) // 2048m
 
-	newBody, qr, err := CheckAndInjectQuota(body, quota, 1002, db)
+	newBody, qr, err := CheckAndInjectQuota(body, quota, 1002, db, qm.GetDefaultQuota().CPUCores)
 	if err != nil {
 		t.Fatalf("CheckAndInjectQuota error: %v", err)
 	}
@@ -189,7 +189,7 @@ func TestBug_BobMemOnly_InjectedNanaCpusWouldBeRejectedByDocker_Red(t *testing.T
 	quota := qm.GetQuota(bob)
 	body := []byte(`{"HostConfig":{"Memory":2147483648}}`)
 
-	newBody, qr, err := CheckAndInjectQuota(body, quota, 1002, db)
+	newBody, qr, err := CheckAndInjectQuota(body, quota, 1002, db, qm.GetDefaultQuota().CPUCores)
 	if err != nil {
 		t.Fatalf("CheckAndInjectQuota error: %v", err)
 	}
@@ -237,7 +237,7 @@ func TestRegression_BobExplicitCPU3_WithinQuota4_Preserved(t *testing.T) {
 	requestedNano := int64(3.0 * 1e9)
 	body := []byte(fmt.Sprintf(`{"HostConfig":{"NanoCpus":%d}}`, requestedNano))
 
-	newBody, qr, err := CheckAndInjectQuota(body, quota, 1002, db)
+	newBody, qr, err := CheckAndInjectQuota(body, quota, 1002, db, qm.GetDefaultQuota().CPUCores)
 	if err != nil {
 		t.Fatalf("CheckAndInjectQuota error: %v", err)
 	}
@@ -269,7 +269,7 @@ func TestRegression_BobExplicitCPU5_ExceedsQuota4_Denied(t *testing.T) {
 	// bob 显式请求 5 核（超出 quota.CPUCores = 4.0）
 	body := []byte(fmt.Sprintf(`{"HostConfig":{"NanoCpus":%d}}`, int64(5.0*1e9)))
 
-	_, qr, err := CheckAndInjectQuota(body, quota, 1002, db)
+	_, qr, err := CheckAndInjectQuota(body, quota, 1002, db, qm.GetDefaultQuota().CPUCores)
 
 	if err == nil || qr.Allowed {
 		t.Errorf(
@@ -300,7 +300,7 @@ func TestRegression_NoUserEntry_NoCPUFlag_InjectsDefault(t *testing.T) {
 
 	body := []byte(`{"HostConfig":{}}`) // 未指定任何资源
 
-	newBody, qr, err := CheckAndInjectQuota(body, quota, 1003, db)
+	newBody, qr, err := CheckAndInjectQuota(body, quota, 1003, db, qm.GetDefaultQuota().CPUCores)
 	if err != nil {
 		t.Fatalf("CheckAndInjectQuota error: %v", err)
 	}
@@ -342,7 +342,7 @@ func TestRegression_BobQuota1_LessThanDefault2_NoCPUFlag_NotExceedQuota(t *testi
 
 	body := []byte(`{"HostConfig":{}}`)
 
-	newBody, qr, err := CheckAndInjectQuota(body, quota, 1002, db)
+	newBody, qr, err := CheckAndInjectQuota(body, quota, 1002, db, qm.GetDefaultQuota().CPUCores)
 	if err != nil {
 		t.Fatalf("CheckAndInjectQuota error: %v", err)
 	}
@@ -379,7 +379,7 @@ func TestRegression_BobMemOnly_AfterFix_MemoryPreserved_CPUFromDefault(t *testin
 	memBytes := int64(2048 * 1024 * 1024)
 	body := []byte(fmt.Sprintf(`{"HostConfig":{"Memory":%d}}`, memBytes))
 
-	newBody, qr, err := CheckAndInjectQuota(body, quota, 1002, db)
+	newBody, qr, err := CheckAndInjectQuota(body, quota, 1002, db, qm.GetDefaultQuota().CPUCores)
 
 	// ── 断言 1：整体请求必须成功 ────────────────────────────────────────────
 	if err != nil {

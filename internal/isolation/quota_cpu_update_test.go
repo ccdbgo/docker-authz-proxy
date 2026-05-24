@@ -197,7 +197,7 @@ func TestRegression_CheckAndInjectQuota_AfterReload_Injects4Cores(t *testing.T) 
 
 	// 用户未指定 CPU 的请求
 	body := []byte(`{"HostConfig":{}}`)
-	newBody, qr, err := CheckAndInjectQuota(body, quota, 1001, db)
+	newBody, qr, err := CheckAndInjectQuota(body, quota, 1001, db, newQM.GetDefaultQuota().CPUCores)
 	if err != nil {
 		t.Fatalf("CheckAndInjectQuota error: %v", err)
 	}
@@ -210,11 +210,13 @@ func TestRegression_CheckAndInjectQuota_AfterReload_Injects4Cores(t *testing.T) 
 		t.Fatalf("unmarshal: %v", e)
 	}
 
-	wantNano := int64(4.0 * 1e9)
+	// 修复后注入值 = min(defaults.cpu_cores=2.0, quota=4.0) = 2.0 核。
+	// alice 配额上限 4.0 可由 alice 显式 --cpus 4.0 使用，但未指定时注入系统默认。
+	wantNano := int64(2.0 * 1e9)
 	if req.HostConfig.NanoCPUs != wantNano {
 		t.Errorf(
-			"injected NanoCpus = %d (%.2f cores), want %d (4.00 cores)\n"+
-				"  after reload, container should be capped at 4.0 cores, not 1.0",
+			"injected NanoCpus = %d (%.2f cores), want %d (2.00 cores = defaults)\n"+
+				"  after reload, unspecified --cpus injects defaults.cpu_cores(2.0), not quota ceiling(4.0)",
 			req.HostConfig.NanoCPUs, float64(req.HostConfig.NanoCPUs)/1e9, wantNano,
 		)
 	}

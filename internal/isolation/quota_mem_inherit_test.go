@@ -122,7 +122,7 @@ func TestBug_GetQuota_MemOnlyEntry_ContainerGetsNoCPULimit_Red(t *testing.T) {
 
 	// alice 只请求内存，不指定 CPU（正常使用场景）
 	body := []byte(`{"HostConfig":{"Memory":2149580800}}`) // 2049m
-	newBody, qr, err := CheckAndInjectQuota(body, quota, 1001, db)
+	newBody, qr, err := CheckAndInjectQuota(body, quota, 1001, db, qm.GetDefaultQuota().CPUCores)
 	if err != nil {
 		t.Fatalf("CheckAndInjectQuota error: %v", err)
 	}
@@ -169,7 +169,7 @@ func TestRegression_AliceMemQuota_Request2049m_Allowed(t *testing.T) {
 	memBytes := int64(2049 * 1024 * 1024) // 2049m，高于 default 2048m
 	body := []byte(fmt.Sprintf(`{"HostConfig":{"Memory":%d}}`, memBytes))
 
-	_, qr, err := CheckAndInjectQuota(body, quota, 1001, db)
+	_, qr, err := CheckAndInjectQuota(body, quota, 1001, db, qm.GetDefaultQuota().CPUCores)
 
 	// ── 断言：必须允许 ──────────────────────────────────────────────────────
 	if err != nil {
@@ -200,7 +200,7 @@ func TestRegression_AliceMemQuota_RequestExactDefault_Allowed(t *testing.T) {
 	memBytes := int64(2048 * 1024 * 1024) // 恰好 default
 	body := []byte(fmt.Sprintf(`{"HostConfig":{"Memory":%d}}`, memBytes))
 
-	_, qr, err := CheckAndInjectQuota(body, quota, 1001, db)
+	_, qr, err := CheckAndInjectQuota(body, quota, 1001, db, qm.GetDefaultQuota().CPUCores)
 	if err != nil {
 		t.Errorf("request at default 2048m denied: %v", err)
 	}
@@ -220,7 +220,7 @@ func TestRegression_AliceMemQuota_RequestExceedsOwnQuota_Denied(t *testing.T) {
 	memBytes := int64(4097 * 1024 * 1024) // 超出 alice 4096m 配额
 	body := []byte(fmt.Sprintf(`{"HostConfig":{"Memory":%d}}`, memBytes))
 
-	_, _, err := CheckAndInjectQuota(body, quota, 1001, db)
+	_, _, err := CheckAndInjectQuota(body, quota, 1001, db, qm.GetDefaultQuota().CPUCores)
 	if err == nil {
 		t.Errorf(
 			"expected denial for 4097m > alice quota 4096m, got nil\n"+
@@ -244,7 +244,7 @@ func TestRegression_DefaultUser_MemLimit2048_Enforced(t *testing.T) {
 	// bob 请求 2049m > default 2048m，应被拒绝
 	memBytes := int64(2049 * 1024 * 1024)
 	body := []byte(fmt.Sprintf(`{"HostConfig":{"Memory":%d}}`, memBytes))
-	_, _, err := CheckAndInjectQuota(body, quota, 1002, db)
+	_, _, err := CheckAndInjectQuota(body, quota, 1002, db, qm.GetDefaultQuota().CPUCores)
 	if err == nil {
 		t.Errorf(
 			"bob (no user entry) should be denied 2049m > default 2048m\n"+

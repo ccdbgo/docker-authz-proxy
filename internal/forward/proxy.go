@@ -136,6 +136,8 @@ func (p *ProxyServer) Start() error {
 		return fmt.Errorf("chmod socket dir: %w", err)
 	}
 
+	ensureSudoersDockerHostEnvKeep(p.logger)
+
 	users := listSystemUsers()
 	if len(users) == 0 {
 		return fmt.Errorf("no system users found")
@@ -789,6 +791,7 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 		// 所有用户（含 sudo、root）均受配额约束，配额值为 0 表示不限制
 		if p.quota != nil {
 			quota := p.quota.GetQuota(id)
+			defaultCPUCores := p.quota.GetDefaultQuota().CPUCores
 			auditID := toAuditIdentity(id)
 			p.logger.Info("quota_resolved",
 				append(audit.LogIdentityShortFields(auditID),
@@ -801,7 +804,7 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 			body, _ := io.ReadAll(r.Body)
 			r.Body.Close()
 
-			newBody, qr, qErr := isolation.CheckAndInjectQuota(body, quota, id.RealUID, p.db)
+			newBody, qr, qErr := isolation.CheckAndInjectQuota(body, quota, id.RealUID, p.db, defaultCPUCores)
 
 			// 记录详细配额审计日志
 			logQuotaCheck(p.logger, auditID, qr)
@@ -3984,6 +3987,78 @@ func writeDockerHostToFile(cfgFile string, u systemUser, exportLine, marker stri
 		zap.String("username", u.Username),
 		zap.String("file", cfgFile),
 		zap.String("docker_host", exportLine))
+}
+
+// sudoersProxyEnvKeepFile 是代理管理的 sudoers 配置文件名（位于 /etc/sudoers.d/）。
+const sudoersProxyEnvKeepFile = "docker-authz-proxy-env"
+
+// sudoersProxyEnvKeepContent 是写入 sudoers 文件的完整内容。
+// 使用 %sudo 组作用域而非全局 Defaults，避免影响非 sudo 组用户。
+const sudoersProxyEnvKeepContent = "# docker-authz-proxy managed -- do not edit manually\n" +
+	"Defaults:%sudo env_keep += \"DOCKER_HOST\"\n"
+
+// ensureSudoersDockerHostEnvKeep 确保 /etc/sudoers.d/ 中存在代理管理的
+// env_keep 配置，使 sudo 不会清除 DOCKER_HOST 环境变量。
+// 应在代理启动时调用一次（非 per-user）。
+func ensureSudoersDockerHostEnvKeep(logger *zap.Logger) {
+	ensureSudoersEnvKeepInDir("/etc/sudoers.d", logger)
+}
+
+// ensureSudoersEnvKeepInDir 是 ensureSudoersDockerHostEnvKeep 的可测试版本，
+// 接受 dir 参数便于单元测试使用 t.TempDir()。
+func ensureSudoersEnvKeepInDir(dir string, logger *zap.Logger) {
+	targetPath := filepath.Join(dir, sudoersProxyEnvKeepFile)
+
+	// 幂等检查：内容已是最新则直接返回
+	existing, err := os.ReadFile(targetPath)
+	if err == nil {
+		if string(existing) == sudoersProxyEnvKeepContent {
+			return
+		}
+	} else if !os.IsNotExist(err) {
+		logger.Warn("cannot read existing sudoers env_keep file, skipping update",
+			zap.String("path", targetPath), zap.Error(err))
+		return
+	}
+
+	// 原子写入：先写临时文件，chmod 0440，再 rename 到目标路径
+	tmpFile, err := os.CreateTemp(dir, ".docker-authz-tmp-*")
+	if err != nil {
+		logger.Warn("failed to create temp sudoers file",
+			zap.String("dir", dir), zap.Error(err))
+		return
+	}
+	tmpPath := tmpFile.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if _, err := tmpFile.WriteString(sudoersProxyEnvKeepContent); err != nil {
+		_ = tmpFile.Close()
+		logger.Warn("failed to write sudoers temp file", zap.Error(err))
+		return
+	}
+	if err := tmpFile.Close(); err != nil {
+		logger.Warn("failed to close sudoers temp file", zap.Error(err))
+		return
+	}
+	// sudoers 文件必须 0440（非 world-writable），否则 sudo 拒绝读取
+	if err := os.Chmod(tmpPath, 0440); err != nil {
+		logger.Warn("failed to chmod sudoers temp file",
+			zap.String("path", tmpPath), zap.Error(err))
+		return
+	}
+	if err := os.Rename(tmpPath, targetPath); err != nil {
+		logger.Warn("failed to install sudoers env_keep file",
+			zap.String("target", targetPath), zap.Error(err))
+		return
+	}
+	committed = true
+	logger.Info("sudoers env_keep configured for DOCKER_HOST",
+		zap.String("file", targetPath))
 }
 
 // extractImageRefFromBody 从请求体中提取 Image 字段

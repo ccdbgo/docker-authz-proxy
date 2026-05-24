@@ -210,6 +210,12 @@ func LoadQuotaManager(path string) (*QuotaManager, error) {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse quota.yaml: %w", err)
 	}
+	// 与 Reload 保持一致：初次加载也拒绝负值，防止负数静默进入注入逻辑。
+	if cfg.Defaults.CPUCores < 0 || cfg.Defaults.MemMB < 0 || cfg.Defaults.StorageGB < 0 {
+		return nil, fmt.Errorf("parse quota.yaml: defaults contains negative value: "+
+			"cpu=%.2f mem=%d storage=%d",
+			cfg.Defaults.CPUCores, cfg.Defaults.MemMB, cfg.Defaults.StorageGB)
+	}
 	m := &QuotaManager{
 		defaults: cfg.Defaults,
 		users:    make(map[string]quotaEntryRaw),
@@ -463,7 +469,12 @@ type QuotaCheckResult struct {
 
 // CheckAndInjectQuota 一次性完成配额校验 + 参数注入，返回修改后的请求体和详细校验结果
 // 这是主入口，替代原来分离的 CheckQuotaPreCreate + InjectResourceLimits
-func CheckAndInjectQuota(body []byte, quota UserQuota, uid int, db ContainerCounter) ([]byte, *QuotaCheckResult, error) {
+//
+// defaultCPUCores：系统全局默认 CPU 核数（来自 quota.yaml defaults.cpu_cores），
+// 用于在用户未指定 --cpus 时确定注入基准值。
+// 传 0 表示系统无默认限制，此时退回注入用户配额上限（quota.CPUCores）。
+// 调用方通常从 QuotaManager.GetDefaultQuota().CPUCores 获取此值。
+func CheckAndInjectQuota(body []byte, quota UserQuota, uid int, db ContainerCounter, defaultCPUCores float64) ([]byte, *QuotaCheckResult, error) {
 	result := &QuotaCheckResult{
 		QuotaCPUCores:  quota.CPUCores,
 		QuotaMemMB:     quota.MemMB,
@@ -597,7 +608,7 @@ func CheckAndInjectQuota(body []byte, quota UserQuota, uid int, db ContainerCoun
 	}
 
 	// 6. 校验通过，注入配额上限（覆盖超出值或补充缺失参数）
-	injected, injResult := injectQuotaLimits(body, req, quota)
+	injected, injResult := injectQuotaLimits(body, req, quota, defaultCPUCores)
 	result.Allowed = true
 	result.InjectedCPUCores = injResult.cpuCores
 	result.InjectedMemMB = injResult.memMB
@@ -735,12 +746,13 @@ type injectionResult struct {
 
 // injectQuotaLimits 将配额上限强制注入请求体
 // 规则：
-//   - CPU：若未指定则注入配额上限；若已指定则保持（已在校验阶段确认不超限）
+//   - CPU：若未指定则注入 defaultCPUCores（系统默认）；defaultCPUCores==0 时退回 quota 上限；
+//          注入值不得超过 quota.CPUCores（用户配额上限）；若已指定则保持（已在校验阶段确认不超限）
 //   - Memory：若未指定则注入配额上限；若已指定则保持
 //   - MemorySwap：强制等于 Memory（禁止 swap，防止绕过内存限制）
 //   - MemorySwappiness：强制设为 0（禁止 swap 使用）
 //   - StorageOpt.size：若未指定则注入配额上限
-func injectQuotaLimits(body []byte, req *containerCreateRequest, quota UserQuota) ([]byte, injectionResult) {
+func injectQuotaLimits(body []byte, req *containerCreateRequest, quota UserQuota, defaultCPUCores float64) ([]byte, injectionResult) {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return body, injectionResult{}
@@ -759,10 +771,24 @@ func injectQuotaLimits(body []byte, req *containerCreateRequest, quota UserQuota
 		currentNano := effectiveCPUNanos(req)
 
 		if currentNano == 0 {
-			// 未指定：注入配额上限
-			b, _ := json.Marshal(quotaNano)
+			// 未指定 --cpus：注入系统默认值（defaultCPUCores），而非用户配额上限。
+			//
+			// 语义区分：
+			//   quota.CPUCores  = 用户可显式请求的最大核数（enforcement 上限）
+			//   defaultCPUCores = 不指定时的基准注入值（defaults.cpu_cores）
+			//
+			// 注入规则：min(defaultCPUCores, quota.CPUCores)
+			//   defaultCPUCores == 0：系统无默认限制，退回注入 quotaNano（原有行为）
+			//   ⚠️  此时若 quotaNano 超出物理 CPU 上限，Docker 仍会拒绝；
+			//       属于管理员配置错误（quota > physical），代理不做隐式物理核修正。
+			defaultNano := int64(defaultCPUCores * 1e9)
+			injectedNano := quotaNano // defaultCPUCores==0 时的兜底
+			if defaultNano > 0 {
+				injectedNano = min(defaultNano, quotaNano)
+			}
+			b, _ := json.Marshal(injectedNano)
 			hostConfig["NanoCpus"] = b
-			result.cpuCores = quota.CPUCores
+			result.cpuCores = float64(injectedNano) / 1e9
 		} else {
 			// 已指定且不超限：保持原值，不做任何转换。
 			// hostConfig 中 NanoCpus/CpuQuota/CpuPeriod 均来自原始请求，无需修改。
@@ -841,13 +867,15 @@ func injectQuotaLimits(body []byte, req *containerCreateRequest, quota UserQuota
 // ── 兼容旧接口（供 proxy.go 过渡期使用）────────────────────────
 
 // CheckQuotaPreCreate 仅做校验，不注入（已被 CheckAndInjectQuota 取代，保留兼容）
-func CheckQuotaPreCreate(body []byte, quota UserQuota, uid int, db ContainerCounter) error {
-	_, _, err := CheckAndInjectQuota(body, quota, uid, db)
+// defaultCPUCores 透传给 CheckAndInjectQuota，语义同上。
+func CheckQuotaPreCreate(body []byte, quota UserQuota, uid int, db ContainerCounter, defaultCPUCores float64) error {
+	_, _, err := CheckAndInjectQuota(body, quota, uid, db, defaultCPUCores)
 	return err
 }
 
 // InjectResourceLimits 仅做注入，不校验（已被 CheckAndInjectQuota 取代，保留兼容）
-func InjectResourceLimits(body []byte, quota UserQuota) ([]byte, error) {
+// defaultCPUCores 透传给 injectQuotaLimits，语义同上。
+func InjectResourceLimits(body []byte, quota UserQuota, defaultCPUCores float64) ([]byte, error) {
 	if quota.CPUCores == 0 && quota.MemMB == 0 && quota.StorageGB == 0 {
 		return body, nil
 	}
@@ -855,7 +883,7 @@ func InjectResourceLimits(body []byte, quota UserQuota) ([]byte, error) {
 	if err != nil {
 		return body, nil
 	}
-	out, _ := injectQuotaLimits(body, req, quota)
+	out, _ := injectQuotaLimits(body, req, quota, defaultCPUCores)
 	return out, nil
 }
 

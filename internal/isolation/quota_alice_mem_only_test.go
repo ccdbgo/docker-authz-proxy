@@ -165,7 +165,7 @@ func TestBug_AliceMemOnly_Request2049m_ShouldBeAllowed(t *testing.T) {
 
 	// ── 主体：模拟 docker container create --memory 2049m ──────────────────
 	body := memOnlyBody(2049)
-	newBody, qr, err := CheckAndInjectQuota(body, quota, 1001, db)
+	newBody, qr, err := CheckAndInjectQuota(body, quota, 1001, db, qm.GetDefaultQuota().CPUCores)
 
 	// ── 断言 1：代理层不应返回 error ─────────────────────────────────────
 	//
@@ -298,7 +298,7 @@ func TestRegression_AliceMemOnly_Request2049m_AllowedWithCorrectInjection(t *tes
 	}
 
 	body := memOnlyBody(2049)
-	newBody, qr, err := CheckAndInjectQuota(body, quota, 1001, db)
+	newBody, qr, err := CheckAndInjectQuota(body, quota, 1001, db, qm.GetDefaultQuota().CPUCores)
 
 	if err != nil {
 		t.Fatalf(
@@ -383,7 +383,7 @@ func TestRegression_AliceMemOnly_ExceedsMemQuota_DeniedWithMemoryError(t *testin
 
 	// 请求 4097m，超出 alice 4096m 配额
 	body := memOnlyBody(4097)
-	_, qr, err := CheckAndInjectQuota(body, quota, 1001, db)
+	_, qr, err := CheckAndInjectQuota(body, quota, 1001, db, qm.GetDefaultQuota().CPUCores)
 
 	// 必须被拒绝
 	if err == nil {
@@ -441,7 +441,7 @@ func TestRegression_AliceMemOnly_ExplicitCPU_PreservedWhenWithinQuota(t *testing
 		int64(2049*1024*1024),
 	))
 
-	newBody, qr, err := CheckAndInjectQuota(body, quota, 1001, db)
+	newBody, qr, err := CheckAndInjectQuota(body, quota, 1001, db, qm.GetDefaultQuota().CPUCores)
 	if err != nil {
 		t.Fatalf(
 			"request denied: %v\n"+
@@ -497,7 +497,7 @@ func TestRegression_BobNoEntry_InheritsDefaultsUnaffectedByAlice(t *testing.T) {
 
 	// bob 请求 2049m > defaults 2048m → 必须拒绝（alice 的 4096m 配额不适用于 bob）
 	body := memOnlyBody(2049)
-	_, qr, err := CheckAndInjectQuota(body, quota, 1002, db)
+	_, qr, err := CheckAndInjectQuota(body, quota, 1002, db, qm.GetDefaultQuota().CPUCores)
 	if err == nil {
 		t.Errorf(
 			"bob should be denied 2049m (> default 2048m)\n"+
@@ -510,7 +510,7 @@ func TestRegression_BobNoEntry_InheritsDefaultsUnaffectedByAlice(t *testing.T) {
 
 	// bob 请求 2048m = defaults → 应被允许
 	body2048 := memOnlyBody(2048)
-	_, qr2, err2 := CheckAndInjectQuota(body2048, quota, 1002, db)
+	_, qr2, err2 := CheckAndInjectQuota(body2048, quota, 1002, db, qm.GetDefaultQuota().CPUCores)
 	if err2 != nil {
 		t.Errorf("bob 2048m (= default) should be allowed: %v", err2)
 	}
@@ -556,7 +556,7 @@ func TestRegression_AliceExplicitZeroCPU_MeansUnlimited_NotInherited(t *testing.
 	// 当 CPUCores=0（不限制）时，注入层不应写入 NanoCpus 字段
 	db := newBugTestDB(t)
 	body := memOnlyBody(2049)
-	newBody, qr, err := CheckAndInjectQuota(body, got, 1001, db)
+	newBody, qr, err := CheckAndInjectQuota(body, got, 1001, db, qm.GetDefaultQuota().CPUCores)
 	if err != nil {
 		t.Fatalf("unexpected error for cpu_cores=0 (unlimited): %v", err)
 	}
