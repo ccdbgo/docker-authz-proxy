@@ -148,7 +148,7 @@ func TestBug_BobNoMemFlag_InjectsQuotaCeilingInsteadOfDefault_Red(t *testing.T) 
 	// bob 未指定 --memory（空 HostConfig，模拟无内存参数的容器创建请求）
 	body := []byte(`{"HostConfig":{}}`)
 
-	newBody, qr, err := CheckAndInjectQuota(body, quota, 1002, db, qm.GetDefaultQuota().CPUCores)
+	newBody, qr, err := CheckAndInjectQuota(body, quota, 1002, db, qm.GetDefaultQuota().CPUCores, qm.GetDefaultQuota().MemMB)
 	if err != nil {
 		t.Fatalf("CheckAndInjectQuota error: %v", err)
 	}
@@ -206,7 +206,7 @@ func TestBug_BobNoMemFlag_QuotaResultInjectedMemMB_ShouldBeDefault_Red(t *testin
 	quota := qm.GetQuota(bob)
 	body := []byte(`{"HostConfig":{}}`) // 未指定 --memory
 
-	_, qr, err := CheckAndInjectQuota(body, quota, 1002, db, qm.GetDefaultQuota().CPUCores)
+	_, qr, err := CheckAndInjectQuota(body, quota, 1002, db, qm.GetDefaultQuota().CPUCores, qm.GetDefaultQuota().MemMB)
 	if err != nil {
 		t.Fatalf("CheckAndInjectQuota error: %v", err)
 	}
@@ -273,7 +273,7 @@ func TestBug_BobMemory1000m_BelowDefault2048m_MustBePreserved_Red(t *testing.T) 
 	requestedBytes := requestedMB * 1024 * 1024
 	body := []byte(fmt.Sprintf(`{"HostConfig":{"Memory":%d}}`, requestedBytes))
 
-	newBody, qr, err := CheckAndInjectQuota(body, quota, 1002, db, qm.GetDefaultQuota().CPUCores)
+	newBody, qr, err := CheckAndInjectQuota(body, quota, 1002, db, qm.GetDefaultQuota().CPUCores, qm.GetDefaultQuota().MemMB)
 
 	// ── 断言 1：代理层必须允许（1000m < quota 3072m）──────────────────────────
 	if err != nil {
@@ -347,7 +347,7 @@ func TestRegression_BobMemory1500m_BelowDefault_WithinQuota_Preserved(t *testing
 	wantBytes := wantMB * 1024 * 1024
 	body := []byte(fmt.Sprintf(`{"HostConfig":{"Memory":%d}}`, wantBytes))
 
-	newBody, qr, err := CheckAndInjectQuota(body, quota, 1002, db, qm.GetDefaultQuota().CPUCores)
+	newBody, qr, err := CheckAndInjectQuota(body, quota, 1002, db, qm.GetDefaultQuota().CPUCores, qm.GetDefaultQuota().MemMB)
 	if err != nil {
 		t.Fatalf(
 			"request denied: %v\n"+
@@ -386,7 +386,7 @@ func TestRegression_BobMemory2049m_AboveDefault_WithinQuota_Preserved(t *testing
 	wantBytes := wantMB * 1024 * 1024
 	body := []byte(fmt.Sprintf(`{"HostConfig":{"Memory":%d}}`, wantBytes))
 
-	newBody, qr, err := CheckAndInjectQuota(body, quota, 1002, db, qm.GetDefaultQuota().CPUCores)
+	newBody, qr, err := CheckAndInjectQuota(body, quota, 1002, db, qm.GetDefaultQuota().CPUCores, qm.GetDefaultQuota().MemMB)
 	if err != nil {
 		t.Fatalf("request denied for 2049m (within quota 3072m): %v", err)
 	}
@@ -420,7 +420,7 @@ func TestRegression_BobMemory3072m_EqualQuota_Preserved(t *testing.T) {
 	wantBytes := wantMB * 1024 * 1024
 	body := []byte(fmt.Sprintf(`{"HostConfig":{"Memory":%d}}`, wantBytes))
 
-	newBody, qr, err := CheckAndInjectQuota(body, quota, 1002, db, qm.GetDefaultQuota().CPUCores)
+	newBody, qr, err := CheckAndInjectQuota(body, quota, 1002, db, qm.GetDefaultQuota().CPUCores, qm.GetDefaultQuota().MemMB)
 	if err != nil {
 		t.Fatalf(
 			"request denied for 3072m = quota ceiling: %v\n"+
@@ -458,7 +458,7 @@ func TestRegression_BobMemory2048m_EqualDefault_Preserved(t *testing.T) {
 	wantBytes := wantMB * 1024 * 1024
 	body := []byte(fmt.Sprintf(`{"HostConfig":{"Memory":%d}}`, wantBytes))
 
-	newBody, qr, err := CheckAndInjectQuota(body, quota, 1002, db, qm.GetDefaultQuota().CPUCores)
+	newBody, qr, err := CheckAndInjectQuota(body, quota, 1002, db, qm.GetDefaultQuota().CPUCores, qm.GetDefaultQuota().MemMB)
 	if err != nil {
 		t.Fatalf("request denied for 2048m = defaults: %v", err)
 	}
@@ -490,7 +490,7 @@ func TestRegression_BobMemory3073m_ExceedsQuota_Denied(t *testing.T) {
 	quota := qm.GetQuota(bob)
 	body := []byte(fmt.Sprintf(`{"HostConfig":{"Memory":%d}}`, int64(3073)*1024*1024))
 
-	_, qr, err := CheckAndInjectQuota(body, quota, 1002, db, qm.GetDefaultQuota().CPUCores)
+	_, qr, err := CheckAndInjectQuota(body, quota, 1002, db, qm.GetDefaultQuota().CPUCores, qm.GetDefaultQuota().MemMB)
 
 	if err == nil {
 		t.Errorf(

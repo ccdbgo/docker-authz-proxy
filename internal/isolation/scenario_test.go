@@ -67,7 +67,7 @@ func TestCheckAndInjectQuota_ContainerCountExceeded(t *testing.T) {
 	quota := UserQuota{MaxContainers: 3}
 	body := []byte(`{"Image":"nginx"}`)
 
-	_, _, err := CheckAndInjectQuota(body, quota, 1001, db, 0)
+	_, _, err := CheckAndInjectQuota(body, quota, 1001, db, 0, 0)
 	if err == nil {
 		t.Error("expected quota exceeded error for containers, got nil")
 	}
@@ -86,7 +86,7 @@ func TestCheckAndInjectQuota_NoLimits_Passes(t *testing.T) {
 	quota := UserQuota{} // 全部为 0，不限制
 	body := []byte(`{"HostConfig":{"NanoCPUs":8000000000,"Memory":4294967296}}`)
 
-	_, result, err := CheckAndInjectQuota(body, quota, 1001, db, 0)
+	_, result, err := CheckAndInjectQuota(body, quota, 1001, db, 0, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

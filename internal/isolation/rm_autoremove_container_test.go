@@ -117,7 +117,7 @@ func TestBug_AutoRemove_NotStripped_WithCpuPeriodQuota_Red(t *testing.T) {
 	// 等价 5.0 核（250000/50000），在配额（8.0）内，用户配额检查放行
 	body := rmBody(true, 50000, 250000)
 
-	outBody, _, err := CheckAndInjectQuota(body, quota, 1001, db, 0)
+	outBody, _, err := CheckAndInjectQuota(body, quota, 1001, db, 0, 0)
 	if err != nil {
 		t.Fatalf("CheckAndInjectQuota 不应返回错误（5.0核 < 配额 8.0核）: %v", err)
 	}
@@ -165,7 +165,7 @@ func TestRegression_AutoRemove_WithoutCpuLimit_MustBeStripped(t *testing.T) {
 		},
 	})
 
-	outBody, _, err := CheckAndInjectQuota(body, quota, 1002, db, 0)
+	outBody, _, err := CheckAndInjectQuota(body, quota, 1002, db, 0, 0)
 	if err != nil {
 		t.Fatalf("CheckAndInjectQuota 不应返回错误: %v", err)
 	}
@@ -202,7 +202,7 @@ func TestRegression_NoAutoRemove_Container_RemainsUnchanged(t *testing.T) {
 		},
 	})
 
-	outBody, _, err := CheckAndInjectQuota(body, quota, 1003, db, 0)
+	outBody, _, err := CheckAndInjectQuota(body, quota, 1003, db, 0, 0)
 	if err != nil {
 		t.Fatalf("CheckAndInjectQuota 不应返回错误: %v", err)
 	}
@@ -228,7 +228,7 @@ func TestRegression_AutoRemove_MemoryInjection_BothCorrect(t *testing.T) {
 
 	body := rmBody(true, 50000, 100000) // 2.0 核，在配额 4.0 内
 
-	outBody, _, err := CheckAndInjectQuota(body, quota, 1004, db, 0)
+	outBody, _, err := CheckAndInjectQuota(body, quota, 1004, db, 0, 0)
 	if err != nil {
 		t.Fatalf("CheckAndInjectQuota 不应返回错误: %v", err)
 	}
@@ -288,7 +288,7 @@ func TestRegression_CpuPeriodQuota_NoAutoRemove_QuotaStillEnforced(t *testing.T)
 	requestedCores := int64(physicalCores() + 1)
 	body := cpuPeriodBody(100000, requestedCores*100000) // 复用 quota_cpuperiod_test.go 中的辅助函数
 
-	_, _, err := CheckAndInjectQuota(body, quota, 1005, db, 0)
+	_, _, err := CheckAndInjectQuota(body, quota, 1005, db, 0, 0)
 
 	if err == nil {
 		t.Errorf(

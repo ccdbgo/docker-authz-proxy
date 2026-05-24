@@ -473,8 +473,13 @@ type QuotaCheckResult struct {
 // defaultCPUCores：系统全局默认 CPU 核数（来自 quota.yaml defaults.cpu_cores），
 // 用于在用户未指定 --cpus 时确定注入基准值。
 // 传 0 表示系统无默认限制，此时退回注入用户配额上限（quota.CPUCores）。
-// 调用方通常从 QuotaManager.GetDefaultQuota().CPUCores 获取此值。
-func CheckAndInjectQuota(body []byte, quota UserQuota, uid int, db ContainerCounter, defaultCPUCores float64) ([]byte, *QuotaCheckResult, error) {
+//
+// defaultMemMB：系统全局默认内存（来自 quota.yaml defaults.mem_mb，单位 MB），
+// 用于在用户未指定 --memory 时确定注入基准值。
+// 传 0 表示系统无默认限制，此时退回注入用户配额上限（quota.MemMB）。
+//
+// 调用方通常从 QuotaManager.GetDefaultQuota() 一次性获取两个值。
+func CheckAndInjectQuota(body []byte, quota UserQuota, uid int, db ContainerCounter, defaultCPUCores float64, defaultMemMB int) ([]byte, *QuotaCheckResult, error) {
 	result := &QuotaCheckResult{
 		QuotaCPUCores:  quota.CPUCores,
 		QuotaMemMB:     quota.MemMB,
@@ -608,7 +613,7 @@ func CheckAndInjectQuota(body []byte, quota UserQuota, uid int, db ContainerCoun
 	}
 
 	// 6. 校验通过，注入配额上限（覆盖超出值或补充缺失参数）
-	injected, injResult := injectQuotaLimits(body, req, quota, defaultCPUCores)
+	injected, injResult := injectQuotaLimits(body, req, quota, defaultCPUCores, defaultMemMB)
 	result.Allowed = true
 	result.InjectedCPUCores = injResult.cpuCores
 	result.InjectedMemMB = injResult.memMB
@@ -752,7 +757,7 @@ type injectionResult struct {
 //   - MemorySwap：强制等于 Memory（禁止 swap，防止绕过内存限制）
 //   - MemorySwappiness：强制设为 0（禁止 swap 使用）
 //   - StorageOpt.size：若未指定则注入配额上限
-func injectQuotaLimits(body []byte, req *containerCreateRequest, quota UserQuota, defaultCPUCores float64) ([]byte, injectionResult) {
+func injectQuotaLimits(body []byte, req *containerCreateRequest, quota UserQuota, defaultCPUCores float64, defaultMemMB int) ([]byte, injectionResult) {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return body, injectionResult{}
@@ -808,8 +813,19 @@ func injectQuotaLimits(body []byte, req *containerCreateRequest, quota UserQuota
 
 		var finalMemBytes int64
 		if req.HostConfig.Memory == 0 {
-			// 未指定：注入配额上限
-			finalMemBytes = quotaBytes
+			// 未指定 --memory：注入系统默认值，而非用户配额上限。
+			//
+			// 语义区分：
+			//   quota.MemMB  = 用户可显式请求的最大内存（enforcement 上限）
+			//   defaultMemMB = 不指定时的基准注入值（defaults.mem_mb）
+			//
+			// 注入规则：min(defaultMemBytes, quotaBytes)
+			//   defaultMemMB == 0：系统无默认限制，退回注入 quotaBytes（原有行为）
+			defaultMemBytes := int64(defaultMemMB) * 1024 * 1024
+			finalMemBytes = quotaBytes // defaultMemMB==0 时的兜底
+			if defaultMemBytes > 0 {
+				finalMemBytes = min(defaultMemBytes, quotaBytes)
+			}
 		} else {
 			// 已指定且不超限：保持原值
 			finalMemBytes = req.HostConfig.Memory
@@ -867,15 +883,15 @@ func injectQuotaLimits(body []byte, req *containerCreateRequest, quota UserQuota
 // ── 兼容旧接口（供 proxy.go 过渡期使用）────────────────────────
 
 // CheckQuotaPreCreate 仅做校验，不注入（已被 CheckAndInjectQuota 取代，保留兼容）
-// defaultCPUCores 透传给 CheckAndInjectQuota，语义同上。
-func CheckQuotaPreCreate(body []byte, quota UserQuota, uid int, db ContainerCounter, defaultCPUCores float64) error {
-	_, _, err := CheckAndInjectQuota(body, quota, uid, db, defaultCPUCores)
+// defaultCPUCores/defaultMemMB 透传给 CheckAndInjectQuota，语义同上。
+func CheckQuotaPreCreate(body []byte, quota UserQuota, uid int, db ContainerCounter, defaultCPUCores float64, defaultMemMB int) error {
+	_, _, err := CheckAndInjectQuota(body, quota, uid, db, defaultCPUCores, defaultMemMB)
 	return err
 }
 
 // InjectResourceLimits 仅做注入，不校验（已被 CheckAndInjectQuota 取代，保留兼容）
-// defaultCPUCores 透传给 injectQuotaLimits，语义同上。
-func InjectResourceLimits(body []byte, quota UserQuota, defaultCPUCores float64) ([]byte, error) {
+// defaultCPUCores/defaultMemMB 透传给 injectQuotaLimits，语义同上。
+func InjectResourceLimits(body []byte, quota UserQuota, defaultCPUCores float64, defaultMemMB int) ([]byte, error) {
 	if quota.CPUCores == 0 && quota.MemMB == 0 && quota.StorageGB == 0 {
 		return body, nil
 	}
@@ -883,7 +899,7 @@ func InjectResourceLimits(body []byte, quota UserQuota, defaultCPUCores float64)
 	if err != nil {
 		return body, nil
 	}
-	out, _ := injectQuotaLimits(body, req, quota, defaultCPUCores)
+	out, _ := injectQuotaLimits(body, req, quota, defaultCPUCores, defaultMemMB)
 	return out, nil
 }
 

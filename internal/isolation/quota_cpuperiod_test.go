@@ -90,7 +90,7 @@ func TestBug_CpuPeriodQuota_ExceedsPhysicalCores_Red(t *testing.T) {
 	requestedCores := int64(physicalCores() + 1) // e.g., 3 for 2-core machine
 	body := cpuPeriodBody(100000, requestedCores*100000)
 
-	_, _, err := CheckAndInjectQuota(body, userQuota, 1001, db, 0)
+	_, _, err := CheckAndInjectQuota(body, userQuota, 1001, db, 0, 0)
 
 	// ── 断言：必须被拒绝 ──────────────────────────────────────────────────────
 	if err == nil {
@@ -135,7 +135,7 @@ func TestRegression_CpuPeriodQuota_WithinPhysicalLimit_Allowed(t *testing.T) {
 	// period=100000, quota=100000 → 1.0 核（低于物理上限）
 	body := cpuPeriodBody(100000, 100000)
 
-	_, qr, err := CheckAndInjectQuota(body, quota, 1001, db, 0)
+	_, qr, err := CheckAndInjectQuota(body, quota, 1001, db, 0, 0)
 
 	if err != nil {
 		t.Errorf(
@@ -170,7 +170,7 @@ func TestRegression_NanoCpus_ExceedsQuota_Denied(t *testing.T) {
 		},
 	})
 
-	_, _, err := CheckAndInjectQuota(body, quota, 1001, db, 0)
+	_, _, err := CheckAndInjectQuota(body, quota, 1001, db, 0, 0)
 
 	if err == nil {
 		t.Errorf(
@@ -199,7 +199,7 @@ func TestRegression_CpuQuotaOnly_DefaultPeriod_1p5Cores_Allowed(t *testing.T) {
 	// CpuPeriod=0 → 内部使用 Docker 默认 100000
 	body := cpuPeriodBody(0, 150000)
 
-	_, qr, err := CheckAndInjectQuota(body, quota, 1001, db, 0)
+	_, qr, err := CheckAndInjectQuota(body, quota, 1001, db, 0, 0)
 
 	if err != nil {
 		t.Errorf(
@@ -233,7 +233,7 @@ func TestRegression_NanoCpus_TakesPriorityOver_CpuPeriodQuota(t *testing.T) {
 		},
 	})
 
-	_, qr, err := CheckAndInjectQuota(body, quota, 1001, db, 0)
+	_, qr, err := CheckAndInjectQuota(body, quota, 1001, db, 0, 0)
 
 	if err != nil {
 		t.Errorf(
@@ -265,7 +265,7 @@ func TestRegression_CpuPeriodQuota_ExactlyAtPhysicalLimit_Allowed(t *testing.T) 
 	// 恰好等于物理核数：period=100000, quota=physicalCores*100000
 	body := cpuPeriodBody(100000, int64(cores)*100000)
 
-	_, _, err := CheckAndInjectQuota(body, quota, 1001, db, 0)
+	_, _, err := CheckAndInjectQuota(body, quota, 1001, db, 0, 0)
 
 	if err != nil {
 		t.Errorf(

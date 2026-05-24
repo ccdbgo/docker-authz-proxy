@@ -791,7 +791,9 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 		// 所有用户（含 sudo、root）均受配额约束，配额值为 0 表示不限制
 		if p.quota != nil {
 			quota := p.quota.GetQuota(id)
-			defaultCPUCores := p.quota.GetDefaultQuota().CPUCores
+			defaultQuota := p.quota.GetDefaultQuota() // 单次 RLock，避免 Reload 期间 TOCTOU
+			defaultCPUCores := defaultQuota.CPUCores
+			defaultMemMB := defaultQuota.MemMB
 			auditID := toAuditIdentity(id)
 			p.logger.Info("quota_resolved",
 				append(audit.LogIdentityShortFields(auditID),
@@ -804,7 +806,7 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 			body, _ := io.ReadAll(r.Body)
 			r.Body.Close()
 
-			newBody, qr, qErr := isolation.CheckAndInjectQuota(body, quota, id.RealUID, p.db, defaultCPUCores)
+			newBody, qr, qErr := isolation.CheckAndInjectQuota(body, quota, id.RealUID, p.db, defaultCPUCores, defaultMemMB)
 
 			// 记录详细配额审计日志
 			logQuotaCheck(p.logger, auditID, qr)

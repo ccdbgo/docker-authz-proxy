@@ -197,7 +197,7 @@ func TestRegression_CheckAndInjectQuota_AfterReload_Injects4Cores(t *testing.T) 
 
 	// 用户未指定 CPU 的请求
 	body := []byte(`{"HostConfig":{}}`)
-	newBody, qr, err := CheckAndInjectQuota(body, quota, 1001, db, newQM.GetDefaultQuota().CPUCores)
+	newBody, qr, err := CheckAndInjectQuota(body, quota, 1001, db, newQM.GetDefaultQuota().CPUCores, newQM.GetDefaultQuota().MemMB)
 	if err != nil {
 		t.Fatalf("CheckAndInjectQuota error: %v", err)
 	}

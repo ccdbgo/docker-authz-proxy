@@ -25,7 +25,7 @@ func TestCheckAndInjectQuota_NoCPULimit_Passes(t *testing.T) {
 	quota := UserQuota{CPUCores: 2.0, MemMB: 512}
 	body := []byte(`{"HostConfig":{}}`)
 
-	newBody, _, err := CheckAndInjectQuota(body, quota, 1001, db, 0)
+	newBody, _, err := CheckAndInjectQuota(body, quota, 1001, db, 0, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -47,7 +47,7 @@ func TestCheckAndInjectQuota_CPUExceeded(t *testing.T) {
 	// 请求 4 核
 	body := []byte(`{"HostConfig":{"NanoCPUs":4000000000}}`)
 
-	_, _, err := CheckAndInjectQuota(body, quota, 1001, db, 0)
+	_, _, err := CheckAndInjectQuota(body, quota, 1001, db, 0, 0)
 	if err == nil {
 		t.Error("expected quota exceeded error for CPU, got nil")
 	}
@@ -59,7 +59,7 @@ func TestCheckAndInjectQuota_MemoryExceeded(t *testing.T) {
 	// 请求 1GB
 	body := []byte(`{"HostConfig":{"Memory":1073741824}}`)
 
-	_, _, err := CheckAndInjectQuota(body, quota, 1001, db, 0)
+	_, _, err := CheckAndInjectQuota(body, quota, 1001, db, 0, 0)
 	if err == nil {
 		t.Error("expected quota exceeded error for memory, got nil")
 	}
@@ -70,7 +70,7 @@ func TestCheckAndInjectQuota_MemoryInjected(t *testing.T) {
 	quota := UserQuota{MemMB: 512}
 	body := []byte(`{"HostConfig":{}}`)
 
-	newBody, _, err := CheckAndInjectQuota(body, quota, 1001, db, 0)
+	newBody, _, err := CheckAndInjectQuota(body, quota, 1001, db, 0, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -94,7 +94,7 @@ func TestCheckAndInjectQuota_MaxContainersExceeded(t *testing.T) {
 	_ = db.SetContainerOwner("c2", &auth.CallerIdentity{RealUID: 1001, RealUsername: "testuser"}, "")
 
 	body := []byte(`{"HostConfig":{}}`)
-	_, _, err := CheckAndInjectQuota(body, quota, 1001, db, 0)
+	_, _, err := CheckAndInjectQuota(body, quota, 1001, db, 0, 0)
 	if err == nil {
 		t.Error("expected quota exceeded error for max containers, got nil")
 	}
@@ -106,7 +106,7 @@ func TestCheckAndInjectQuota_NoLimits_Passthrough(t *testing.T) {
 	quota := UserQuota{}
 	body := []byte(`{"HostConfig":{"NanoCPUs":8000000000,"Memory":4294967296}}`)
 
-	_, _, err := CheckAndInjectQuota(body, quota, 1001, db, 0)
+	_, _, err := CheckAndInjectQuota(body, quota, 1001, db, 0, 0)
 	if err != nil {
 		t.Errorf("zero quota should not block: %v", err)
 	}
