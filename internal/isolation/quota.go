@@ -26,10 +26,10 @@ var builtinAllowedDevices = []string{
 
 // QuotaConfig quota.yaml 顶层结构
 type QuotaConfig struct {
-	Version  int                         `yaml:"version"`
-	Defaults QuotaEntry                  `yaml:"defaults"`
-	Users    map[string]quotaEntryRaw    `yaml:"users"`
-	Groups   map[string]quotaEntryRaw    `yaml:"groups"`
+	Version  int                      `yaml:"version"`
+	Defaults QuotaEntry               `yaml:"defaults"`
+	Users    map[string]quotaEntryRaw `yaml:"users"`
+	Groups   map[string]quotaEntryRaw `yaml:"groups"`
 }
 
 // QuotaEntry 单条配额（0 表示不限制）
@@ -110,10 +110,10 @@ type UserQuota struct {
 
 // QuotaExceededError 配额超限，携带详细信息供审计和 HTTP 响应使用
 type QuotaExceededError struct {
-	Resource  string  // "cpu" | "memory" | "storage" | "containers"
-	Requested string  // 用户请求值（人类可读）
-	Limit     string  // 配额上限（人类可读）
-	Excess    string  // 超出量（人类可读）
+	Resource  string // "cpu" | "memory" | "storage" | "containers"
+	Requested string // 用户请求值（人类可读）
+	Limit     string // 配额上限（人类可读）
+	Excess    string // 超出量（人类可读）
 }
 
 func (e *QuotaExceededError) Error() string {
@@ -148,7 +148,7 @@ type containerCreateRequest struct {
 // RequestedResources 从请求体解析出的用户请求资源参数（原始值，未经配额处理）
 type RequestedResources struct {
 	// CPU
-	NanoCPUs   int64  // 0 表示未指定
+	NanoCPUs   int64 // 0 表示未指定
 	CpuQuota   int64
 	CpuPeriod  int64
 	CpuShares  int64
@@ -438,10 +438,10 @@ type ContainerCounter interface {
 // QuotaCheckResult 配额校验结果，用于详细审计日志
 type QuotaCheckResult struct {
 	// 用户请求的原始参数
-	RequestedCPUCores  float64
-	RequestedMemMB     int64
-	RequestedStorageGB int
-	RequestedCpuShares int64
+	RequestedCPUCores   float64
+	RequestedMemMB      int64
+	RequestedStorageGB  int
+	RequestedCpuShares  int64
 	RequestedCpusetCpus string
 
 	// 用户配额上限
@@ -457,7 +457,7 @@ type QuotaCheckResult struct {
 	// 校验结果
 	Allowed bool
 	// 若拒绝，记录超出的资源和数值
-	DeniedResource string // "cpu" | "memory" | "storage" | "containers"
+	DeniedResource  string // "cpu" | "memory" | "storage" | "containers"
 	DeniedRequested string
 	DeniedLimit     string
 	DeniedExcess    string
@@ -747,7 +747,7 @@ type injectionResult struct {
 // injectQuotaLimits 将配额上限强制注入请求体
 // 规则：
 //   - CPU：若未指定则注入 defaultCPUCores（系统默认）；defaultCPUCores==0 时退回 quota 上限；
-//          注入值不得超过 quota.CPUCores（用户配额上限）；若已指定则保持（已在校验阶段确认不超限）
+//     注入值不得超过 quota.CPUCores（用户配额上限）；若已指定则保持（已在校验阶段确认不超限）
 //   - Memory：若未指定则注入配额上限；若已指定则保持
 //   - MemorySwap：强制等于 Memory（禁止 swap，防止绕过内存限制）
 //   - MemorySwappiness：强制设为 0（禁止 swap 使用）
