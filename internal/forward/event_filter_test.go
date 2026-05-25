@@ -187,9 +187,15 @@ func TestEventBelongsToUser_ContainerEvent_PriorityLabel(t *testing.T) {
 
 // TestEventBelongsToUser_NetworkEvent_PrefixMatching
 //
-// 回归-3：network 事件通过网络名前缀判断归属（user-<uid>- / peer-<uid>-），
-// 系统网络（bridge、host、docker_gwbridge）应对所有用户透传。
-// 覆盖：前缀正向匹配、他人前缀拒绝、系统网络透传。
+// 回归-3：network 事件按网络名模式三路过滤：
+//
+//	路径 1a：user-{uid}-bridge（用户专属桥接，connect/disconnect 事件用此名）
+//	路径 1b：peer-{digits}-{digits} 互通对等网络
+//	路径 2 ：{username}_u{uid}_{name} 用户自建网络（含 _u{digits}_ 段）
+//	路径 3 ：无以上模式 → 系统内置网络（bridge/host/docker_gwbridge），
+//	         对所有用户放行（return true）
+//
+// 覆盖：各路径正向匹配、他人网络拒绝、系统网络对所有用户透传。
 func TestEventBelongsToUser_NetworkEvent_PrefixMatching(t *testing.T) {
 	const bobUID = 1002
 
@@ -199,12 +205,20 @@ func TestEventBelongsToUser_NetworkEvent_PrefixMatching(t *testing.T) {
 		want    bool
 		desc    string
 	}{
-		{fmt.Sprintf("user-%d-net0", bobUID), bobUID, true, "bob user-prefix network"},
-		{fmt.Sprintf("peer-%d-other", bobUID), bobUID, true, "bob peer-prefix network"},
-		{"user-1001-net0", bobUID, false, "alice's network → bob should not see"},
-		{"bridge", bobUID, false, "system bridge → no uid match, pass-through = false"},
-		{"host", bobUID, false, "system host network"},
-		{"docker_gwbridge", bobUID, false, "docker gateway bridge"},
+		// 路径 2：真实用户网络格式 {username}_u{uid}_{name}
+		{"bob_u1002_mynet", bobUID, true, "bob's user network → visible to bob"},
+		{"bob_u1002_mynet", 1001, false, "bob's network → alice should not see"},
+		{"alice_u1001_mynet", bobUID, false, "alice's network → bob should not see"},
+		// 路径 1a：user-{uid}-bridge（connect/disconnect 事件用桥接网络名）
+		{fmt.Sprintf("user-%d-bridge", bobUID), bobUID, true, "bob's bridge network"},
+		{"user-1001-bridge", bobUID, false, "alice's bridge → bob should not see"},
+		// 路径 1b：peer-{digits}-{digits} 互通网络
+		{"peer-1002-1001", bobUID, true, "peer network containing bob's uid"},
+		{"peer-1001-1003", bobUID, false, "peer between others → bob should not see"},
+		// 路径 3：系统内置网络，对所有用户放行（return true）
+		{"bridge", bobUID, true, "system bridge → passthrough to all users"},
+		{"host", bobUID, true, "system host → passthrough to all users"},
+		{"docker_gwbridge", bobUID, true, "docker gateway bridge → passthrough to all users"},
 	}
 	for _, tc := range cases {
 		event := makeNetworkEvent("connect", tc.netName)

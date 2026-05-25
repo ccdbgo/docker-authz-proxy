@@ -1887,12 +1887,61 @@ func (p *ProxyServer) eventBelongsToUser(line []byte, uid int) bool {
 	}
 	uidStr := strconv.Itoa(uid)
 
-	// network 事件：通过网络名前缀判断（user-<uid>- 或 peer-<uid>-）
+	// network 事件：通过网络名判断归属。
+	//
+	// 系统托管网络（代理自动创建）：
+	//   - user-{uid}-bridge：用户专属桥接，仅该用户可见
+	//   - peer-{uidA}-{uidB}：peer 互通网络，uid 出现在段中的用户可见
+	//   - 内置网络（bridge/host/none 等）：无 _u{digits}_ 段，放行
+	//
+	// 用户普通网络格式：{username}_u{uid}_{user-defined-name}
+	//   代理注入前缀恰好一次，第一个 _u{digits}_ 即为 uid 段。
+	//
+	// 三条路径：
+	//   1. 系统桥接/peer 网络，uid 匹配 → true；不匹配 → false
+	//   2. 普通用户网络，第一个 _u{digits}_ 的 uid 匹配 → true；不匹配 → false
+	//   3. 无 _u{digits}_ 段（内置系统网络）→ true（放行）
 	if ev.Type == "network" {
 		name := attrs["name"]
-		return strings.HasPrefix(name, "user-"+uidStr+"-") ||
-			strings.HasPrefix(name, "peer-"+uidStr+"-") ||
-			(strings.HasPrefix(name, "peer-") && strings.Contains(name, "-"+uidStr+"-"))
+
+		// 路径 1a：user-{uid}-bridge（用户专属桥接网络）
+		if name == "user-"+uidStr+"-bridge" {
+			return true
+		}
+		if strings.HasPrefix(name, "user-") && strings.HasSuffix(name, "-bridge") {
+			return false // 属于其他用户的 bridge 网络
+		}
+
+		// 路径 1b：peer-{digits}-{digits} 互通网络
+		if strings.HasPrefix(name, "peer-") {
+			rest := name[len("peer-"):]
+			for _, seg := range strings.Split(rest, "-") {
+				if seg == uidStr {
+					return true
+				}
+			}
+			return false // peer 网络但 uid 不在其中
+		}
+
+		// 路径 2/3：普通用户网络，找第一个 _u{digits}_ 段
+		for i := 0; i < len(name); i++ {
+			if name[i] != '_' {
+				continue
+			}
+			if i+1 >= len(name) || name[i+1] != 'u' {
+				continue
+			}
+			j := i + 2
+			for j < len(name) && name[j] >= '0' && name[j] <= '9' {
+				j++
+			}
+			if j == i+2 || j >= len(name) || name[j] != '_' {
+				continue // digits 段为空或末尾无 _，不是有效 uid 段
+			}
+			foundUID := name[i+2 : j]
+			return foundUID == uidStr // 路径 2：匹配→true，不匹配→false
+		}
+		return true // 路径 3：无 _u{digits}_ 段，系统内置网络，放行
 	}
 
 	// volume 事件：Docker volume 事件的卷名在 Actor.ID 中（Attributes 仅含 driver 等元数据）。
