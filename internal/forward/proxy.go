@@ -55,8 +55,11 @@ type ProxyServer struct {
 
 	// requestTimeout 单请求超时（含上游响应），0 表示不限制
 	requestTimeout time.Duration
-	// semaphore 并发信号量，nil 表示不限制
+	// semaphore 短命令并发信号量（ps/inspect/pull 等），nil 表示不限制
 	semaphore chan struct{}
+	// streamSemaphore 长连接并发信号量（events/stats/logs-f/attach/exec），nil 表示不限制。
+	// 与 semaphore 分离，防止持续数小时的长连接耗尽短命令槽位。
+	streamSemaphore chan struct{}
 
 	mu        sync.Mutex
 	listeners map[string]net.Listener
@@ -93,8 +96,10 @@ type ProxyServer struct {
 type ProxyOptions struct {
 	// RequestTimeout 单个请求的最大处理时间（含等待上游响应），0 表示不限制，建议 30s
 	RequestTimeout time.Duration
-	// MaxConcurrent 全局最大并发请求数，0 表示不限制，建议 100
+	// MaxConcurrent 短命令最大并发数，0 表示不限制（默认）。显式设置时建议 ≥ 用户数×2
 	MaxConcurrent int
+	// MaxConcurrentStreams 长连接最大并发数（events/stats/logs-f/attach/exec），0 表示不限制（默认）
+	MaxConcurrentStreams int
 	// StorageBase 用户存储根目录，默认 /var/docker/user-storage
 	StorageBase string
 	// StorageCleanupInterval 定期清理孤立 Volume 的间隔，0 表示不启用清理，建议 5m
@@ -120,6 +125,10 @@ func NewProxyServer(socketDir, upstreamSock string, policy *authz.Policy, db *au
 	if opts.MaxConcurrent > 0 {
 		sem = make(chan struct{}, opts.MaxConcurrent)
 	}
+	var streamSem chan struct{}
+	if opts.MaxConcurrentStreams > 0 {
+		streamSem = make(chan struct{}, opts.MaxConcurrentStreams)
+	}
 
 	storageBase := opts.StorageBase
 	if storageBase == "" {
@@ -138,9 +147,10 @@ func NewProxyServer(socketDir, upstreamSock string, policy *authz.Policy, db *au
 		bridge:         isolation.NewBridgeManager(upstreamSock),
 		storageBase:    storageBase,
 		storage:        isolation.NewStorageManager(storageBase, upstreamSock),
-		requestTimeout: opts.RequestTimeout,
-		semaphore:      sem,
-		listeners:      make(map[string]net.Listener),
+		requestTimeout:  opts.RequestTimeout,
+		semaphore:       sem,
+		streamSemaphore: streamSem,
+		listeners:       make(map[string]net.Listener),
 		transport:      transport,
 	}
 }
@@ -429,18 +439,40 @@ func (p *ProxyServer) StartTCPListener(addr string, tlsCfg *tls.Config) error {
 
 // ServeHTTP 是每个请求的入口：并发控制 + 授权 + 代理
 func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// 并发限制：信号量满时直接返回 503，避免请求堆积
-	if p.semaphore != nil {
-		select {
-		case p.semaphore <- struct{}{}:
-			defer func() { <-p.semaphore }()
-		default:
-			p.logger.Warn("concurrency_limit_reached",
-				zap.Int("limit", cap(p.semaphore)),
-				zap.String("uri", r.URL.RequestURI()),
-			)
-			writeDockerError(w, http.StatusServiceUnavailable, "server busy, please retry later")
-			return
+	// 并发限制：短命令（semaphore）与长连接（streamSemaphore）使用独立信号量池。
+	// 防止 events/stats/exec 等持续数小时的长连接耗尽短命令槽位导致 docker ps 等返回 503。
+	// 两者默认均为 nil（不限制），运维人员按需显式设置。
+	//
+	// isHijackRequest 此处在 URL 重写前调用，但只检查 header 和路径后缀，
+	// URL 重写不改变后缀，调用时序安全。缓存结果避免 line ~553 处的重复调用。
+	isHijack := isHijackRequest(r)
+	if isHijack || isLongLivedRequest(r) {
+		if p.streamSemaphore != nil {
+			select {
+			case p.streamSemaphore <- struct{}{}:
+				defer func() { <-p.streamSemaphore }()
+			default:
+				p.logger.Warn("stream_concurrency_limit_reached",
+					zap.Int("limit", cap(p.streamSemaphore)),
+					zap.String("uri", r.URL.RequestURI()),
+				)
+				writeDockerError(w, http.StatusServiceUnavailable, "too many concurrent streams, please retry later")
+				return
+			}
+		}
+	} else {
+		if p.semaphore != nil {
+			select {
+			case p.semaphore <- struct{}{}:
+				defer func() { <-p.semaphore }()
+			default:
+				p.logger.Warn("concurrency_limit_reached",
+					zap.Int("limit", cap(p.semaphore)),
+					zap.String("uri", r.URL.RequestURI()),
+				)
+				writeDockerError(w, http.StatusServiceUnavailable, "server busy, please retry later")
+				return
+			}
 		}
 	}
 
@@ -512,7 +544,7 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		r = isolation.RewriteVolumeURL(r, identity.RealUID)
 	}
 
-	if isHijackRequest(r) {
+	if isHijack {
 		p.logger.Debug("hijack_detected",
 			zap.String("user", fmt.Sprintf("%s(uid=%d)", identity.RealUsername, identity.RealUID)),
 			zap.String("method", r.Method),
@@ -3453,6 +3485,38 @@ func isHijackRequest(r *http.Request) bool {
 		}
 	}
 	return false
+}
+
+// isLongLivedRequest 判断请求是否为长连接流式响应（events / stats / logs?follow）。
+// 布尔参数解析与 Docker daemon httputils.BoolValue 对齐：
+//   false 等价值：对应参数的零值（""对 follow=缺省意味不跟随）、"0"、"false"、"no"
+//   true  等价值：其余所有值（"1"、"true"、"yes" 等）
+//
+// 仅在路径后缀匹配时才解析 Query，避免对所有请求分配 url.Values map。
+// 此函数在 URL 重写前调用：只检测路径后缀，URL 重写不改变后缀，调用时序安全。
+func isLongLivedRequest(r *http.Request) bool {
+	path := authz.StripAPIVersion(r.URL.Path)
+
+	// GET /events：始终长连接
+	if strings.HasSuffix(path, "/events") {
+		return true
+	}
+
+	// 仅在需要时才解析 Query，且只解析一次
+	if !strings.HasSuffix(path, "/stats") && !strings.HasSuffix(path, "/logs") {
+		return false
+	}
+	q := r.URL.Query()
+
+	if strings.HasSuffix(path, "/stats") {
+		// GET /containers/{id}/stats：缺省为流式；stream=false/0/no 时为单次快照
+		s := q.Get("stream")
+		return s != "false" && s != "0" && s != "no"
+	}
+
+	// GET /containers/{id}/logs：follow=1/true/yes 时为长连接，缺省或 0/false/no 为短命令
+	f := q.Get("follow")
+	return f != "" && f != "0" && f != "false" && f != "no"
 }
 
 // handleHijack 处理需要双向流的请求（attach/exec-start 等）

@@ -33,8 +33,9 @@ func main() {
 		logFormat    = flag.String("log-format", "json", "日志格式: json/text")
 		logFile      = flag.String("log-file", "", "日志文件路径（空表示输出到 stdout）")
 		// 连接与并发控制
-		requestTimeout = flag.Int("request-timeout", 30, "单请求超时秒数（含等待上游响应），0 表示不限制")
-		maxConcurrent  = flag.Int("max-concurrent", 100, "最大并发请求数，0 表示不限制")
+		requestTimeout      = flag.Int("request-timeout", 30, "单请求超时秒数（含等待上游响应），0 表示不限制")
+		maxConcurrent       = flag.Int("max-concurrent", 0, "短命令最大并发数（ps/inspect/pull 等），0 表示不限制；显式设置时建议 ≥ 用户数×2")
+		maxConcurrentStreams = flag.Int("max-concurrent-streams", 0, "长连接最大并发数（events/stats/logs-f/attach/exec），0 表示不限制")
 		// 存储资源隔离
 		storageRoot            = flag.String("storage-root", "/var/docker/user-storage", "用户存储根目录")
 		storageCleanupInterval = flag.Int("storage-cleanup-interval", 5, "存储清理间隔（分钟），0 表示不启用清理")
@@ -116,7 +117,8 @@ func main() {
 		zap.String("db", *dbPath),
 		zap.String("log_level", *logLevel),
 		zap.Int("request_timeout_sec", *requestTimeout),
-		zap.Int("max_concurrent", *maxConcurrent),
+		zap.Int("max_concurrent_cmd", *maxConcurrent),
+		zap.Int("max_concurrent_streams", *maxConcurrentStreams),
 		zap.String("storage_root", *storageRoot),
 		zap.Int("storage_cleanup_interval_min", *storageCleanupInterval),
 	)
@@ -208,6 +210,7 @@ func main() {
 	proxyOpts := forward.ProxyOptions{
 		RequestTimeout:         time.Duration(*requestTimeout) * time.Second,
 		MaxConcurrent:          *maxConcurrent,
+		MaxConcurrentStreams:   *maxConcurrentStreams,
 		StorageBase:            *storageRoot,
 		StorageCleanupInterval: time.Duration(*storageCleanupInterval) * time.Minute,
 	}
