@@ -68,6 +68,17 @@ type ProxyServer struct {
 	// 用于解决竞态：docker build 返回后立即执行 docker rmi，而 trackBuildKitImages
 	// goroutine 尚未将镜像写入 DB。checkImageRemovePermission 检测到此状态时会短暂等待。
 	pendingBuilds sync.Map // map[int]time.Time (uid → start time)
+
+	// pendingBuildTags 记录正在进行经典 builder（POST /build）构建的 tag → ownerUID 映射。
+	// 用途：在 SetImageOwner 调用前的竞态窗口内，image tag 事件到达 eventBelongsToUser
+	// 时，通过此 map 提供归属信息，防止私有 build 镜像的事件泄漏给其他用户。
+	//
+	// 覆盖范围：仅限经典 builder（POST /build → ActionBuild case）。
+	// BuildKit（docker buildx / POST /grpc）走 trackBuildKitImages goroutine，
+	// 生命周期与 case 返回不对齐，需独立修复（BUG-18b）。
+	//
+	// 并发安全：CompareAndDelete 确保两个并发 build 同一 tag 时不会互相删除对方记录。
+	pendingBuildTags sync.Map // map[string]int: tag → ownerUID
 }
 
 // ProxyOptions 可选配置参数
@@ -1977,13 +1988,28 @@ func (p *ProxyServer) eventBelongsToUser(line []byte, uid int) bool {
 		return true // 路径 3：系统卷或格式不合法，放行
 	}
 
-	// image 事件：通过 DB 查归属。
+	// image 事件：通过 pendingBuildTags（竞态窗口）或 DB 查归属。
 	// image 事件的 Actor.ID 为 sha256: 开头的 content ID，Attributes["name"] 为 tag 或 ID。
-	// 三条路径：
-	//   1. DB 中有记录且属于本用户（或公共镜像）       → true
-	//   2. DB 中有记录且属于其他用户（私有镜像）       → false（隔离）
-	//   3. DB 中无记录（基础镜像、中间层、系统镜像等） → true（放行）
+	// 四条路径：
+	//   0. pendingBuildTags 中有命名 tag 记录（经典 builder 竞态窗口）→ 按 uid 判断
+	//   1. DB 中有记录且属于本用户（或公共镜像）                       → true
+	//   2. DB 中有记录且属于其他用户（私有镜像）                       → false（隔离）
+	//   3. DB 中无记录（基础镜像、中间层、系统镜像等）                 → true（放行）
 	if ev.Type == "image" {
+		// 路径 0：pendingBuildTags
+		// 处理经典 builder 竞态：Docker 在代理调用 SetImageOwner 之前就已发出 image tag
+		// 事件。仅对命名 tag（非 sha256: 开头）生效；image create 的 sha256 名（中间层）
+		// 不命中此路径，继续走路径 3 放行。
+		name := attrs["name"]
+		if name != "" && !strings.HasPrefix(name, "sha256:") {
+			if v, ok := p.pendingBuildTags.Load(name); ok {
+				if ownerUID, ok := v.(int); ok {
+					return ownerUID == uid
+				}
+				// 类型断言失败（异常情况）：跳过路径 0，降级到 DB 路径
+			}
+		}
+
 		imageID := ev.Actor.ID // 通常为 sha256:... 格式
 		if imageID == "" {
 			imageID = attrs["name"]
@@ -2473,6 +2499,20 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 		}
 
 	case authz.ActionBuild:
+		// ── 竞态窗口防护：在读取流式响应之前注册 pending tag ──────────────────
+		// 时序保证：p.forward() 在收到 Docker HTTP 响应头时返回，此时 Docker 才开始
+		// 执行构建步骤；image 事件在构建完成后发出，晚于此处的 Store。
+		// defer CompareAndDelete：只有存储值仍等于本次 build 的 uid 时才删除，
+		// 防止并发构建同一 tag 时互相删除对方记录（Go 1.20+）。
+		// 仅覆盖经典 builder（POST /build）；BuildKit 见 BUG-18b。
+		if u, uErr := url.ParseRequestURI(requestURI); uErr == nil {
+			for _, tag := range u.Query()["t"] {
+				tag := tag
+				ownerUID := id.RealUID
+				p.pendingBuildTags.Store(tag, ownerUID)
+				defer p.pendingBuildTags.CompareAndDelete(tag, ownerUID)
+			}
+		}
 		isolation.CopyHeaders(w, resp.Header)
 		w.WriteHeader(resp.StatusCode)
 		imageID := streamAndCaptureImageID(w, resp, "build")
