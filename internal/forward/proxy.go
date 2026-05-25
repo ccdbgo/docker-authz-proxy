@@ -90,6 +90,18 @@ type ProxyServer struct {
 	// 时序保证：ActionPull case 开头（响应头到达时）注册，早于 Docker 发出 pull 事件。
 	// 并发安全：CompareAndDelete 确保并发 pull 同一 imageRef 时不会互相删除对方记录。
 	pendingPullRefs sync.Map // map[string]int: imageRef → ownerUID
+
+	// completedPullOwner 在 pull 完成后维持 imageRef → ownerUID 映射，
+	// 覆盖 pendingPullRefs 清除后 Docker 事件投递延迟的窗口（BUG-20）。
+	//
+	// 生命周期：SetImageOwner 调用后存入，pullEventDeliveryGrace 后由 time.AfterFunc 自动清除。
+	// 选用 TTL 而非 rmi 联动的原因：
+	//   1. pull 事件是一次性即时事件，Docker 发出后几秒内必达订阅者。
+	//   2. ActionRemoveImage 收到的是 content ID，无 ref→contentID 反向索引，
+	//      无法可靠清理 ref 级别的条目（rmi by sha256 时尤为明显）。
+	// 并发安全：time.AfterFunc closure 使用 CompareAndDelete，
+	//   并发 pull 同一 ref 时各自的 timer 只删除与自身 ownerUID 匹配的条目。
+	completedPullOwner sync.Map // map[string]int: imageRef → ownerUID
 }
 
 // ProxyOptions 可选配置参数
@@ -1922,6 +1934,11 @@ type upstreamError struct {
 func (e *upstreamError) Error() string { return e.cause.Error() }
 func (e *upstreamError) Unwrap() error { return e.cause }
 
+// pullEventDeliveryGrace 是 pull 完成后 completedPullOwner 条目的 TTL。
+// Docker 事件在 pull 完成后通常在数毫秒到数秒内投递给所有订阅者；
+// 30s 提供足够的余量，同时防止无限期内存占用。
+const pullEventDeliveryGrace = 30 * time.Second
+
 // eventBelongsToUser 判断一行 docker events JSON 是否属于指定 uid 的用户。
 // 过滤规则：
 //   - volume 事件：通过卷名前缀 user-{uid}-volume-* 判断（卷 API 不支持自定义 Attributes 标签）
@@ -2040,10 +2057,12 @@ func (p *ProxyServer) eventBelongsToUser(line []byte, uid int) bool {
 	// image 事件的 Actor.ID：pull/tag/untag 事件为 image ref（如 alpine:3.18），
 	//   delete/create 事件为 sha256: 开头的 content ID。
 	// Attributes["name"]：仅含仓库名（如 alpine），不含 tag。
-	// 七条路径：
+	// 九条路径：
 	//   0a.   pendingBuildTags 中有命名 tag 记录（经典 builder/BuildKit 竞态窗口）→ 按 uid 判断
 	//   0b.   pendingPullRefs 中有命名 ref，用 attrs["name"] 查命中              → 按 uid 判断
 	//   0b.2. pendingPullRefs 中有命名 ref，用 Actor.ID 查命中（含完整 tag）      → 按 uid 判断
+	//   0c.   completedPullOwner 中有命名 ref，用 attrs["name"] 查命中           → 按 uid 判断
+	//   0c.2. completedPullOwner 中有命名 ref，用 Actor.ID 查命中（含完整 tag）   → 按 uid 判断
 	//   1.    DB 中有记录且公共镜像                                               → true
 	//   2.    DB 中有记录且属于本用户                                              → true
 	//   2.5.  DB 中有记录但属于他人，image_access 有当前用户记录（曾 pull 过）     → true
@@ -2076,6 +2095,28 @@ func (p *ProxyServer) eventBelongsToUser(line []byte, uid int) bool {
 		// Actor.ID 在 pull 事件中正好是完整 ref，用它补充查询覆盖此情形。
 		if actorRef := ev.Actor.ID; actorRef != "" && !strings.HasPrefix(actorRef, "sha256:") {
 			if v, ok := p.pendingPullRefs.Load(actorRef); ok {
+				if ownerUID, ok := v.(int); ok {
+					return ownerUID == uid
+				}
+			}
+		}
+
+		// 路径 0c / 0c.2：completedPullOwner（pull 完成后事件投递窗口，BUG-20）
+		// pendingPullRefs 在 ServeHTTP defer 运行时已清除，但 Docker 事件仍可能在此后
+		// 数秒内到达订阅者（异步投递延迟）。completedPullOwner 在 SetImageOwner 调用后
+		// pullEventDeliveryGrace (30s) 内保留 ref → ownerUID 映射作为兜底。
+		// 双 key 查询与路径 0b/0b.2 对齐：
+		//   name（attrs）覆盖 latest tag 场景（key="busybox"，Actor.ID="busybox:latest"）
+		//   ev.Actor.ID   覆盖非 latest tag 场景（key="alpine:3.18"，attrs="alpine"）
+		if name != "" && !strings.HasPrefix(name, "sha256:") {
+			if v, ok := p.completedPullOwner.Load(name); ok {
+				if ownerUID, ok := v.(int); ok {
+					return ownerUID == uid
+				}
+			}
+		}
+		if actorID := ev.Actor.ID; actorID != "" && !strings.HasPrefix(actorID, "sha256:") {
+			if v, ok := p.completedPullOwner.Load(actorID); ok {
 				if ownerUID, ok := v.(int); ok {
 					return ownerUID == uid
 				}
@@ -2573,6 +2614,16 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 						}
 					}
 				}
+				// BUG-20：pendingPullRefs 将在 ServeHTTP defer 返回时立即清除，
+				// 但 Docker pull 事件可能在数秒后才到达其他用户的事件流协程。
+				// completedPullOwner 延续 imageRef → ownerUID pullEventDeliveryGrace (30s)，
+				// 覆盖此投递延迟窗口。time.AfterFunc 确保条目自动清理，无内存泄漏。
+				// imageRef 此处必定非空（外层 if imageRef != "" 已守卫）。
+				ref, ownerUID := imageRef, id.RealUID
+				p.completedPullOwner.Store(ref, ownerUID)
+				time.AfterFunc(pullEventDeliveryGrace, func() {
+					p.completedPullOwner.CompareAndDelete(ref, ownerUID)
+				})
 			}
 		}
 
