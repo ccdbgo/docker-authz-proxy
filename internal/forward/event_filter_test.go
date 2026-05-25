@@ -22,6 +22,14 @@ import (
 	"testing"
 )
 
+// eventBelongsToUser 是测试用的包级包装函数，使用无 DB 的 ProxyServer 实例。
+// image 事件在无 DB 时走路径3（DB无记录→放行），与旧行为兼容。
+// 需要测试 image 事件隔离时请直接使用 ProxyServer.eventBelongsToUser 并传入真实 DB。
+func eventBelongsToUser(line []byte, uid int) bool {
+	p := &ProxyServer{}
+	return p.eventBelongsToUser(line, uid)
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // 事件 JSON 构造辅助函数
 // ──────────────────────────────────────────────────────────────────────────────

@@ -1866,10 +1866,11 @@ func (e *upstreamError) Unwrap() error { return e.cause }
 // eventBelongsToUser 判断一行 docker events JSON 是否属于指定 uid 的用户。
 // 过滤规则：
 //   - volume 事件：通过卷名前缀 user-{uid}-volume-* 判断（卷 API 不支持自定义 Attributes 标签）
-//   - container/image 事件：通过 system.authz.owner.uid 或 user_id 字段判断
+//   - image 事件：通过 DB 查归属（三路径：属于本用户→true/属于他人→false/DB无记录→true）
+//   - container 事件：通过 system.authz.owner.uid 或 user_id 字段判断
 //   - network 事件：通过网络名前缀 user-<uid>- 或 peer-<uid>- 判断
 //   - 无法判断归属的事件（系统事件、无 uid 字段）一律放行
-func eventBelongsToUser(line []byte, uid int) bool {
+func (p *ProxyServer) eventBelongsToUser(line []byte, uid int) bool {
 	var ev struct {
 		Type  string `json:"Type"`
 		Actor struct {
@@ -1925,6 +1926,30 @@ func eventBelongsToUser(line []byte, uid int) bool {
 			}
 		}
 		return true // 路径 3：系统卷或格式不合法，放行
+	}
+
+	// image 事件：通过 DB 查归属。
+	// image 事件的 Actor.ID 为 sha256: 开头的 content ID，Attributes["name"] 为 tag 或 ID。
+	// 三条路径：
+	//   1. DB 中有记录且属于本用户（或公共镜像）       → true
+	//   2. DB 中有记录且属于其他用户（私有镜像）       → false（隔离）
+	//   3. DB 中无记录（基础镜像、中间层、系统镜像等） → true（放行）
+	if ev.Type == "image" {
+		imageID := ev.Actor.ID // 通常为 sha256:... 格式
+		if imageID == "" {
+			imageID = attrs["name"]
+		}
+		if imageID != "" && p.db != nil {
+			owner, isPublic, found := p.db.GetImageOwner(imageID)
+			if found {
+				if isPublic {
+					return true // 路径 1：公共镜像，所有人可见
+				}
+				return owner.UID == uid // 路径 1/2：按归属判断
+			}
+			// 路径 3：DB 无记录，放行
+		}
+		return true
 	}
 
 	// 其他事件：通过 system.authz.owner.uid 或 user_id 判断
@@ -2959,7 +2984,7 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 				}
 				// /events 过滤：非 privileged 用户只看自己的事件
 				if isEvents && !id.IsPrivileged() {
-					if !eventBelongsToUser(line, id.RealUID) {
+					if !p.eventBelongsToUser(line, id.RealUID) {
 						continue
 					}
 				}
