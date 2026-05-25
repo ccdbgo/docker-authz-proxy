@@ -79,6 +79,14 @@ type ProxyServer struct {
 	//
 	// 并发安全：CompareAndDelete 确保两个并发 build 同一 tag 时不会互相删除对方记录。
 	pendingBuildTags sync.Map // map[string]int: tag → ownerUID
+
+	// pendingPullRefs 记录正在进行 pull 操作的 imageRef → ownerUID 映射（BUG-19）。
+	// 用途：在 SetImageOwner 调用前的竞态窗口内，image pull 事件到达 eventBelongsToUser
+	// 时，通过此 map 提供归属信息，防止 pull 镜像事件泄漏给其他用户。
+	//
+	// 时序保证：ActionPull case 开头（响应头到达时）注册，早于 Docker 发出 pull 事件。
+	// 并发安全：CompareAndDelete 确保并发 pull 同一 imageRef 时不会互相删除对方记录。
+	pendingPullRefs sync.Map // map[string]int: imageRef → ownerUID
 }
 
 // ProxyOptions 可选配置参数
@@ -1988,17 +1996,18 @@ func (p *ProxyServer) eventBelongsToUser(line []byte, uid int) bool {
 		return true // 路径 3：系统卷或格式不合法，放行
 	}
 
-	// image 事件：通过 pendingBuildTags（竞态窗口）或 DB 查归属。
+	// image 事件：通过 pending 竞态窗口 map 或 DB 查归属。
 	// image 事件的 Actor.ID 为 sha256: 开头的 content ID，Attributes["name"] 为 tag 或 ID。
-	// 四条路径：
-	//   0. pendingBuildTags 中有命名 tag 记录（经典 builder 竞态窗口）→ 按 uid 判断
-	//   1. DB 中有记录且属于本用户（或公共镜像）                       → true
-	//   2. DB 中有记录且属于其他用户（私有镜像）                       → false（隔离）
-	//   3. DB 中无记录（基础镜像、中间层、系统镜像等）                 → true（放行）
+	// 五条路径：
+	//   0a. pendingBuildTags 中有命名 tag 记录（经典 builder/BuildKit 竞态窗口）→ 按 uid 判断
+	//   0b. pendingPullRefs 中有命名 ref 记录（pull 竞态窗口，BUG-19）          → 按 uid 判断
+	//   1.  DB 中有记录且属于本用户（或公共镜像）                                 → true
+	//   2.  DB 中有记录且属于其他用户（私有镜像）                                 → false（隔离）
+	//   3.  DB 中无记录（基础镜像、中间层、系统镜像等）                           → true（放行）
 	if ev.Type == "image" {
-		// 路径 0：pendingBuildTags
-		// 处理经典 builder 竞态：Docker 在代理调用 SetImageOwner 之前就已发出 image tag
-		// 事件。仅对命名 tag（非 sha256: 开头）生效；image create 的 sha256 名（中间层）
+		// 路径 0：pending 竞态窗口（build tag 或 pull ref）
+		// 处理 Docker 在代理调用 SetImageOwner 之前就已发出 image 事件的场景。
+		// 仅对命名 ref（非 sha256: 开头）生效；image create 的 sha256 名（中间层）
 		// 不命中此路径，继续走路径 3 放行。
 		name := attrs["name"]
 		if name != "" && !strings.HasPrefix(name, "sha256:") {
@@ -2006,7 +2015,14 @@ func (p *ProxyServer) eventBelongsToUser(line []byte, uid int) bool {
 				if ownerUID, ok := v.(int); ok {
 					return ownerUID == uid
 				}
-				// 类型断言失败（异常情况）：跳过路径 0，降级到 DB 路径
+				// 类型断言失败（异常情况）：跳过路径 0a，降级到后续路径
+			}
+			// 路径 0b：pendingPullRefs（pull 竞态窗口，BUG-19）
+			if v, ok := p.pendingPullRefs.Load(name); ok {
+				if ownerUID, ok := v.(int); ok {
+					return ownerUID == uid
+				}
+				// 类型断言失败（异常情况）：跳过路径 0b，降级到 DB 路径
 			}
 		}
 
@@ -2447,6 +2463,15 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 		}
 
 	case authz.ActionPull:
+		// BUG-19 竞态防护：在流式传输前注册 pendingPullRefs。
+		// Docker pull 完成后立即发出 image pull 事件，而 SetImageOwner 在流末尾才执行。
+		// 提前注册确保竞态窗口内 image pull 事件按归属过滤，不泄漏给其他用户。
+		// defer CompareAndDelete 确保并发同 ref pull 时不互相删除对方记录。
+		imageRef := parseImageRefFromURI(requestURI)
+		if imageRef != "" {
+			p.pendingPullRefs.Store(imageRef, id.RealUID)
+			defer p.pendingPullRefs.CompareAndDelete(imageRef, id.RealUID)
+		}
 		isolation.CopyHeaders(w, resp.Header)
 		w.WriteHeader(resp.StatusCode)
 		if resp.StatusCode != http.StatusOK {
@@ -2454,7 +2479,6 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 			break
 		}
 		capturedDigest := streamAndCaptureImageID(w, resp, "pull")
-		imageRef := parseImageRefFromURI(requestURI)
 		if imageRef != "" {
 			imageID := p.resolveImageIDByRef(imageRef)
 			// resolveImageIDByRef 可能因 Docker 索引短暂延迟返回空；
