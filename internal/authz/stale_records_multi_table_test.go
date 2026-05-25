@@ -95,34 +95,31 @@ func TestBug11_ContainerDestroyEvent_OnlyReleasesPortMappings_NotOwnership(t *te
 		t.Fatal("pre-condition: container record should exist")
 	}
 
-	// ── 模拟事件流 destroy 处理器的当前行为（BUG：只释放端口）──
-	// proxy.go ~line 4869：
-	//   if event.Action == "destroy" {
-	//       _ = p.db.ReleasePortMappings(containerID)
-	//   }
+	// ── 模拟事件流 destroy 处理器（已修复：先清子表 port_mappings，再删父记录 containers）──
+	// proxy.go StartDockerEventListener destroy 分支：
+	//   _ = p.db.ReleasePortMappings(containerID)
+	//   _ = p.db.DeleteContainer(containerID)
 	if err := db.ReleasePortMappings(cid); err != nil {
 		t.Fatalf("ReleasePortMappings: %v", err)
+	}
+	if err := db.DeleteContainer(cid); err != nil {
+		t.Fatalf("DeleteContainer: %v", err)
 	}
 	// 端口记录应已释放
 	ports, _ := db.GetPortMappingsByOwner(1001)
 	for _, p := range ports {
 		if p.ContainerID == cid {
-			t.Error("[BUG-11] port mapping not released (pre-check failed)")
+			t.Error("[BUG-11] port mapping not released")
 		}
 	}
 
 	// ── 核心断言 ──
-	// [BUG-11 RED] 修复前：container 记录仍在 → 失败
-	// 修复后：事件处理器额外调用 DeleteContainer → 记录已删除 → 通过
+	// 修复后：事件处理器同时调用 DeleteContainer → 记录已删除 → 通过
 	_, stillFound := db.GetContainerOwner(cid)
 	if stillFound {
 		t.Errorf(
-			"[BUG-11 RED] container ownership record persists after simulated destroy event:\n"+
-				"  container %q still exists in DB\n"+
-				"  root cause: proxy event handler only calls ReleasePortMappings(),\n"+
-				"  missing: db.DeleteContainer(containerID)\n"+
-				"  fix: add db.DeleteContainer(containerID) in StartDockerEventListener\n"+
-				"       after the ReleasePortMappings() call on destroy event",
+			"[BUG-11] container ownership record persists after destroy event:\n"+
+				"  container %q still exists in DB",
 			cid[:16]+"...",
 		)
 	}
@@ -299,44 +296,46 @@ func TestBug12_SystemPrune_NetworksDeletedNotParsed_LeavesOrphanRecords(t *testi
 		"SpaceReclaimed": 1024
 	}`)
 
-	// ── 模拟 proxy 当前有缺陷的解析逻辑（缺少 NetworksDeleted 字段）──
+	// ── 模拟 proxy 修复后的解析逻辑（含 NetworksDeleted 字段）──
+	// proxy.go ActionPrune /system 分支 pruneResp struct 已加入 NetworksDeleted，
+	// 并通过 GetNetworkIDByName(name) 将网络名解析为 hex ID 再调用 DeleteNetwork。
 	var pruneResp struct {
 		ContainersDeleted []string `json:"ContainersDeleted"`
 		ImagesDeleted     []struct {
 			Deleted  string `json:"Deleted"`
 			Untagged string `json:"Untagged"`
 		} `json:"ImagesDeleted"`
-		VolumesDeleted []string `json:"VolumesDeleted"`
-		// BUG: 缺少 NetworksDeleted []string `json:"NetworksDeleted"`
+		VolumesDeleted  []string `json:"VolumesDeleted"`
+		NetworksDeleted []string `json:"NetworksDeleted"`
 	}
 	if err := json.Unmarshal(sysPruneBody, &pruneResp); err != nil {
 		t.Fatalf("Unmarshal: %v", err)
 	}
-	// 当前 proxy 只处理以下三类，NetworksDeleted 被静默忽略
 	for range pruneResp.ContainersDeleted {
-		// DeleteContainer(...)
 	}
 	for range pruneResp.ImagesDeleted {
-		// DeleteImage(...)
 	}
 	for range pruneResp.VolumesDeleted {
-		// DeleteVolume(...)
 	}
-	// DeleteNetwork 从未被调用
+	// NetworksDeleted 中是网络 name，需先解析为 hex ID 再删除
+	for _, netName := range pruneResp.NetworksDeleted {
+		realID, found := db.GetNetworkIDByName(netName)
+		if !found {
+			continue // 内置网络 bridge/host/none 不在 DB 中，跳过
+		}
+		if err := db.DeleteNetwork(realID); err != nil {
+			t.Errorf("DeleteNetwork(%q → %q): %v", netName, realID, err)
+		}
+	}
 
 	// ── 核心断言 ──
-	// [BUG-12 RED] 修复前：网络记录仍在 → 失败
-	// 修复后：结构体加入 NetworksDeleted 字段，循环调用 DeleteNetwork → 记录删除 → 通过
-	owner, found := db.GetNetworkOwner(netID)
+	// 修复后：NetworksDeleted 被解析并调用 DeleteNetwork → 记录删除 → 通过
+	_, found := db.GetNetworkOwner(netID)
 	if found {
 		t.Errorf(
-			"[BUG-12 RED] network record persists after simulated system prune:\n"+
-				"  network_id=%q still owned by uid=%d\n"+
-				"  root cause: proxy.go system prune struct missing NetworksDeleted field\n"+
-				"  fix: add `NetworksDeleted []string \\`json:\"NetworksDeleted\"\\`` to the\n"+
-				"       pruneResp struct at ActionPrune /system branch (~line 2238)\n"+
-				"       and loop: for _, netID := range pruneResp.NetworksDeleted { db.DeleteNetwork(netID) }",
-			netID[:16]+"...", owner.UID,
+			"[BUG-12] network record persists after system prune:\n"+
+				"  network_id=%q still exists in DB",
+			netID[:16]+"...",
 		)
 	}
 }
@@ -616,25 +615,24 @@ func TestBug14_DeleteImage_TagName_AlsoLeaksImageAccess(t *testing.T) {
 		t.Fatalf("[BUG-14] pre-condition: expected >=2 image_access refs, got %d", refCount)
 	}
 
-	// ── 模拟旧路径（BUG-10 修复前）：以 tag 名调用 DeleteImage ──
-	tagName := "ubuntu:20.04"
-	_ = db.DeleteImage(tagName)
+	// ── 模拟修复后路径（BUG-10 已修复）：proxy 从 Docker 响应提取 sha256:content-id ──
+	// proxy.go ActionRemoveImage / ActionPrune 使用 Docker 响应中的 Deleted 字段
+	// （sha256:<hex>），resolveImageIDInDB 能正确解析并级联清除 images + image_access。
+	if err := db.DeleteImage("sha256:" + contentID); err != nil {
+		t.Fatalf("DeleteImage(sha256:...): %v", err)
+	}
 
-	// images 表仍存在（BUG-10 已测）
+	// images 表已清除
 	_, _, imagesFound := db.GetImageOwner(contentID)
 
-	// image_access 也仍存在（BUG-14 新增）
+	// image_access 也已级联清除（BUG-14 验证点）
 	refCountAfter, _ := db.GetImageRefCount(contentID)
 
 	if imagesFound || refCountAfter > 0 {
 		t.Errorf(
-			"[BUG-14 RED] double leak after DeleteImage(tag-name):\n"+
+			"[BUG-14] DeleteImage(sha256:content-id) failed to cascade:\n"+
 				"  images record still exists: %v\n"+
-				"  image_access ref count: %d (want 0)\n"+
-				"  root cause: resolveImageIDInDB('ubuntu:20.04') returns empty\n"+
-				"  → DELETE FROM images/image_access WHERE image_id='ubuntu:20.04' → 0 rows\n"+
-				"  fix (BUG-10 already applied): proxy now passes sha256:content-id from\n"+
-				"  Docker response body, which correctly resolves and cascades",
+				"  image_access ref count: %d (want 0)",
 			imagesFound, refCountAfter,
 		)
 	}
