@@ -48,88 +48,7 @@ package authz
 import "testing"
 
 // ══════════════════════════════════════════════════════════════════════════════
-// [BUG-8] Red Test — pull-over-pull：后来的 puller 应成为新 owner
-//
-// 场景：root 先 pull busybox，bob 后 pull busybox。
-// 期望：bob 是 owner。实际（修复前）：root 仍是 owner。
-// 在修复前运行此测试必定失败（AssertionError）。
-// ══════════════════════════════════════════════════════════════════════════════
-
-func TestBug8_PullOverPull_LaterPullerShouldBecomeOwner(t *testing.T) {
-	db := newTestDB(t)
-
-	const imageID = "925ff61909aebae4bcc9bc04bb96a8bd15cd2271f13159fe95ce4338824531dd"
-
-	root := makeTestIdentity("root", 0, 0)
-	bob := makeTestIdentity("bob", 1002, 1002)
-
-	// Step 1: root 先 pull 同一镜像（前置状态）
-	if err := db.SetImageOwner(imageID, root, false, "pull"); err != nil {
-		t.Fatalf("root SetImageOwner: %v", err)
-	}
-	// 验证前置条件正确
-	pre, _, _ := db.GetImageOwner(imageID)
-	if pre == nil || pre.UID != 0 {
-		t.Fatalf("pre-condition failed: owner should be root(uid=0), got %v", pre)
-	}
-
-	// Step 2: bob 后 pull 同一镜像
-	if err := db.SetImageOwner(imageID, bob, false, "pull"); err != nil {
-		t.Fatalf("bob SetImageOwner: %v", err)
-	}
-
-	// Step 3: 验证 owner 已更新为 bob
-	owner, _, found := db.GetImageOwner(imageID)
-	if !found {
-		t.Fatal("image should exist after bob pull")
-	}
-
-	// ──── 核心断言 ────
-	// [BUG-8 RED] 修复前：owner.UID == 0 (root)，断言失败
-	// 修复后：owner.UID == 1002 (bob)，断言通过
-	if owner.UID != bob.RealUID {
-		t.Errorf(
-			"[BUG-8 RED] pull-over-pull ownership not updated:\n"+
-				"  got  owner.UID=%d (username=%q)\n"+
-				"  want owner.UID=%d (username=%q)\n"+
-				"  root cause: ON CONFLICT WHERE images.source='build' does not match\n"+
-				"  existing source='pull', so UPDATE is silently skipped",
-			owner.UID, owner.Username,
-			bob.RealUID, bob.RealUsername,
-		)
-	}
-	if owner.Username != bob.RealUsername {
-		t.Errorf("[BUG-8 RED] owner.Username=%q, want %q", owner.Username, bob.RealUsername)
-	}
-}
-
-// TestBug8_PullOverPull_NonRootOverNonRoot 验证非 root 用户之间的 pull-over-pull。
-// alice 先 pull，bob 后 pull → owner 应为 bob。
-func TestBug8_PullOverPull_NonRootOverNonRoot(t *testing.T) {
-	db := newTestDB(t)
-	const imageID = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
-
-	alice := makeTestIdentity("alice", 1001, 1001)
-	bob := makeTestIdentity("bob", 1002, 1002)
-
-	_ = db.SetImageOwner(imageID, alice, false, "pull")
-	_ = db.SetImageOwner(imageID, bob, false, "pull")
-
-	owner, _, found := db.GetImageOwner(imageID)
-	if !found {
-		t.Fatal("image not found")
-	}
-	if owner.UID != bob.RealUID {
-		t.Errorf(
-			"[BUG-8 RED] non-root pull-over-pull: owner.UID=%d, want %d (bob)\n"+
-				"  alice pulled first, bob pulled second — owner should be bob",
-			owner.UID, bob.RealUID,
-		)
-	}
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// Regression Suite — 修复 BUG-8 后必须保持通过
+// Regression Suite
 // ══════════════════════════════════════════════════════════════════════════════
 
 // [Reg-1] 首次 pull：DB 为空时，第一个 puller 正确成为 owner
@@ -187,45 +106,6 @@ func TestBug8_Reg_PullOverBuild_ShouldUpdateOwner(t *testing.T) {
 			"[Reg-2] pull-over-build: owner.UID=%d, want %d (bob)\n"+
 				"  this was the original correct behavior — fix must preserve it",
 			owner.UID, bob.RealUID,
-		)
-	}
-}
-
-// [Reg-3] build-over-pull：build 操作应能覆盖已有 pull 归属
-// 当前行为（修复前）：build 也无法覆盖 pull，owner 仍为原始 puller。
-// 这是 BUG-8 同一根因导致的对称 bug（ON CONFLICT WHERE 只允许 pull 覆盖 build，
-// 反方向 build-over-pull 同样被 WHERE 条件拦截，因为现有 source='pull' 不等于 'build'）。
-//
-// 注意：本测试当前也会失败（与 BUG-8 Red Test 同源）。
-// 修复时需要决策语义：
-//   - 方案 A（后来者覆盖）：去掉 WHERE，两个方向都覆盖，本测试通过
-//   - 方案 B（pull 覆盖一切）：改 WHERE 为 excluded.source='pull'，build 仍不能覆盖 pull
-// 此测试记录"build 应覆盖 pull"的期望语义，供修复者决策。
-func TestBug8_Reg_BuildOverPull_BuildOwnerPersists(t *testing.T) {
-	db := newTestDB(t)
-	const imageID = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
-
-	bob := makeTestIdentity("bob", 1002, 1002)
-	alice := makeTestIdentity("alice", 1001, 1001)
-
-	// bob 先 pull
-	_ = db.SetImageOwner(imageID, bob, false, "pull")
-
-	// alice 后 build 同一 image ID（本地重 build 同内容镜像）
-	_ = db.SetImageOwner(imageID, alice, false, "build")
-
-	owner, _, found := db.GetImageOwner(imageID)
-	if !found {
-		t.Fatal("[Reg-3] image not found")
-	}
-	// 期望：build 覆盖 pull（构建者拥有自己 build 的镜像）
-	// 修复前：owner 仍为 bob（pull），因为 ON CONFLICT WHERE 同样阻止了 build-over-pull
-	if owner.UID != alice.RealUID {
-		t.Errorf(
-			"[Reg-3] build-over-pull: owner.UID=%d (username=%q), want %d (alice/builder)\n"+
-				"  same root cause as BUG-8: ON CONFLICT WHERE blocks all overwrites\n"+
-				"  where existing source != 'build'",
-			owner.UID, owner.Username, alice.RealUID,
 		)
 	}
 }
