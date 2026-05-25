@@ -55,36 +55,45 @@ func (s *latencyStat) record(d time.Duration) {
 	s.mu.Unlock()
 }
 
-func (s *latencyStat) percentile(p float64) float64 {
+// snapshot 持锁拷贝样本后立即释放锁，计算留在锁外执行。
+func (s *latencyStat) snapshot() []float64 {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.samples) == 0 {
-		return 0
-	}
-	sorted := make([]float64, len(s.samples))
-	copy(sorted, s.samples)
-	sort.Float64s(sorted)
-	idx := int(math.Ceil(p/100.0*float64(len(sorted)))) - 1
-	if idx < 0 {
-		idx = 0
-	}
-	if idx >= len(sorted) {
-		idx = len(sorted) - 1
-	}
-	return sorted[idx]
+	cp := make([]float64, len(s.samples))
+	copy(cp, s.samples)
+	s.mu.Unlock()
+	return cp
 }
 
-func (s *latencyStat) avg() float64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.samples) == 0 {
-		return 0
+// stats 基于同一次快照计算 avg/p50/p95/p99，保证四值来自相同数据集。
+// sort.Float64s（O(n log n)）在锁外执行，不阻塞并发 record()。
+func (s *latencyStat) stats() (avg, p50, p95, p99 float64) {
+	cp := s.snapshot()
+	if len(cp) == 0 {
+		return 0, 0, 0, 0
 	}
+	sort.Float64s(cp)
 	var sum float64
-	for _, v := range s.samples {
+	for _, v := range cp {
 		sum += v
 	}
-	return sum / float64(len(s.samples))
+	avg = sum / float64(len(cp))
+	pctAt := func(p float64) float64 {
+		if p < 0 || p > 100 {
+			panic(fmt.Sprintf("percentile out of range [0,100]: %v", p))
+		}
+		idx := int(math.Ceil(p/100.0*float64(len(cp)))) - 1
+		if idx < 0 {
+			idx = 0
+		}
+		if idx >= len(cp) {
+			idx = len(cp) - 1
+		}
+		return cp[idx]
+	}
+	p50 = pctAt(50)
+	p95 = pctAt(95)
+	p99 = pctAt(99)
+	return
 }
 
 // ── 通用结果打印 ───────────────────────────────────────────────────────────────
@@ -111,12 +120,10 @@ func printPerfResults(t *testing.T, results []opResult) {
 		if r.elapsed > 0 {
 			rps = float64(r.success) / r.elapsed.Seconds()
 		}
+		avg, p50, p95, p99 := r.stat.stats() // 单次快照，四值来自同一数据集
 		t.Logf("  %-40s  %7.2f  %7.2f  %7.2f  %7.2f  %6d  %6d  %8.1f",
 			r.name,
-			r.stat.avg(),
-			r.stat.percentile(50),
-			r.stat.percentile(95),
-			r.stat.percentile(99),
+			avg, p50, p95, p99,
 			r.success, r.failure, rps)
 	}
 	t.Log("══════════════════════════════════════════════════════════════════════════════")
@@ -356,7 +363,9 @@ func TestPerf_Events_100Users(t *testing.T) {
 func TestPerf_ImagePull_100Users(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		imageID := "sha256:3fbc632167424a6d997e74f52b878d7cc478225cffac6bc977eedfe51c7f4e79"
+		// 从 fromImage 参数派生唯一 imageID，避免 100 用户争抢同一所有权记录
+		fromImage := r.URL.Query().Get("fromImage")
+		imageID := fmt.Sprintf("sha256:%064x", perfFNV64(fromImage))
 		for _, l := range []string{
 			`{"status":"Pulling from library/busybox"}`,
 			`{"status":"Pull complete"}`,
@@ -458,7 +467,9 @@ func TestPerf_MixedLoad_100Users(t *testing.T) {
 
 		case r.Method == "POST" && r.URL.Path == "/images/create":
 			w.Header().Set("Content-Type", "application/json")
-			imgID := "sha256:3fbc632167424a6d997e74f52b878d7cc478225cffac6bc977eedfe51c7f4e79"
+			// 从 fromImage 参数派生唯一 imageID，与 TestPerf_ImagePull 保持一致
+			fromImage := r.URL.Query().Get("fromImage")
+			imgID := fmt.Sprintf("sha256:%064x", perfFNV64(fromImage))
 			for _, l := range []string{
 				`{"status":"Pulling from library/busybox"}`,
 				fmt.Sprintf(`{"aux":{"ID":"%s"}}`, imgID),
@@ -545,7 +556,7 @@ func TestPerf_MixedLoad_100Users(t *testing.T) {
 				doReq("container_list", "GET", "/containers/json", nil)
 				doReq("image_list", "GET", "/images/json", nil)
 				doReq("container_create", "POST", "/containers/create", createBody())
-				doReq("events", "GET", fmt.Sprintf("/events?type=container"), nil)
+				doReq("events", "GET", "/events?type=container", nil)
 				doReq("image_pull", "POST",
 					fmt.Sprintf("/images/create?fromImage=%s&tag=latest", imgRef), nil)
 			}
@@ -566,7 +577,13 @@ func TestPerf_MixedLoad_100Users(t *testing.T) {
 	t.Logf("  总耗时: %.3f s    总请求: %d    成功率: %.2f%%",
 		elapsed.Seconds(),
 		totalSuccess+totalFailure,
-		float64(totalSuccess)/float64(totalSuccess+totalFailure)*100)
+		func() float64 {
+			total := totalSuccess + totalFailure
+			if total == 0 {
+				return 0
+			}
+			return float64(totalSuccess) / float64(total) * 100
+		}())
 	t.Log("══════════════════════════════════════════════════════════════════════════════")
 	t.Logf("  %-26s  %7s  %7s  %7s  %7s  %6s  %6s  %8s",
 		"操作", "avg(ms)", "p50(ms)", "p95(ms)", "p99(ms)", "成功", "失败", "RPS")
@@ -574,12 +591,10 @@ func TestPerf_MixedLoad_100Users(t *testing.T) {
 	for _, op := range opNames {
 		s := stats[op]
 		rps := float64(s.success) / elapsed.Seconds()
+		avg, p50, p95, p99 := s.stat.stats() // 单次快照，四值来自同一数据集
 		t.Logf("  %-26s  %7.2f  %7.2f  %7.2f  %7.2f  %6d  %6d  %8.1f",
 			op,
-			s.stat.avg(),
-			s.stat.percentile(50),
-			s.stat.percentile(95),
-			s.stat.percentile(99),
+			avg, p50, p95, p99,
 			s.success, s.failure, rps)
 	}
 	t.Log("  ──────────────────────────────────────────────────────────────────────────")
@@ -596,7 +611,10 @@ func TestPerf_MixedLoad_100Users(t *testing.T) {
 // TestPerf_DBWriteContention_100Users
 // 不经过 HTTP 层，直接压测 SetContainerOwner（SQLite 单写连接争用）。
 func TestPerf_DBWriteContention_100Users(t *testing.T) {
-	upstream := httptest.NewServer(nil)
+	// 此测试只压 DB 写路径，不走 HTTP 层；upstream 仅为 newTestProxy 构造所需
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
 	defer upstream.Close()
 	p := newTestProxy(t, upstream, nil)
 
@@ -638,7 +656,10 @@ func TestPerf_DBWriteContention_100Users(t *testing.T) {
 // 100 用户同时调用 eventBelongsToUser（不走 HTTP 层），
 // 测量事件过滤热路径的原始延迟。
 func TestPerf_EventFilter_100Users(t *testing.T) {
-	upstream := httptest.NewServer(nil)
+	// 此测试只压事件过滤路径，不走 HTTP 层；upstream 仅为 newTestProxy 构造所需
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
 	defer upstream.Close()
 	p := newTestProxy(t, upstream, nil)
 
@@ -680,4 +701,15 @@ func TestPerf_EventFilter_100Users(t *testing.T) {
 		{"eventBelongsToUser (100u×10ops)", stat, matchCount, noMatchCount, elapsed},
 	})
 	t.Logf("  正向匹配（owner==uid）: %d    负向（非owner）: %d", matchCount, noMatchCount)
+}
+
+// perfFNV64 是非加密哈希，仅用于从 imageRef 字符串派生唯一的 64 位摘要，
+// 作为测试用 imageID 的后缀，确保不同 imageRef 产生不同 imageID。
+func perfFNV64(s string) uint64 {
+	h := uint64(14695981039346656037)
+	for i := 0; i < len(s); i++ {
+		h ^= uint64(s[i])
+		h *= 1099511628211
+	}
+	return h
 }
