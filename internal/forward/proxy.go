@@ -4418,10 +4418,27 @@ func parseImageRefFromURI(requestURI string) string {
 	if fromImage == "" {
 		return ""
 	}
+	// Docker CLI 29.x 将 fromImage 标准化为完整 registry 路径（如 docker.io/library/alpine），
+	// 但 Docker daemon 发出事件时使用短名（如 alpine）。
+	// 规范化为短名，确保 pendingPullRefs / completedPullOwner 的 key 与事件 Actor.ID 一致。
+	fromImage = normalizeImageRef(fromImage)
 	if tag := params.Get("tag"); tag != "" && tag != "latest" {
 		return fromImage + ":" + tag
 	}
 	return fromImage
+}
+
+// normalizeImageRef 将完整 registry 路径规范化为短名，与 Docker 事件 Actor.ID 对齐。
+// docker.io/library/alpine  → alpine
+// docker.io/library/ubuntu  → ubuntu
+// docker.io/nginx/nginx     → nginx/nginx（保留非 library 的 namespace）
+// registry.example.com/foo  → 不变（非 docker.io 的保留原样）
+func normalizeImageRef(ref string) string {
+	const dockerIOLibrary = "docker.io/library/"
+	if strings.HasPrefix(ref, dockerIOLibrary) {
+		return ref[len(dockerIOLibrary):]
+	}
+	return ref
 }
 
 // fetchContainerLabels 通过 Docker API 获取容器的 Labels，失败返回 nil
