@@ -26,11 +26,12 @@ import (
 // 事件 JSON 构造辅助函数
 // ──────────────────────────────────────────────────────────────────────────────
 
-// makeVolumeEvent 构造无归属标签的 volume 事件（当前代理产生的真实格式）。
+// makeVolumeEvent 构造 volume 事件（与真实 Docker daemon 格式一致）。
+// 真实 Docker 事件：卷名在 Actor.ID，Attributes 仅含 driver（无 name 字段）。
 func makeVolumeEvent(action, volumeName string) []byte {
 	return []byte(fmt.Sprintf(
-		`{"Type":"volume","Action":%q,"Actor":{"ID":%q,"Attributes":{"driver":"local","name":%q}}}`,
-		action, volumeName, volumeName,
+		`{"Type":"volume","Action":%q,"Actor":{"ID":%q,"Attributes":{"driver":"local"}}}`,
+		action, volumeName,
 	))
 }
 

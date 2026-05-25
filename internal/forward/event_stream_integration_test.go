@@ -47,8 +47,8 @@ import (
 
 func makeRawVolumeDestroyEvent(volumeName string) string {
 	return fmt.Sprintf(
-		`{"Type":"volume","Action":"destroy","Actor":{"ID":%q,"Attributes":{"driver":"local","name":%q}}}`,
-		volumeName, volumeName,
+		`{"Type":"volume","Action":"destroy","Actor":{"ID":%q,"Attributes":{"driver":"local"}}}`,
+		volumeName,
 	)
 }
 

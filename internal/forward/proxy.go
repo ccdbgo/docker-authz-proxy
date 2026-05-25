@@ -1873,6 +1873,7 @@ func eventBelongsToUser(line []byte, uid int) bool {
 	var ev struct {
 		Type  string `json:"Type"`
 		Actor struct {
+			ID         string            `json:"ID"`
 			Attributes map[string]string `json:"Attributes"`
 		} `json:"Actor"`
 	}
@@ -1881,7 +1882,7 @@ func eventBelongsToUser(line []byte, uid int) bool {
 	}
 	attrs := ev.Actor.Attributes
 	if attrs == nil {
-		return true
+		attrs = map[string]string{}
 	}
 	uidStr := strconv.Itoa(uid)
 
@@ -1893,7 +1894,7 @@ func eventBelongsToUser(line []byte, uid int) bool {
 			(strings.HasPrefix(name, "peer-") && strings.Contains(name, "-"+uidStr+"-"))
 	}
 
-	// volume 事件：Docker volume Attributes 不携带自定义标签，
+	// volume 事件：Docker volume 事件的卷名在 Actor.ID 中（Attributes 仅含 driver 等元数据）。
 	// 通过卷名前缀 user-{digits}-volume-* 判断归属。
 	// 三条路径：
 	//   1. 名称属于本用户 (user-{uid}-volume-*)      → true
@@ -1901,10 +1902,13 @@ func eventBelongsToUser(line []byte, uid int) bool {
 	//   3. 非用户格式（系统卷 / 格式非法）            → true（放行，宁滥勿缺）
 	//
 	// 路径 2 的识别与 isUserVolumePrefix（isolation/storage.go）严格对齐：
-	// user- + 纯数字段 + -volume-，严禁用 strings.Contains 等宽松匹配，
-	// 否则格式非法的卷名会走入路径 2，对全部用户静默丢弃事件。
+	// user- + 纯数字段 + -volume-，严禁用 strings.Contains 等宽松匹配。
 	if ev.Type == "volume" {
-		name := attrs["name"]
+		// Actor.ID 是卷名的权威来源；Attributes["name"] 是某些 Docker 版本提供的冗余副本。
+		name := ev.Actor.ID
+		if name == "" {
+			name = attrs["name"] // 兼容旧格式或测试存根
+		}
 		ownPrefix := "user-" + uidStr + "-volume-"
 		if strings.HasPrefix(name, ownPrefix) {
 			return true // 路径 1：属于本用户
