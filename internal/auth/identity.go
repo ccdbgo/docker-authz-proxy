@@ -336,15 +336,34 @@ func ResolveCallerIdentity(conn net.Conn) (*CallerIdentity, error) {
 			}
 			realUsername = loginUsername
 		} else {
-			// loginuid == 0 或未设置：直接以 root 身份登录
-			userType = UserTypeRoot
-			realUID = 0
-			realGID = effectiveGID
-			realUsername = "root"
-
-			// 兜底：若 /proc/status 显示 rUID != 0，说明是 su 切换但 loginuid 未设置
-			// （极少数情况，如旧内核或非 PAM 登录）
-			if procStatusErr == nil && procRUID != 0 {
+			// loginuid == 0 或未设置。
+			// 路径1：读 SUDO_UID——sudo 注入到进程环境，比 loginuid 更可靠。
+			// 以数字 UID 为权威，通过 /etc/passwd 双向验证，不信任 SUDO_USER 字符串。
+			env := readProcEnviron(pid)
+			sudoUID := getEnvInt(env, "SUDO_UID")
+			if sudoUID > 0 {
+				sudoUsername := LookupUsername(sudoUID)
+				if sudoUsername == "" {
+					return nil, &IdentityForgeryError{
+						Reason: fmt.Sprintf("SUDO_UID %d not found in /etc/passwd (pid=%d)", sudoUID, pid),
+					}
+				}
+				if LookupUID(sudoUsername) != sudoUID {
+					return nil, &IdentityForgeryError{
+						Reason: fmt.Sprintf("SUDO_UID %d username=%q uid mismatch in /etc/passwd (pid=%d)", sudoUID, sudoUsername, pid),
+					}
+				}
+				switchedIdentity = true
+				userType = UserTypeSudo
+				realUID = sudoUID
+				realGID = LookupPrimaryGID(sudoUsername)
+				if realGID < 0 {
+					realGID = effectiveGID
+				}
+				realUsername = sudoUsername
+			} else if procStatusErr == nil && procRUID != 0 {
+				// 路径2：SUDO_UID 不可用时，若 /proc/status 显示 rUID != 0，
+				// 说明是 su 切换但 loginuid 未设置（旧内核或非 PAM 登录）
 				origUsername := LookupUsername(procRUID)
 				if origUsername == "" {
 					return nil, &IdentityForgeryError{
@@ -361,6 +380,12 @@ func ResolveCallerIdentity(conn net.Conn) (*CallerIdentity, error) {
 				realUID = procRUID
 				realGID = procRGID
 				realUsername = origUsername
+			} else {
+				// 路径3：以上路径均未匹配，确认为直接 root 登录
+				userType = UserTypeRoot
+				realUID = 0
+				realGID = effectiveGID
+				realUsername = "root"
 			}
 		}
 	}
