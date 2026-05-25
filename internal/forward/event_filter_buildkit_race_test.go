@@ -16,8 +16,12 @@ package forward
 //
 // ──── 修复 ─────────────────────────────────────────────────────────────────
 //
-//   handleHijack（isGRPC 分支）开始时，调用 parseBuildxTags(id.DockerCommand)
+//   handleHijack（isGRPC 分支）开始时，调用 parseBuildxTags(id.CmdLine)
 //   提取 -t / --tag 参数，Store 到 pendingBuildTags（与经典 builder 共用路径0）。
+//   注意：使用 id.CmdLine（完整命令行，来自 /proc/{pid}/cmdline），
+//   而非 id.DockerCommand（已解析子命令）。BuildKit gRPC 来自 docker-buildx
+//   插件进程，base 为 docker-buildx，parseDockerCommand 返回 ""，
+//   必须读 CmdLine 才能提取到 -t/--tag 参数。
 //
 //   trackBuildKitImages 在 writeOne 完成后（SetImageOwner 调用后），
 //   对发现的新 tag 执行 CompareAndDelete 清理。
