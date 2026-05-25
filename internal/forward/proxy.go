@@ -83,12 +83,15 @@ type ProxyServer struct {
 	// 并发安全：CompareAndDelete 确保两个并发 build 同一 tag 时不会互相删除对方记录。
 	pendingBuildTags sync.Map // map[string]int: tag → ownerUID
 
-	// pendingPullRefs 记录正在进行 pull 操作的 imageRef → ownerUID 映射（BUG-19）。
+	// pendingPullRefs 记录正在进行 pull 操作的 imageRef → ownerUID 映射（BUG-19/21）。
 	// 用途：在 SetImageOwner 调用前的竞态窗口内，image pull 事件到达 eventBelongsToUser
 	// 时，通过此 map 提供归属信息，防止 pull 镜像事件泄漏给其他用户。
 	//
-	// 时序保证：ActionPull case 开头（响应头到达时）注册，早于 Docker 发出 pull 事件。
-	// 并发安全：CompareAndDelete 确保并发 pull 同一 imageRef 时不会互相删除对方记录。
+	// 时序保证：forward 前注册，早于 Docker 发出 pull 事件（含 cached image 竞态）。
+	// 并发安全：CompareAndDelete 确保 defer 清理时不误删并发 pull 同一 ref 的其他记录。
+	// 注意：并发 Store 时后者会覆盖前者的 ownerUID（sync.Map 无 CAS Store），
+	//   极端情况下前者 pull 进行中其事件会被以后者 ownerUID 过滤。此为已知局限，
+	//   概率极低（同一 ref 毫秒级并发），completedPullOwner 可补偿大多数情形。
 	pendingPullRefs sync.Map // map[string]int: imageRef → ownerUID
 
 	// completedPullOwner 在 pull 完成后维持 imageRef → ownerUID 映射，
@@ -690,9 +693,11 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		zap.String("action", action),
 		zap.String("uri", r.URL.RequestURI()),
 	)
-	// BUG-19 pull 竞态防护：在 forward 前注册 pendingPullRefs，
-	// 确保 Docker 发出 image pull 事件时（cached image 几乎与请求同步）窗口已覆盖。
-	if action == authz.ActionPull && !identity.IsPrivileged() {
+	// BUG-19/21 pull 竞态防护：在 forward 前注册 pendingPullRefs，覆盖从请求发出
+	// 到 completedPullOwner.Store 写入之间的竞态窗口。
+	// 特权用户（root/sudo）同样需要注册：其 pull 事件同样广播给所有订阅者，
+	// 若跳过则在 completedPullOwner 写入前事件已到达，非特权用户可见泄漏。
+	if action == authz.ActionPull {
 		if pullRef := parseImageRefFromURI(modifiedReq.URL.RequestURI()); pullRef != "" {
 			p.pendingPullRefs.Store(pullRef, identity.RealUID)
 			defer p.pendingPullRefs.CompareAndDelete(pullRef, identity.RealUID)
