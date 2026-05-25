@@ -3431,6 +3431,17 @@ func (p *ProxyServer) handleHijack(w http.ResponseWriter, r *http.Request, id *a
 	var preSnapshot *imageSnapshot
 	if isGRPC {
 		preSnapshot = p.snapshotImageState()
+		// BUG-18b：gRPC 连接建立时（构建开始前），将命令行中的 -t tag 注册到
+		// pendingBuildTags，确保在 trackBuildKitImages 300ms 等待期间
+		// image tag 事件不会泄漏给其他用户。
+		// 多连接场景：Store 幂等（同 tag 同 uid 多次写入安全）；
+		// 清理由发现新镜像的 goroutine 负责（trackBuildKitImages 末尾）。
+		// 注意：使用 id.CmdLine（完整命令行），而非 id.DockerCommand（已解析子命令）。
+		// BuildKit gRPC 连接来自 docker-buildx 插件进程，parseDockerCommand 无法
+		// 解析其完整 cmdline，DockerCommand 为空字符串。
+		for _, tag := range parseBuildxTags(id.CmdLine) {
+			p.pendingBuildTags.Store(tag, id.RealUID)
+		}
 	}
 	action := authz.OverrideActionByCommand(id.DockerCommand, authz.ClassifyAction(r.Method, r.URL.RequestURI()))
 	p.logger.Debug("hijack_request",
@@ -3660,12 +3671,14 @@ func (p *ProxyServer) trackBuildKitImages(id *auth.CallerIdentity, pre *imageSna
 	// 收集需要归属的镜像 ID，tagged 镜像优先（避免竞态：rmi 先于无 tag 镜像写入）
 	taggedIDs := make(map[string]bool)
 	otherIDs := make(map[string]bool)
+	var newTags []string // BUG-18b: 新增/变更的 tag，writeOne 后清理 pendingBuildTags
 
 	// tag 对比：tag 新增、SHA 变更、或 SHA 不变但不在 DB 中（相同内容重建）
 	for tag, postID := range post.tagToID {
 		preID, existed := pre.tagToID[tag]
 		if !existed || preID != postID {
 			taggedIDs[postID] = true
+			newTags = append(newTags, tag) // BUG-18b
 		} else {
 			// tag 存在且 SHA 相同：若不在 DB 中则归属（相同内容重建场景）
 			existingOwner, _, found := p.db.GetImageOwner(postID)
@@ -3739,6 +3752,13 @@ func (p *ProxyServer) trackBuildKitImages(id *auth.CallerIdentity, pre *imageSna
 	// 再写无 tag 的中间层镜像
 	for imageID := range otherIDs {
 		writeOne(imageID)
+	}
+
+	// BUG-18b：SetImageOwner 已调用，清理竞态窗口中注册的 pendingBuildTags 条目。
+	// 仅清理本次发现有新镜像的 tag（其他 goroutine 找不到新镜像则不清理，
+	// 由负责写入的 goroutine 负责），CompareAndDelete 保证并发安全。
+	for _, tag := range newTags {
+		p.pendingBuildTags.CompareAndDelete(tag, id.RealUID)
 	}
 }
 
@@ -4452,6 +4472,25 @@ func (p *ProxyServer) resolveImageIDByRef(imageRef string) string {
 func isBuildKitImage(imageRef string) bool {
 	ref := strings.ToLower(imageRef)
 	return strings.Contains(ref, "moby/buildkit") || strings.Contains(ref, "docker/buildkit")
+}
+
+// parseBuildxTags 从 docker buildx 命令行中提取 -t / --tag 参数值。
+// 支持：-t foo:v1, --tag foo:latest, --tag=foo:v1, -t foo:v1 -t foo:latest。
+// 用于 BUG-18b：在 gRPC hijack 开始时注册 pendingBuildTags，
+// 防止 BuildKit 构建完成后 image tag 事件在 SetImageOwner 前泄漏给其他用户。
+func parseBuildxTags(cmd string) []string {
+	parts := strings.Fields(cmd)
+	var tags []string
+	for i := 0; i < len(parts); i++ {
+		switch {
+		case (parts[i] == "-t" || parts[i] == "--tag") && i+1 < len(parts):
+			tags = append(tags, parts[i+1])
+			i++ // 跳过下一个 token（tag 值）
+		case strings.HasPrefix(parts[i], "--tag="):
+			tags = append(tags, strings.TrimPrefix(parts[i], "--tag="))
+		}
+	}
+	return tags
 }
 
 // imageHasOtherTags 检查镜像是否还有除 excludeTag 之外的其他 tag
