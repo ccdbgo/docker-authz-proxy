@@ -2037,15 +2037,18 @@ func (p *ProxyServer) eventBelongsToUser(line []byte, uid int) bool {
 	}
 
 	// image 事件：通过 pending 竞态窗口 map 或 DB 查归属。
-	// image 事件的 Actor.ID 为 sha256: 开头的 content ID，Attributes["name"] 为 tag 或 ID。
-	// 六条路径：
-	//   0a. pendingBuildTags 中有命名 tag 记录（经典 builder/BuildKit 竞态窗口）→ 按 uid 判断
-	//   0b. pendingPullRefs 中有命名 ref 记录（pull 竞态窗口，BUG-19）          → 按 uid 判断
-	//   1.  DB 中有记录且公共镜像                                               → true
-	//   2.  DB 中有记录且属于本用户                                              → true
-	//   2.5 DB 中有记录但属于他人，image_access 有当前用户记录（曾 pull 过）      → true
-	//   3.  DB 中无记录（基础镜像、中间层）                                       → true（放行）
-	//   否  DB 中有记录属于他人且无 image_access 记录                            → false（隔离）
+	// image 事件的 Actor.ID：pull/tag/untag 事件为 image ref（如 alpine:3.18），
+	//   delete/create 事件为 sha256: 开头的 content ID。
+	// Attributes["name"]：仅含仓库名（如 alpine），不含 tag。
+	// 七条路径：
+	//   0a.   pendingBuildTags 中有命名 tag 记录（经典 builder/BuildKit 竞态窗口）→ 按 uid 判断
+	//   0b.   pendingPullRefs 中有命名 ref，用 attrs["name"] 查命中              → 按 uid 判断
+	//   0b.2. pendingPullRefs 中有命名 ref，用 Actor.ID 查命中（含完整 tag）      → 按 uid 判断
+	//   1.    DB 中有记录且公共镜像                                               → true
+	//   2.    DB 中有记录且属于本用户                                              → true
+	//   2.5.  DB 中有记录但属于他人，image_access 有当前用户记录（曾 pull 过）     → true
+	//   3.    DB 中无记录（基础镜像、中间层）                                      → true（放行）
+	//   否    DB 中有记录属于他人且无 image_access 记录                           → false（隔离）
 	if ev.Type == "image" {
 		// 路径 0：pending 竞态窗口（build tag 或 pull ref）
 		// 处理 Docker 在代理调用 SetImageOwner 之前就已发出 image 事件的场景。
@@ -2059,7 +2062,7 @@ func (p *ProxyServer) eventBelongsToUser(line []byte, uid int) bool {
 				}
 				// 类型断言失败（异常情况）：跳过路径 0a，降级到后续路径
 			}
-			// 路径 0b：pendingPullRefs（pull 竞态窗口，BUG-19）
+			// 路径 0b：pendingPullRefs via attrs["name"]（pull 竞态窗口，BUG-19）
 			if v, ok := p.pendingPullRefs.Load(name); ok {
 				if ownerUID, ok := v.(int); ok {
 					return ownerUID == uid
@@ -2068,7 +2071,18 @@ func (p *ProxyServer) eventBelongsToUser(line []byte, uid int) bool {
 			}
 		}
 
-		imageID := ev.Actor.ID // 通常为 sha256:... 格式
+		// 路径 0b.2：Docker pull 事件中 attrs["name"] 仅含仓库名（如 alpine），不含 tag，
+		// 而 pendingPullRefs 以完整 ref（如 alpine:3.18）为 key。
+		// Actor.ID 在 pull 事件中正好是完整 ref，用它补充查询覆盖此情形。
+		if actorRef := ev.Actor.ID; actorRef != "" && !strings.HasPrefix(actorRef, "sha256:") {
+			if v, ok := p.pendingPullRefs.Load(actorRef); ok {
+				if ownerUID, ok := v.(int); ok {
+					return ownerUID == uid
+				}
+			}
+		}
+
+		imageID := ev.Actor.ID // pull/tag 事件为 ref；delete 事件为 sha256:...
 		if imageID == "" {
 			imageID = attrs["name"]
 		}

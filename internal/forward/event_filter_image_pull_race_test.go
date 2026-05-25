@@ -269,3 +269,78 @@ func TestBug19_Reg5_Integration_PendingBlocksOtherUsers(t *testing.T) {
 		)
 	}
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// BUG 修复：pull 事件 Actor.ID 含完整 tag，attrs["name"] 仅含仓库名
+//
+// 复现场景：alice 执行 docker pull alpine:3.18，bob 执行 docker system events
+//   Docker 发出事件：{"Type":"image","Action":"pull",
+//                     "Actor":{"ID":"alpine:3.18","Attributes":{"name":"alpine"}}}
+//   pendingPullRefs key = "alpine:3.18"（来自 parseImageRefFromURI）
+//   路径0b 用 attrs["name"]="alpine" 查询 → miss
+//   路径3（DB 无记录）→ return true → bob 错误地收到 alice 的 pull 事件
+//
+// 修复：路径0b.2 用 Actor.ID="alpine:3.18" 补充查询 pendingPullRefs → hit → 隔离
+// ══════════════════════════════════════════════════════════════════════════════
+
+// TestBug_PullEvent_ActorIDHasTag_NameHasNoTag
+//
+// 精确复现 alice pull alpine:3.18 导致 bob 收到事件的场景：
+//   - pendingPullRefs["alpine:3.18"] = aliceUID（parseImageRefFromURI 的结果）
+//   - 事件：Actor.ID="alpine:3.18", attrs["name"]="alpine"（真实 Docker 格式）
+//   - 路径0b 用 "alpine" 查询 → miss；路径0b.2 用 "alpine:3.18" 查询 → hit → 隔离
+func TestBug_PullEvent_ActorIDHasTag_NameHasNoTag(t *testing.T) {
+	p := newTestProxy(t, httptest.NewServer(nil), nil)
+
+	const fullRef = "alpine:3.18" // parseImageRefFromURI("?fromImage=alpine&tag=3.18")
+	p.pendingPullRefs.Store(fullRef, pullRaceAliceUID)
+	defer p.pendingPullRefs.CompareAndDelete(fullRef, pullRaceAliceUID)
+
+	// 真实 Docker 事件格式：Actor.ID=完整 ref，attrs["name"]=仓库名（无 tag）
+	event := makeImageEvent("pull", fullRef, "alpine")
+
+	if p.eventBelongsToUser(event, pullRaceBobUID) {
+		t.Errorf(
+			"[pull tag 泄漏]: bob(uid=%d) 收到了 alice(uid=%d) 的 image pull 事件\n"+
+				"\tActor.ID=%q  attrs[\"name\"]=%q  pendingPullRefs key=%q\n"+
+				"\t路径0b 用 attrs[\"name\"] 查询未命中，路径0b.2（Actor.ID 查询）应命中",
+			pullRaceBobUID, pullRaceAliceUID, fullRef, "alpine", fullRef,
+		)
+	}
+	if !p.eventBelongsToUser(event, pullRaceAliceUID) {
+		t.Errorf(
+			"alice(uid=%d) 应能看到自己的 alpine:3.18 pull 事件（路径0b.2 命中）",
+			pullRaceAliceUID,
+		)
+	}
+}
+
+// TestBug_PullEvent_ActorIDHasTag_Reg_Latest
+//
+// 回归：latest tag 场景（docker pull busybox）。
+//   parseImageRefFromURI 省略 :latest → key="busybox"
+//   Actor.ID="busybox:latest", attrs["name"]="busybox"
+//   路径0b 用 "busybox" 查询 → hit（key="busybox"）→ 仍然正确隔离
+func TestBug_PullEvent_ActorIDHasTag_Reg_Latest(t *testing.T) {
+	p := newTestProxy(t, httptest.NewServer(nil), nil)
+
+	// latest tag：parseImageRefFromURI 省略 :latest，存储 key="busybox"
+	p.pendingPullRefs.Store("busybox", pullRaceAliceUID)
+	defer p.pendingPullRefs.CompareAndDelete("busybox", pullRaceAliceUID)
+
+	// 真实 Docker 事件：Actor.ID="busybox:latest", attrs["name"]="busybox"
+	event := makeImageEvent("pull", "busybox:latest", "busybox")
+
+	if p.eventBelongsToUser(event, pullRaceBobUID) {
+		t.Errorf(
+			"回归 [latest tag]: bob(uid=%d) 不应收到 alice 的 busybox pull 事件",
+			pullRaceBobUID,
+		)
+	}
+	if !p.eventBelongsToUser(event, pullRaceAliceUID) {
+		t.Errorf(
+			"回归 [latest tag]: alice(uid=%d) 应收到自己的 busybox pull 事件",
+			pullRaceAliceUID,
+		)
+	}
+}
