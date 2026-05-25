@@ -25,6 +25,7 @@ LINUX_PORT="${LINUX_PORT:-22}"
 REMOTE_DIR="${REMOTE_DIR:-/tmp/docker-authz-deploy}"
 MODE="auto"        # auto | binary | source
 EXTRA_FLAGS=""     # 传给 install.sh 的额外参数
+SKIP_BUILD=false   # --skip-build: 跳过重新编译（显式使用现有包）
 
 show_usage() {
     cat << EOF
@@ -39,6 +40,7 @@ show_usage() {
   -d, --dir  DIR     远程临时目录（默认: /tmp/docker-authz-deploy）
   --upgrade          升级模式（覆盖已有配置文件）
   --source           强制使用源码编译模式（目标机需安装 Go）
+  --skip-build       跳过本地重新编译，直接使用现有 dist/ 包（慎用）
   --help             显示此帮助
 
 环境变量: LINUX_SERVER / LINUX_USER / LINUX_PORT / REMOTE_DIR
@@ -57,9 +59,10 @@ while [[ $# -gt 0 ]]; do
         -u|--user)    LINUX_USER="$2";   shift 2 ;;
         -p|--port)    LINUX_PORT="$2";   shift 2 ;;
         -d|--dir)     REMOTE_DIR="$2";   shift 2 ;;
-        --upgrade)    EXTRA_FLAGS="--upgrade"; shift ;;
-        --source)     MODE="source"; shift ;;
-        --help)       show_usage; exit 0 ;;
+        --upgrade)     EXTRA_FLAGS="--upgrade"; shift ;;
+        --source)      MODE="source"; shift ;;
+        --skip-build)  SKIP_BUILD=true; shift ;;
+        --help)        show_usage; exit 0 ;;
         *) log_error "未知选项: $1"; show_usage; exit 1 ;;
     esac
 done
@@ -91,21 +94,33 @@ if ! $SSH -o BatchMode=yes "$TARGET" "echo ok" &>/dev/null; then
 fi
 log_info "SSH 连接正常"
 
-# ── 选择部署模式 ─────────────────────────────────────────────────────────────
+# ── 本地编译 ─────────────────────────────────────────────────────────────────
 PKG_DIR="${SCRIPT_DIR}/dist/docker-authz-proxy-deploy-linux-amd64"
 PKG_TAR="${SCRIPT_DIR}/dist/docker-authz-proxy-deploy-linux-amd64.tar.gz"
+STAMP_FILE="${PKG_TAR}.build-stamp"
+
+if [ "$MODE" != "source" ]; then
+    if [ "$SKIP_BUILD" = true ]; then
+        log_warn "已跳过本地编译（--skip-build），使用现有包"
+        if [ ! -f "$PKG_TAR" ]; then
+            log_error "未找到 $PKG_TAR，请先运行 bash build-release.sh 或去掉 --skip-build"
+            exit 1
+        fi
+        log_warn "当前包 git stamp: $(cat "$STAMP_FILE" 2>/dev/null || echo "未知")"
+    else
+        log_step "本地编译（确保部署最新代码）"
+        if ! command -v go &>/dev/null; then
+            log_warn "未找到本地 Go 编译器，自动切换源码编译模式（目标机需安装 Go）"
+            MODE="source"
+        else
+            bash "${SCRIPT_DIR}/build-release.sh"
+            log_info "本地编译完成，git stamp: $(cat "$STAMP_FILE" 2>/dev/null || echo "未知")"
+        fi
+    fi
+fi
 
 if [ "$MODE" = "auto" ]; then
-    if [ -f "$PKG_TAR" ]; then
-        MODE="binary"
-        log_info "检测到预编译包: dist/docker-authz-proxy-deploy-linux-amd64.tar.gz"
-        log_info "使用【预编译包模式】（无需目标机安装 Go）"
-    else
-        MODE="source"
-        log_warn "未找到预编译包 dist/docker-authz-proxy-deploy-linux-amd64.tar.gz"
-        log_warn "使用【源码编译模式】（目标机需安装 Go 1.21+）"
-        log_warn "提示：先运行 bash build-release.sh 生成预编译包可更快部署"
-    fi
+    MODE="binary"
 fi
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -159,6 +174,18 @@ else
     log_step "步骤 4/4: 编译并安装"
     $SSH -t "$TARGET" "cd $REMOTE_DIR && bash deploy-to-linux.sh"
 
+fi
+
+# ── 部署后版本核验 ────────────────────────────────────────────────────────────
+log_step "部署后版本核验"
+DEPLOYED_VER=$($SSH "$TARGET" "/usr/local/bin/docker-authz-proxy --version 2>/dev/null || echo 'unknown'")
+EXPECTED_STAMP=$(cat "$STAMP_FILE" 2>/dev/null || echo "")
+log_info "服务器版本: $DEPLOYED_VER"
+if [ -n "$EXPECTED_STAMP" ] && echo "$DEPLOYED_VER" | grep -q "$EXPECTED_STAMP"; then
+    log_info "✓ 版本核验通过：服务器运行的正是本次编译的二进制"
+elif [ -n "$EXPECTED_STAMP" ]; then
+    log_warn "⚠ 版本核验失败：期望 git=${EXPECTED_STAMP}，实际 ${DEPLOYED_VER}"
+    log_warn "  请检查 install.sh 是否正确替换了二进制"
 fi
 
 # ── 完成 ─────────────────────────────────────────────────────────────────────

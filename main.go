@@ -23,6 +23,9 @@ import (
 	"go.uber.org/zap"
 )
 
+// 由 build-release.sh 通过 -ldflags "-X main.gitCommit=<hash>" 注入
+var gitCommit = "dev"
+
 func main() {
 	var (
 		socketDir    = flag.String("socket-dir", "/run/docker-authz", "per-user socket 目录")
@@ -64,8 +67,14 @@ func main() {
 		querySince   = flag.String("since", "", "日志起始时间（RFC3339，如 2025-01-01T00:00:00Z）")
 		queryUntil   = flag.String("until", "", "日志结束时间（RFC3339）")
 		queryLimit   = flag.Int("limit", 0, "最多返回日志条数（0 表示不限制）")
+		showVersion  = flag.Bool("version", false, "打印版本信息后退出")
 	)
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("docker-authz-proxy git=%s\n", gitCommit)
+		os.Exit(0)
+	}
 
 	// --query 模式：直接查 DB 输出结果后退出，不启动代理
 	if *queryType != "" {

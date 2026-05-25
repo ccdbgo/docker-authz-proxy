@@ -20,6 +20,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 VERSION="${VERSION:-v1.0}"
+GIT_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+GIT_DIRTY=$(git diff --quiet 2>/dev/null && echo "" || echo "-dirty")
+BUILD_STAMP="${GIT_COMMIT}${GIT_DIRTY}"
+log_info "Git commit: ${BUILD_STAMP}"
+
 DIST_DIR="dist"
 PKG_NAME="docker-authz-proxy-deploy-linux-amd64"
 PKG_DIR="${DIST_DIR}/${PKG_NAME}"
@@ -49,7 +54,7 @@ BUILD_FLAGS="-trimpath -ldflags=-s -ldflags=-w"
 
 log_info "编译 docker-authz-proxy ..."
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-    go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
+    go build -trimpath -ldflags="-s -w -X main.gitCommit=${BUILD_STAMP}" \
     -o "${PKG_DIR}/bin/docker-authz-proxy" . && \
     log_info "  -> ${PKG_DIR}/bin/docker-authz-proxy"
 
@@ -374,6 +379,8 @@ README_EOF
 log_step "打包为 tar.gz"
 cd "$DIST_DIR"
 tar czf "${PKG_NAME}.tar.gz" "$PKG_NAME"
+# 写入构建戳文件，deploy 脚本用于核验新鲜度
+echo "${BUILD_STAMP}" > "${PKG_NAME}.tar.gz.build-stamp"
 cd ..
 
 PKG_SIZE=$(du -sh "${OUTPUT_TAR}" | cut -f1)
