@@ -646,6 +646,14 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		zap.String("action", action),
 		zap.String("uri", r.URL.RequestURI()),
 	)
+	// BUG-19 pull 竞态防护：在 forward 前注册 pendingPullRefs，
+	// 确保 Docker 发出 image pull 事件时（cached image 几乎与请求同步）窗口已覆盖。
+	if action == authz.ActionPull && !identity.IsPrivileged() {
+		if pullRef := parseImageRefFromURI(modifiedReq.URL.RequestURI()); pullRef != "" {
+			p.pendingPullRefs.Store(pullRef, identity.RealUID)
+			defer p.pendingPullRefs.CompareAndDelete(pullRef, identity.RealUID)
+		}
+	}
 	forwardStart := time.Now()
 	resp, err := p.forward(modifiedReq)
 	latencyMs := time.Since(forwardStart).Milliseconds()
@@ -1998,12 +2006,14 @@ func (p *ProxyServer) eventBelongsToUser(line []byte, uid int) bool {
 
 	// image 事件：通过 pending 竞态窗口 map 或 DB 查归属。
 	// image 事件的 Actor.ID 为 sha256: 开头的 content ID，Attributes["name"] 为 tag 或 ID。
-	// 五条路径：
+	// 六条路径：
 	//   0a. pendingBuildTags 中有命名 tag 记录（经典 builder/BuildKit 竞态窗口）→ 按 uid 判断
 	//   0b. pendingPullRefs 中有命名 ref 记录（pull 竞态窗口，BUG-19）          → 按 uid 判断
-	//   1.  DB 中有记录且属于本用户（或公共镜像）                                 → true
-	//   2.  DB 中有记录且属于其他用户（私有镜像）                                 → false（隔离）
-	//   3.  DB 中无记录（基础镜像、中间层、系统镜像等）                           → true（放行）
+	//   1.  DB 中有记录且公共镜像                                               → true
+	//   2.  DB 中有记录且属于本用户                                              → true
+	//   2.5 DB 中有记录但属于他人，image_access 有当前用户记录（曾 pull 过）      → true
+	//   3.  DB 中无记录（基础镜像、中间层）                                       → true（放行）
+	//   否  DB 中有记录属于他人且无 image_access 记录                            → false（隔离）
 	if ev.Type == "image" {
 		// 路径 0：pending 竞态窗口（build tag 或 pull ref）
 		// 处理 Docker 在代理调用 SetImageOwner 之前就已发出 image 事件的场景。
@@ -2036,7 +2046,12 @@ func (p *ProxyServer) eventBelongsToUser(line []byte, uid int) bool {
 				if isPublic {
 					return true // 路径 1：公共镜像，所有人可见
 				}
-				return owner.UID == uid // 路径 1/2：按归属判断
+				if owner.UID == uid {
+					return true // 路径 2：本人镜像
+				}
+				// 路径 2.5：他人私有镜像，但当前用户曾 pull 过（image_access 有记录）
+				return p.db.HasImageAccess(imageID, uid)
+				// 注：HasImageAccess 返回 false 即路径 否（隔离）
 			}
 			// 路径 3：DB 无记录，放行
 		}
@@ -2463,15 +2478,8 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 		}
 
 	case authz.ActionPull:
-		// BUG-19 竞态防护：在流式传输前注册 pendingPullRefs。
-		// Docker pull 完成后立即发出 image pull 事件，而 SetImageOwner 在流末尾才执行。
-		// 提前注册确保竞态窗口内 image pull 事件按归属过滤，不泄漏给其他用户。
-		// defer CompareAndDelete 确保并发同 ref pull 时不互相删除对方记录。
+		// pendingPullRefs 在 ServeHTTP 的 forward 前已注册（BUG-19），此处仅用 imageRef 查询镜像 ID。
 		imageRef := parseImageRefFromURI(requestURI)
-		if imageRef != "" {
-			p.pendingPullRefs.Store(imageRef, id.RealUID)
-			defer p.pendingPullRefs.CompareAndDelete(imageRef, id.RealUID)
-		}
 		isolation.CopyHeaders(w, resp.Header)
 		w.WriteHeader(resp.StatusCode)
 		if resp.StatusCode != http.StatusOK {

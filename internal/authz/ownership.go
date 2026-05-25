@@ -428,6 +428,21 @@ func (o *OwnershipDB) GetImageOwner(imageID string) (*OwnerInfo, bool, bool) {
 	return &info, isPublicInt != 0, true
 }
 
+// HasImageAccess 判断用户是否在 image_access 表中拥有对某镜像的显式访问记录。
+// 用于 eventBelongsToUser 路径 2.5：镜像属于他人但当前用户曾经 pull 过。
+func (o *OwnershipDB) HasImageAccess(imageID string, uid int) bool {
+	imageID = normalizeImageID(imageID)
+	if imageID == "" {
+		return false
+	}
+	var count int
+	_ = o.DB.QueryRow(
+		`SELECT COUNT(*) FROM image_access WHERE image_id = ? AND user_uid = ?`,
+		imageID, uid,
+	).Scan(&count)
+	return count > 0
+}
+
 // CanUseImage 判断用户是否有权使用某镜像
 func (o *OwnershipDB) CanUseImage(realUID int, imageID string) bool {
 	resolvedID := o.resolveImageIDInDB(imageID)
