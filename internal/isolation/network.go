@@ -97,16 +97,41 @@ func InjectNetworkNamePrefixWithName(body []byte, identity *auth.CallerIdentity)
 
 	// 注入 OS 层桥接器名称，使 brctl show <netname> 在宿主机上直接生效。
 	//
-	// 条件（三者同时满足才注入）：
+	// 条件（同时满足才注入）：
 	//   1. Driver 为 "bridge" 或缺省（Docker 默认为 bridge）
 	//   2. 用户未通过 --opt com.docker.network.bridge.name=... 显式设置
 	//   3. 用户可见名称非空且 ≤ 15 字节（Linux IFNAMSIZ=16 含 null，上限 15 字节）
+	//   4. 非 config-only 模板网络（ConfigOnly:true）：模板不创建真实桥接口，
+	//      注入无意义且会污染模板 Options；若被 --config-from 继承，消费侧会携带
+	//      bridge.name 导致 Docker 报错。依赖 Docker CLI 显式携带 "ConfigOnly":true 字段。
+	//   5. 非 config-from 消费网络（ConfigFrom.Network 非空）：Docker 明确禁止依赖
+	//      配置源的网络携带任何 driver options，否则报 "network driver options are not
+	//      supported if the network depends on a configuration network"。
+	//      注意：此处读取的 req["ConfigFrom"] 已经过上方前缀改写，但 != "" 判断不受影响。
 	//
 	// userVisibleName：去掉已有前缀后的原始网络名（name 不含前缀时 TrimPrefix 直接返回 name）。
 	// 注意：len() 在此计算字节长度，与 Linux 内核 IFNAMSIZ 限制一致，勿改为 rune 长度。
 	const bridgeNameOpt = "com.docker.network.bridge.name"
 	userVisibleName := strings.TrimPrefix(name, prefix)
-	if userVisibleName != "" && len(userVisibleName) <= 15 {
+
+	// skipBridgeNameInject：ConfigOnly=true 或 ConfigFrom.Network 非空时跳过注入。
+	skipBridgeNameInject := false
+	if coRaw, ok := req["ConfigOnly"]; ok {
+		var co bool
+		if json.Unmarshal(coRaw, &co) == nil && co {
+			skipBridgeNameInject = true
+		}
+	}
+	if !skipBridgeNameInject {
+		if cfRaw, ok := req["ConfigFrom"]; ok {
+			var cf struct{ Network string }
+			if json.Unmarshal(cfRaw, &cf) == nil && cf.Network != "" {
+				skipBridgeNameInject = true
+			}
+		}
+	}
+
+	if !skipBridgeNameInject && userVisibleName != "" && len(userVisibleName) <= 15 {
 		var driver string
 		if dRaw, ok := req["Driver"]; ok {
 			_ = json.Unmarshal(dRaw, &driver)
