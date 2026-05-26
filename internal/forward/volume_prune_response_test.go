@@ -131,7 +131,7 @@ func TestBUG9_VolumePrune_Response_ContainsInternalPrefix(t *testing.T) {
 	seedVolumes(t, proxy, aliceUID, "alice", "config")
 
 	w := httptest.NewRecorder()
-	intercepted := proxy.handleVolumePrune(w, alice)
+	intercepted := proxy.handleVolumePrune(w, httptest.NewRequest("POST", "/volumes/prune", nil),alice)
 	if !intercepted {
 		t.Fatalf("handleVolumePrune should intercept regular user, got false")
 	}
@@ -200,7 +200,7 @@ func TestBUG9_VolumePrune_Response_RegularUser_NameStripped(t *testing.T) {
 			seedVolumes(t, proxy, aliceUID, "alice", tc.suffix)
 
 			w := httptest.NewRecorder()
-			proxy.handleVolumePrune(w, alice)
+			proxy.handleVolumePrune(w, httptest.NewRequest("POST", "/volumes/prune", nil),alice)
 
 			resp := parseVolumePruneResp(t, w.Body.String())
 			if len(resp.VolumesDeleted) != 1 {
@@ -297,7 +297,7 @@ func TestBUG9_Regression_VolumePrune_MultiVolume_AllNamesStripped(t *testing.T) 
 	seedVolumes(t, proxy, aliceUID, "alice", suffixes...)
 
 	w := httptest.NewRecorder()
-	proxy.handleVolumePrune(w, alice)
+	proxy.handleVolumePrune(w, httptest.NewRequest("POST", "/volumes/prune", nil),alice)
 
 	resp := parseVolumePruneResp(t, w.Body.String())
 
@@ -352,7 +352,7 @@ func TestBUG9_Regression_VolumePrune_409_NotInResponse(t *testing.T) {
 	}
 
 	w := httptest.NewRecorder()
-	proxy.handleVolumePrune(w, alice)
+	proxy.handleVolumePrune(w, httptest.NewRequest("POST", "/volumes/prune", nil),alice)
 
 	resp := parseVolumePruneResp(t, w.Body.String())
 
@@ -389,7 +389,7 @@ func TestBUG9_Regression_VolumePrune_EmptyDB_ResponseFormat(t *testing.T) {
 	proxy := newVolumePruneResponseTestProxy(t, rt)
 
 	w := httptest.NewRecorder()
-	proxy.handleVolumePrune(w, regularIdentity("alice", 1001))
+	proxy.handleVolumePrune(w, httptest.NewRequest("POST", "/volumes/prune", nil),regularIdentity("alice", 1001))
 
 	body := w.Body.String()
 	if !strings.Contains(body, `"VolumesDeleted":[]`) {
@@ -412,7 +412,7 @@ func TestBUG9_Regression_SudoPrune_Response_ContainsAllUsers(t *testing.T) {
 	seedVolumes(t, proxy, 1001, "alice", "config")
 
 	w := httptest.NewRecorder()
-	proxy.handleVolumePrune(w, sudoIdentity("sudo_test", 1005))
+	proxy.handleVolumePrune(w, httptest.NewRequest("POST", "/volumes/prune", nil),sudoIdentity("sudo_test", 1005))
 
 	resp := parseVolumePruneResp(t, w.Body.String())
 

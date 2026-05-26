@@ -631,7 +631,7 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 非特权用户的 volume prune：拦截并自行处理（Docker 原生只删匿名 volume，无法删具名 volume）
 	if action == authz.ActionPrune &&
 		strings.HasPrefix(authz.StripAPIVersion(r.URL.Path), "/volumes/prune") {
-		if p.handleVolumePrune(w, identity) {
+		if p.handleVolumePrune(w, r, identity) {
 			return
 		}
 	}
@@ -2937,8 +2937,14 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 			writeDockerError(w, http.StatusBadGateway, "read upstream response failed")
 			return
 		}
-		if resp.StatusCode == http.StatusOK && !id.IsPrivileged() {
-			body = isolation.StripVolumeInspectPrefix(body, id.RealUID)
+		if !id.IsPrivileged() {
+			if resp.StatusCode == http.StatusOK {
+				body = isolation.StripVolumeInspectPrefix(body, id.RealUID)
+			} else {
+				// 错误响应（如 404）中也含内部前缀，字节替换剥离
+				// e.g. {"message":"volume user-1002-volume-test_vol not found"}
+				body = bytes.ReplaceAll(body, []byte(isolation.UserVolumePrefix(id.RealUID)), nil)
+			}
 		}
 		isolation.CopyHeaders(w, resp.Header)
 		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
@@ -5392,7 +5398,19 @@ func (p *ProxyServer) checkCreateContainerNetworks(w http.ResponseWriter, r *htt
 //   - IsPrivileged()==false (普通用户)：只删除自己的具名 volume
 //
 // 返回 true 表示已拦截处理，调用方应直接 return；返回 false 表示放行正常流程。
-func (p *ProxyServer) handleVolumePrune(w http.ResponseWriter, id *auth.CallerIdentity) bool {
+func (p *ProxyServer) handleVolumePrune(w http.ResponseWriter, r *http.Request, id *auth.CallerIdentity) bool {
+	// 解析 --filter 参数；同时支持 Docker 新版 map[string]map[string]bool
+	// 和旧版 map[string][]string 两种编码格式。
+	labelFilters, parseErr := parsePruneLabelFilters(r.URL.Query().Get("filters"))
+	if parseErr != nil {
+		// filters 格式无法识别：安全失败，返回空结果而非删除全部
+		p.logger.Warn("volume_prune_filter_parse_error",
+			zap.String("raw_filters", r.URL.Query().Get("filters")),
+			zap.Error(parseErr))
+		writeVolumePruneEmptyResponse(w)
+		return true
+	}
+
 	var ownedVols []string
 	var err error
 	if id.IsPrivileged() {
@@ -5422,6 +5440,10 @@ func (p *ProxyServer) handleVolumePrune(w http.ResponseWriter, id *auth.CallerId
 	for _, volName := range ownedVols {
 		// 仅允许代理自身格式的具名卷（防路径注入）
 		if !isolation.IsUserVolumePrefix(volName) {
+			continue
+		}
+		// 若有 label filter，先 inspect 卷标签；不匹配则跳过，不删除
+		if len(labelFilters) > 0 && !p.volumeMatchesLabelFilters(volName, labelFilters) {
 			continue
 		}
 		req, err := http.NewRequest("DELETE", "http://docker/volumes/"+volName, nil)
@@ -5477,6 +5499,96 @@ func writeVolumePruneEmptyResponse(w http.ResponseWriter) {
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
+}
+
+// parsePruneLabelFilters 解析 POST /volumes/prune 的 filters 查询参数，提取正向 label 过滤条件。
+//
+// Docker 客户端存在两种编码格式：
+//
+//	新版（map[string]map[string]bool）：{"label":{"env=test":true}}
+//	旧版（map[string][]string）：         {"label":["env=test"]}
+//
+// 返回规则：
+//
+//	raw==""          → nil, nil   （无 filter，全量删除，与原有行为一致）
+//	解析成功无 label → nil, nil   （仅含 dangling 等其他 filter，保守：全量删除）
+//	解析成功有 label → labels, nil
+//	两种格式均失败   → nil, error （调用方安全失败，返回空结果）
+//
+// 注意：label!= 否定过滤暂不支持；dangling filter 不影响具名卷删除逻辑（预存限制）。
+func parsePruneLabelFilters(raw string) ([]string, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	// 优先尝试新版格式 map[string]map[string]bool
+	var f1 map[string]map[string]bool
+	if json.Unmarshal([]byte(raw), &f1) == nil {
+		labels := make([]string, 0, len(f1["label"]))
+		for k := range f1["label"] {
+			labels = append(labels, k)
+		}
+		return labels, nil
+	}
+	// 再尝试旧版格式 map[string][]string
+	var f2 map[string][]string
+	if json.Unmarshal([]byte(raw), &f2) == nil {
+		return append([]string(nil), f2["label"]...), nil
+	}
+	return nil, fmt.Errorf("volume prune: unrecognized filters format: %q", raw)
+}
+
+// volumeMatchesLabelFilters 通过 GET /volumes/{name} inspect 卷标签，
+// 检查是否满足所有 label 过滤条件。
+//
+// 每个 filter 格式：
+//
+//	"key=value" → Labels[key] == value
+//	"key"       → Labels[key] 存在（任意值）
+//
+// 网络错误、非 200 响应、JSON 解析失败时保守返回 false（不删除该卷）。
+func (p *ProxyServer) volumeMatchesLabelFilters(volName string, filters []string) bool {
+	req, err := http.NewRequest("GET", "http://docker/volumes/"+volName, nil)
+	if err != nil {
+		// URL 构造失败（极端情况）：安全跳过，不 panic
+		p.logger.Warn("volume_label_inspect_request_error",
+			zap.String("volume", volName),
+			zap.Error(err))
+		return false
+	}
+	resp, err := p.transport.RoundTrip(req)
+	if err != nil {
+		p.logger.Warn("volume_label_inspect_transport_error",
+			zap.String("volume", volName),
+			zap.Error(err))
+		return false
+	}
+	// 必须耗尽 body 再 Close，保证 Unix socket 连接被 transport 复用
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	var info struct {
+		Labels map[string]string `json:"Labels"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		return false
+	}
+	// Labels 为 nil（卷无 label）时：map 访问返回零值，不 panic
+	for _, f := range filters {
+		if k, v, ok := strings.Cut(f, "="); ok {
+			if info.Labels[k] != v {
+				return false
+			}
+		} else {
+			if _, exists := info.Labels[f]; !exists {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // handleContainerPrune 拦截非特权用户的 POST /containers/prune 请求。

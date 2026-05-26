@@ -208,7 +208,7 @@ func TestBUG7_SudoVolumePrune_LeavesAllNamedVolumesIntact(t *testing.T) {
 
 	sudoTest := sudoIdentity("sudo_test", 1005)
 	w := httptest.NewRecorder()
-	intercepted := proxy.handleVolumePrune(w, sudoTest)
+	intercepted := proxy.handleVolumePrune(w, httptest.NewRequest("POST", "/volumes/prune", nil),sudoTest)
 
 	// ── 断言 A：代理必须拦截 sudo prune（不能 return false 放行）───────────
 	// Bug 行为：intercepted == false
@@ -256,7 +256,7 @@ func TestVolumePrune_RootUser_DeletesAllUsersVolumes(t *testing.T) {
 	totalVols := len(bobVols) + len(aliceVols) + len(charlieVols) // 4
 
 	w := httptest.NewRecorder()
-	intercepted := proxy.handleVolumePrune(w, rootIdentity())
+	intercepted := proxy.handleVolumePrune(w, httptest.NewRequest("POST", "/volumes/prune", nil),rootIdentity())
 
 	if !intercepted {
 		t.Fatalf("root user: want intercepted=true (proxy handles all-user delete), got false")
@@ -308,7 +308,7 @@ func TestVolumePrune_RegularUser_OnlyDeletesOwnVolumes(t *testing.T) {
 	seedVolumes(t, proxy, 1001, "alice", "config") // alice 的卷应保持不变
 
 	w := httptest.NewRecorder()
-	if intercepted := proxy.handleVolumePrune(w, regularIdentity("bob", 1002)); !intercepted {
+	if intercepted := proxy.handleVolumePrune(w, httptest.NewRequest("POST", "/volumes/prune", nil),regularIdentity("bob", 1002)); !intercepted {
 		t.Fatalf("regular user: want intercepted=true, got false")
 	}
 
@@ -372,7 +372,7 @@ func TestVolumePrune_PrivilegedUser_SkipsVolumeInUse_409(t *testing.T) {
 
 	// sudo 用户执行 prune（应删除所有用户的卷，跳过 409 的）
 	w := httptest.NewRecorder()
-	if intercepted := proxy.handleVolumePrune(w, sudoIdentity("sudo_test", 1005)); !intercepted {
+	if intercepted := proxy.handleVolumePrune(w, httptest.NewRequest("POST", "/volumes/prune", nil),sudoIdentity("sudo_test", 1005)); !intercepted {
 		t.Fatalf("sudo user: want intercepted=true, got false")
 	}
 
@@ -436,7 +436,7 @@ func TestVolumePrune_PrivilegedUser_EmptyDB_NoRequests(t *testing.T) {
 			// DB 为空，不预置任何卷
 
 			w := httptest.NewRecorder()
-			intercepted := proxy.handleVolumePrune(w, id)
+			intercepted := proxy.handleVolumePrune(w, httptest.NewRequest("POST", "/volumes/prune", nil),id)
 
 			if !intercepted {
 				t.Fatalf("%s: want intercepted=true even with empty DB, got false",
