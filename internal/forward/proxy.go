@@ -65,7 +65,8 @@ type ProxyServer struct {
 	listeners map[string]net.Listener
 	servers   []*http.Server
 
-	transport http.RoundTripper
+	transport     http.RoundTripper // 短命令（ps/inspect 等），ResponseHeaderTimeout 30s
+	slowTransport http.RoundTripper // pull/push/import：dockerd 需连接外部 registry，响应头可能延迟数分钟
 
 	// pendingBuilds 记录正在进行 BuildKit gRPC 构建的用户（uid → 构建开始时间）。
 	// 用于解决竞态：docker build 返回后立即执行 docker rmi，而 trackBuildKitImages
@@ -105,6 +106,13 @@ type ProxyServer struct {
 	// 并发安全：time.AfterFunc closure 使用 CompareAndDelete，
 	//   并发 pull 同一 ref 时各自的 timer 只删除与自身 ownerUID 匹配的条目。
 	completedPullOwner sync.Map // map[string]int: imageRef → ownerUID
+
+	// completedPruneOwner 在资源被 prune 删除后维持 "{type}:{id}" → ownerUID 映射，
+	// 覆盖 DB 记录已删除但 Docker daemon 事件尚未投递给订阅者的竞态窗口。
+	// key 格式："{type}:{id}"，如 "volume:user-1001-volume-foo"、"image:sha256:abc…"
+	// 生命周期：删 DB 前 Store，pruneEventDeliveryGrace 后由 time.AfterFunc 自动清除。
+	// 并发安全：CompareAndDelete 确保 timer 只删除与自身 ownerUID 匹配的条目。
+	completedPruneOwner sync.Map // map[string]int: "{type}:{id}" → ownerUID
 }
 
 // ProxyOptions 可选配置参数
@@ -124,15 +132,31 @@ type ProxyOptions struct {
 func NewProxyServer(socketDir, upstreamSock string, policy *authz.Policy, db *authz.OwnershipDB,
 	logger *zap.Logger, quota *isolation.QuotaManager, auditLog *audit.AuditLogger,
 	authenticators []auth.Authenticator, opts ProxyOptions) *ProxyServer {
+	// 提取为命名变量，两个 transport 共享同一拨号逻辑，避免参数静默漂移。
+	dialUnix := func(ctx context.Context, _, _ string) (net.Conn, error) {
+		d := &net.Dialer{Timeout: 5 * time.Second}
+		return d.DialContext(ctx, "unix", upstreamSock)
+	}
 	transport := &http.Transport{
-		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			d := &net.Dialer{Timeout: 5 * time.Second}
-			return d.DialContext(ctx, "unix", upstreamSock)
-		},
+		DialContext:           dialUnix,
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   100,
 		IdleConnTimeout:       90 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
+		DisableCompression:    true,
+	}
+	// slowTransport：pull/push/import 需要 dockerd 连接外部 registry。
+	// 响应头到达时间取决于 registry mirror 网络质量，可能超过 30s。
+	// ResponseHeaderTimeout 设为 10min 而非 0：足以覆盖合理的 registry 延迟，
+	// 同时保留对 dockerd 本身挂死的最终超时保护。
+	// DisableCompression 必须与 transport 保持一致：代理透明转发，
+	// 不能让 transport 自动解压并丢失 Content-Encoding，否则客户端收到损坏的数据流。
+	slowTransport := &http.Transport{
+		DialContext:           dialUnix,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   100,
+		IdleConnTimeout:       90 * time.Second,
+		ResponseHeaderTimeout: 10 * time.Minute,
 		DisableCompression:    true,
 	}
 
@@ -166,7 +190,8 @@ func NewProxyServer(socketDir, upstreamSock string, policy *authz.Policy, db *au
 		semaphore:       sem,
 		streamSemaphore: streamSem,
 		listeners:       make(map[string]net.Listener),
-		transport:      transport,
+		transport:       transport,
+		slowTransport:   slowTransport,
 	}
 }
 
@@ -704,7 +729,7 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	forwardStart := time.Now()
-	resp, err := p.forward(modifiedReq)
+	resp, err := p.forward(modifiedReq, isSlowAction(action))
 	latencyMs := time.Since(forwardStart).Milliseconds()
 	if err != nil {
 		statusCode := http.StatusBadGateway
@@ -826,7 +851,7 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 			if resolvedID == "" {
 				// 本地不存在，让 docker 自动 pull
 			} else {
-				_, isPublic, found := p.db.GetImageOwner(resolvedID)
+				_, isPublic, _, found := p.db.GetImageOwner(resolvedID)
 				if !found {
 					if !id.IsPrivileged() {
 						auditID := toAuditIdentity(id)
@@ -1335,7 +1360,7 @@ func (p *ProxyServer) checkImageRemovePermission(w http.ResponseWriter, r *http.
 		// 镜像在 Docker 中不存在，直接放行让 Docker 返回 404
 		return true
 	}
-	owner, isPublic, found := p.db.GetImageOwner(resolvedID)
+	owner, isPublic, _, found := p.db.GetImageOwner(resolvedID)
 	if !found {
 		if !id.IsPrivileged() {
 			// 检查该用户是否有正在进行的 BuildKit 构建（竞态保护）：
@@ -1352,7 +1377,7 @@ func (p *ProxyServer) checkImageRemovePermission(w http.ResponseWriter, r *http.
 					deadline := time.Now().Add(5 * time.Second)
 					for time.Now().Before(deadline) {
 						time.Sleep(50 * time.Millisecond)
-						owner, isPublic, found = p.db.GetImageOwner(resolvedID)
+						owner, isPublic, _, found = p.db.GetImageOwner(resolvedID)
 						if found {
 							break
 						}
@@ -1539,7 +1564,7 @@ func (p *ProxyServer) checkImagePullPermission(w http.ResponseWriter, r *http.Re
 		return true // 本地无此镜像，允许从仓库拉取
 	}
 
-	owner, isPublic, found := p.db.GetImageOwner(resolvedID)
+	owner, isPublic, _, found := p.db.GetImageOwner(resolvedID)
 	if !found {
 		return true
 	}
@@ -1641,7 +1666,7 @@ func (p *ProxyServer) checkImageTagPermission(w http.ResponseWriter, r *http.Req
 	if resolvedID == "" {
 		resolvedID = imageRef
 	}
-	owner, _, found := p.db.GetImageOwner(resolvedID)
+	owner, _, _, found := p.db.GetImageOwner(resolvedID)
 	if !found {
 		// 镜像未被代理追踪（可能是 docker build 产生的中间层），允许通过
 		return true
@@ -1717,7 +1742,7 @@ func (p *ProxyServer) checkImagePushPermission(w http.ResponseWriter, r *http.Re
 		resolvedID = imageRef
 	}
 
-	owner, _, found := p.db.GetImageOwner(resolvedID)
+	owner, _, _, found := p.db.GetImageOwner(resolvedID)
 	if !found {
 		auditID := toAuditIdentity(id)
 		audit.LogAuthzDeniedNotTracked(p.logger, auditID, "image", truncID(resolvedID), authz.ActionPush)
@@ -1838,8 +1863,15 @@ func (p *ProxyServer) preprocessRequest(r *http.Request, id *auth.CallerIdentity
 	return newReq, nil
 }
 
-// forward 将请求转发到上游 dockerd，支持超时重试（最多2次，指数退避）
-func (p *ProxyServer) forward(r *http.Request) (*http.Response, error) {
+// forward 将请求转发到上游 dockerd，支持超时重试（最多2次，指数退避）。
+// slow=true 时使用 slowTransport（ResponseHeaderTimeout: 10min），
+// 适用于 pull/push/import 等需要 dockerd 连接外部 registry 的操作。
+func (p *ProxyServer) forward(r *http.Request, slow bool) (*http.Response, error) {
+	tr := p.transport
+	if slow && p.slowTransport != nil {
+		tr = p.slowTransport
+	}
+
 	upstreamURL := &url.URL{
 		Scheme:   "http",
 		Host:     "docker",
@@ -1899,7 +1931,7 @@ func (p *ProxyServer) forward(r *http.Request) (*http.Response, error) {
 			outReq.ContentLength = 0
 		}
 
-		resp, err = p.transport.RoundTrip(outReq)
+		resp, err = tr.RoundTrip(outReq)
 		if err != nil {
 			// 连接拒绝/Dockerd未启动 → 503；网络中断 → 500（重试后仍失败）
 			if attempt < maxRetries && canRetry {
@@ -1944,6 +1976,11 @@ func (e *upstreamError) Unwrap() error { return e.cause }
 // 30s 提供足够的余量，同时防止无限期内存占用。
 const pullEventDeliveryGrace = 30 * time.Second
 
+// pruneEventDeliveryGrace 是 prune 删除 DB 记录后 completedPruneOwner 条目的 TTL。
+// Docker 事件在资源删除后通常在数毫秒到数秒内投递给所有订阅者；
+// 30s 提供足够的余量，与 pullEventDeliveryGrace 保持一致。
+const pruneEventDeliveryGrace = 30 * time.Second
+
 // eventBelongsToUser 判断一行 docker events JSON 是否属于指定 uid 的用户。
 // 过滤规则：
 //   - volume 事件：通过卷名前缀 user-{uid}-volume-* 判断（卷 API 不支持自定义 Attributes 标签）
@@ -1951,7 +1988,13 @@ const pullEventDeliveryGrace = 30 * time.Second
 //   - container 事件：通过 system.authz.owner.uid 或 user_id 字段判断
 //   - network 事件：通过网络名前缀 user-<uid>- 或 peer-<uid>- 判断
 //   - 无法判断归属的事件（系统事件、无 uid 字段）一律放行
-func (p *ProxyServer) eventBelongsToUser(line []byte, uid int) bool {
+//
+// sudoCtx 表示监听者当前是否以 sudo 命令模式运行（id.IsSudoCommand()）。
+// 当 sudoCtx=false（非特权视图）时，privileged_context=1 的资源事件对该用户不可见，
+// 与 docker image ls / docker ps 等列表查询的过滤行为保持一致。
+// 实际上 sudoCtx=true 时调用方已走 IsPrivileged()=true 分支不会进入此函数，
+// 该参数主要用于语义清晰及未来扩展。
+func (p *ProxyServer) eventBelongsToUser(line []byte, uid int, sudoCtx bool) bool {
 	var ev struct {
 		Type  string `json:"Type"`
 		Actor struct {
@@ -2055,6 +2098,12 @@ func (p *ProxyServer) eventBelongsToUser(line []byte, uid int) bool {
 				return false // 路径 2：格式合法，但属于其他用户
 			}
 		}
+		// 路径 prune：DB 记录已被 prune 删除，但事件尚在投递中（竞态补偿）
+		if v, ok := p.completedPruneOwner.Load("volume:" + name); ok {
+			if ownerUID, ok := v.(int); ok {
+				return ownerUID == uid
+			}
+		}
 		return true // 路径 3：系统卷或格式不合法，放行
 	}
 
@@ -2133,19 +2182,29 @@ func (p *ProxyServer) eventBelongsToUser(line []byte, uid int) bool {
 			imageID = attrs["name"]
 		}
 		if imageID != "" && p.db != nil {
-			owner, isPublic, found := p.db.GetImageOwner(imageID)
+			owner, isPublic, privCtx, found := p.db.GetImageOwner(imageID)
 			if found {
 				if isPublic {
 					return true // 路径 1：公共镜像，所有人可见
 				}
 				if owner.UID == uid {
-					return true // 路径 2：本人镜像
+					// 路径 2：本人镜像。非 sudo 视图（sudoCtx=false）时过滤
+					// privileged_context=1 的资源，与 docker image ls 行为一致。
+					if !sudoCtx && privCtx == 1 {
+						return false
+					}
+					return true
 				}
 				// 路径 2.5：他人私有镜像，但当前用户曾 pull 过（image_access 有记录）
 				return p.db.HasImageAccess(imageID, uid)
 				// 注：HasImageAccess 返回 false 即路径 否（隔离）
 			}
-			// 路径 3：DB 无记录，放行
+			// 路径 3：DB 无记录，先检查 completedPruneOwner 竞态补偿窗口
+			if v, ok := p.completedPruneOwner.Load("image:" + imageID); ok {
+				if ownerUID, ok := v.(int); ok {
+					return ownerUID == uid
+				}
+			}
 		}
 		return true
 	}
@@ -3213,7 +3272,7 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 				}
 				// /events 过滤：非 privileged 用户只看自己的事件
 				if isEvents && !id.IsPrivileged() {
-					if !p.eventBelongsToUser(line, id.RealUID) {
+					if !p.eventBelongsToUser(line, id.RealUID, id.IsSudoCommand()) {
 						continue
 					}
 				}
@@ -3595,6 +3654,19 @@ func isLongLivedRequest(r *http.Request) bool {
 	return f != "" && f != "0" && f != "false" && f != "no"
 }
 
+// isSlowAction 报告 action 是否需要 dockerd 连接外部 registry。
+// 这类操作的响应头可能在数分钟后才到达（受 registry mirror 网络质量影响），
+// 应使用 slowTransport（ResponseHeaderTimeout: 10min），
+// 避免 transport 的 30s 限制将合法的慢速请求误杀。
+func isSlowAction(action string) bool {
+	switch action {
+	case authz.ActionPull, authz.ActionPush, authz.ActionImport:
+		return true
+	default:
+		return false
+	}
+}
+
 // handleHijack 处理需要双向流的请求（attach/exec-start 等）
 func (p *ProxyServer) handleHijack(w http.ResponseWriter, r *http.Request, id *auth.CallerIdentity) {
 	// BuildKit 通过 POST /grpc 进行构建，在 hijack 开始前先快照当前镜像列表，
@@ -3853,7 +3925,7 @@ func (p *ProxyServer) trackBuildKitImages(id *auth.CallerIdentity, pre *imageSna
 			newTags = append(newTags, tag) // BUG-18b
 		} else {
 			// tag 存在且 SHA 相同：若不在 DB 中则归属（相同内容重建场景）
-			existingOwner, _, found := p.db.GetImageOwner(postID)
+			existingOwner, _, _, found := p.db.GetImageOwner(postID)
 			if !found {
 				taggedIDs[postID] = true
 			} else if existingOwner.UID != id.RealUID {
@@ -3882,7 +3954,7 @@ func (p *ProxyServer) trackBuildKitImages(id *auth.CallerIdentity, pre *imageSna
 	}
 
 	writeOne := func(imageID string) {
-		existingOwner, _, found := p.db.GetImageOwner(imageID)
+		existingOwner, _, _, found := p.db.GetImageOwner(imageID)
 		if found {
 			// 镜像已有归属记录
 			if existingOwner.UID != id.RealUID {
@@ -5460,6 +5532,13 @@ func (p *ProxyServer) handleVolumePrune(w http.ResponseWriter, r *http.Request, 
 		_, _ = io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 		if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
+			// 竞态补偿：先存 completedPruneOwner，再删 DB，确保事件到达时可查属主
+			pruneKey := "volume:" + volName
+			ownerUID := id.RealUID
+			p.completedPruneOwner.Store(pruneKey, ownerUID)
+			time.AfterFunc(pruneEventDeliveryGrace, func() {
+				p.completedPruneOwner.CompareAndDelete(pruneKey, ownerUID)
+			})
 			_ = p.db.DeleteVolume(volName)
 			// 普通用户：剥离 user-{uid}-volume- 前缀，还原用户可见名称
 			// 特权用户（sudo/root）：保留内部名，便于跨用户操作的审计追踪
@@ -5626,6 +5705,14 @@ func (p *ProxyServer) handleContainerPrune(w http.ResponseWriter, id *auth.Calle
 		}
 		resp.Body.Close()
 		if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
+			// 竞态补偿：container 事件通过 Attributes 中的 owner uid 判断，DB 删除不影响过滤；
+			// 但仍存入 completedPruneOwner 以应对未来格式变化或缺少 Attributes 的场景。
+			pruneKey := "container:" + cid
+			ownerUID := id.RealUID
+			p.completedPruneOwner.Store(pruneKey, ownerUID)
+			time.AfterFunc(pruneEventDeliveryGrace, func() {
+				p.completedPruneOwner.CompareAndDelete(pruneKey, ownerUID)
+			})
 			_ = p.db.DeleteContainer(cid)
 			_ = p.db.ReleasePortMappings(cid)
 			deleted = append(deleted, cid)
@@ -5707,6 +5794,13 @@ func (p *ProxyServer) handleImagePrune(w http.ResponseWriter, id *auth.CallerIde
 		delBody, _ := io.ReadAll(delResp.Body)
 		delResp.Body.Close()
 		if delResp.StatusCode == http.StatusOK {
+			// 竞态补偿：先存 completedPruneOwner，再删 DB
+			pruneKey := "image:" + img.ID
+			ownerUID := id.RealUID
+			p.completedPruneOwner.Store(pruneKey, ownerUID)
+			time.AfterFunc(pruneEventDeliveryGrace, func() {
+				p.completedPruneOwner.CompareAndDelete(pruneKey, ownerUID)
+			})
 			_ = p.db.DeleteImage(img.ID)
 			// Docker 返回 [{"Deleted":"sha256:..."},{"Untagged":"..."}] 格式
 			var items []pruneDeleted
@@ -5789,6 +5883,15 @@ func (p *ProxyServer) handleNetworkPrune(w http.ResponseWriter, r *http.Request,
 		_, _ = io.Copy(io.Discard, delResp.Body)
 		delResp.Body.Close()
 		if delResp.StatusCode == http.StatusNoContent || delResp.StatusCode == http.StatusOK {
+			// 竞态补偿：先存 completedPruneOwner，再删 DB
+			// network 事件通过名称前缀 _u{uid}_ 判断属主，DB 删除不影响名称；
+			// 仍存入以保持与其他资源类型行为一致，且可应对系统内置网络边界情形。
+			pruneKey := "network:" + netID
+			ownerUID := id.RealUID
+			p.completedPruneOwner.Store(pruneKey, ownerUID)
+			time.AfterFunc(pruneEventDeliveryGrace, func() {
+				p.completedPruneOwner.CompareAndDelete(pruneKey, ownerUID)
+			})
 			// [H1] 记录 DB 删除失败，防止幽灵记录静默堆积
 			if dbErr := p.db.DeleteNetwork(netID); dbErr != nil {
 				p.logger.Error("network_prune_db_delete_failed",

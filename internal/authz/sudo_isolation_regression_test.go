@@ -86,7 +86,7 @@ func Test_SudoCommandIsolation_regression(t *testing.T) {
 			t.Fatalf("SetImageOwner: %v", err)
 		}
 		// 用 GetImageOwner 验证 owner_uid 仍为原始用户（非 root），身份记录正确
-		info, _, found := db.GetImageOwner("aabbcc112233aabb")
+		info, _, _, found := db.GetImageOwner("aabbcc112233aabb")
 		if !found {
 			t.Fatal("GetImageOwner: image not found")
 		}

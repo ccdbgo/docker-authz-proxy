@@ -76,7 +76,7 @@ func TestBug18_ImageTagRace_NamedTagLeaksWhenDBEmpty(t *testing.T) {
 	tagEvent := makeImageEvent("tag", sudoTestImageID, bug18Tag)
 
 	// ── RED ASSERTION A：image tag 事件不应泄漏给 bob ──────────────────────
-	if p.eventBelongsToUser(tagEvent, bobUID3) {
+	if p.eventBelongsToUser(tagEvent, bobUID3, false) {
 		t.Errorf(
 			"BUG-18 [image tag 竞态泄漏]:\n"+
 				"\tbob(uid=%d) 收到了 sudo_test(uid=%d) 的 image tag 事件\n"+
@@ -88,7 +88,7 @@ func TestBug18_ImageTagRace_NamedTagLeaksWhenDBEmpty(t *testing.T) {
 	}
 
 	// ── RED ASSERTION B：alice 同样不应收到 ────────────────────────────────
-	if p.eventBelongsToUser(tagEvent, 1001) {
+	if p.eventBelongsToUser(tagEvent, 1001, false) {
 		t.Errorf(
 			"BUG-18 [竞态泄漏]: alice(uid=1001) 收到了 sudo_test 的 image tag 事件\n"+
 				"\t隔离失效对任意非构建者均成立",
@@ -110,7 +110,7 @@ func TestBug18_Reg1_PendingBuild_BuilderAllowed(t *testing.T) {
 
 	tagEvent := makeImageEvent("tag", sudoTestImageID, bug18Tag)
 
-	if !p.eventBelongsToUser(tagEvent, sudoTestUID) {
+	if !p.eventBelongsToUser(tagEvent, sudoTestUID, false) {
 		t.Errorf(
 			"回归-1: sudo_test(uid=%d) 应能看到自己的 image tag 事件\n"+
 				"\tpendingBuildTags[%q]=%d → uid 匹配 → return true",
@@ -131,7 +131,7 @@ func TestBug18_Reg2_ImageCreateSHA256_StillPassthrough(t *testing.T) {
 	createEvent := makeImageEvent("create", sudoTestImageID, sudoTestImageID)
 
 	for _, uid := range []int{bobUID3, sudoTestUID, 1001} {
-		if !p.eventBelongsToUser(createEvent, uid) {
+		if !p.eventBelongsToUser(createEvent, uid, false) {
 			t.Errorf(
 				"回归-2: uid=%d 不应被过滤 image create sha256 事件（DB 无记录 → 中间层放行）\n"+
 					"\timageID=%q  name=%q（sha256 前缀，非命名 tag，路径0 不生效）\n"+
@@ -156,14 +156,14 @@ func TestBug18_Reg3_AfterBuildComplete_DBFiltersCorrectly(t *testing.T) {
 
 	tagEvent := makeImageEvent("tag", sudoTestImageID, bug18Tag)
 
-	if p.eventBelongsToUser(tagEvent, bobUID3) {
+	if p.eventBelongsToUser(tagEvent, bobUID3, false) {
 		t.Errorf(
 			"回归-3: bob(uid=%d) 不应收到 DB 已注册的 sudo_test(uid=%d) image tag 事件\n"+
 				"\tBUG-16 的 DB 过滤路径应继续正确工作",
 			bobUID3, sudoTestUID,
 		)
 	}
-	if !p.eventBelongsToUser(tagEvent, sudoTestUID) {
+	if !p.eventBelongsToUser(tagEvent, sudoTestUID, false) {
 		t.Errorf(
 			"回归-3: sudo_test(uid=%d) 应收到自己的 image tag 事件（DB 路径）",
 			sudoTestUID,
@@ -188,14 +188,14 @@ func TestBug18_Reg4_MultiTag_AllProtected(t *testing.T) {
 
 	for _, tag := range []string{tag1, tag2} {
 		event := makeImageEvent("tag", sudoTestImageID, tag)
-		if p.eventBelongsToUser(event, bobUID3) {
+		if p.eventBelongsToUser(event, bobUID3, false) {
 			t.Errorf(
 				"回归-4 [多 tag]: bob(uid=%d) 收到了 sudo_test 的 image tag 事件\n"+
 					"\ttag=%q 应受 pendingBuildTags 保护",
 				bobUID3, tag,
 			)
 		}
-		if !p.eventBelongsToUser(event, sudoTestUID) {
+		if !p.eventBelongsToUser(event, sudoTestUID, false) {
 			t.Errorf(
 				"回归-4 [多 tag]: sudo_test(uid=%d) 应能看到自己的 image tag 事件\n"+
 					"\ttag=%q",

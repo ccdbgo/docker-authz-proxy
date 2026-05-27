@@ -91,7 +91,7 @@ func TestBug10_DeleteImage_TagNameLeavesOrphanRecord(t *testing.T) {
 	if err := db.SetImageOwner(contentID, root, false, "pull"); err != nil {
 		t.Fatalf("SetImageOwner: %v", err)
 	}
-	_, _, found := db.GetImageOwner(contentID)
+	_, _, _, found := db.GetImageOwner(contentID)
 	if !found {
 		t.Fatal("pre-condition failed: image record should exist before delete")
 	}
@@ -117,7 +117,7 @@ func TestBug10_DeleteImage_TagNameLeavesOrphanRecord(t *testing.T) {
 	}
 
 	// 修复后断言：content ID 记录已被清除，无孤儿
-	_, _, stillFound := db.GetImageOwner(contentID)
+	_, _, _, stillFound := db.GetImageOwner(contentID)
 	if stillFound {
 		t.Errorf(
 			"[BUG-10] orphan record persists after fixed proxy path:\n"+
@@ -157,7 +157,7 @@ func TestBug10_DeleteImage_ShortTagNameNoHexPrefix(t *testing.T) {
 		}
 	}
 
-	_, _, stillFound := db.GetImageOwner(contentID)
+	_, _, _, stillFound := db.GetImageOwner(contentID)
 	if stillFound {
 		t.Errorf(
 			"[BUG-10] orphan record persists after fixed proxy path (busybox scenario):\n"+
@@ -186,7 +186,7 @@ func TestBug10_Reg_DeleteByContentID_Succeeds(t *testing.T) {
 	}
 
 	// images 记录已删除
-	_, _, found := db.GetImageOwner(contentID)
+	_, _, _, found := db.GetImageOwner(contentID)
 	if found {
 		t.Error("[Reg-1] image record should be deleted when called with content ID")
 	}
@@ -214,7 +214,7 @@ func TestBug10_Reg_DeleteBySha256PrefixContentID_Succeeds(t *testing.T) {
 		t.Fatalf("[Reg-2] DeleteImage(sha256:...): %v", err)
 	}
 
-	_, _, found := db.GetImageOwner(rawID)
+	_, _, _, found := db.GetImageOwner(rawID)
 	if found {
 		t.Error("[Reg-2] sha256:-prefixed delete should remove the record")
 	}
@@ -239,7 +239,7 @@ func TestBug10_Reg_DeleteByShortHexID_Succeeds(t *testing.T) {
 		t.Fatalf("[Reg-3] DeleteImage(shortID=%q): %v", shortID, err)
 	}
 
-	_, _, found := db.GetImageOwner(contentID)
+	_, _, _, found := db.GetImageOwner(contentID)
 	if found {
 		t.Errorf(
 			"[Reg-3 RED] short 12-char hex ID delete failed (additional bug):\n"+
@@ -259,7 +259,7 @@ func TestBug10_Reg_DeleteNonexistentID_NoError(t *testing.T) {
 	const nonexistentID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 	// 确认记录不存在
-	_, _, found := db.GetImageOwner(nonexistentID)
+	_, _, _, found := db.GetImageOwner(nonexistentID)
 	if found {
 		t.Fatal("[Reg-4] pre-condition: record should not exist")
 	}

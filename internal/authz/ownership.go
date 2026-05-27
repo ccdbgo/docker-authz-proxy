@@ -438,21 +438,23 @@ func (o *OwnershipDB) resolveImageIDInDB(imageID string) string {
 	return ""
 }
 
-// GetImageOwner 返回镜像归属信息及是否为公共镜像
-func (o *OwnershipDB) GetImageOwner(imageID string) (*OwnerInfo, bool, bool) {
+// GetImageOwner 返回镜像归属信息及是否为公共镜像。
+// 第三个返回值 privCtx 为 images.privileged_context 字段值（0 或 1）：
+// 1 表示该镜像由 sudo 命令创建，在非特权事件流视图中不应可见。
+func (o *OwnershipDB) GetImageOwner(imageID string) (*OwnerInfo, bool, int, bool) {
 	resolvedID := o.resolveImageIDInDB(imageID)
 	if resolvedID == "" {
-		return nil, false, false
+		return nil, false, 0, false
 	}
 	var info OwnerInfo
-	var isPublicInt int
+	var isPublicInt, privCtx int
 	err := o.DB.QueryRow(
-		`SELECT owner_username, owner_uid, owner_gid, is_public, COALESCE(source, '') FROM images WHERE image_id = ?`, resolvedID,
-	).Scan(&info.Username, &info.UID, &info.GID, &isPublicInt, &info.Source)
+		`SELECT owner_username, owner_uid, owner_gid, is_public, COALESCE(source, ''), privileged_context FROM images WHERE image_id = ?`, resolvedID,
+	).Scan(&info.Username, &info.UID, &info.GID, &isPublicInt, &info.Source, &privCtx)
 	if err != nil {
-		return nil, false, false
+		return nil, false, 0, false
 	}
-	return &info, isPublicInt != 0, true
+	return &info, isPublicInt != 0, privCtx, true
 }
 
 // HasImageAccess 判断用户是否在 image_access 表中拥有对某镜像的非特权访问记录。
@@ -503,8 +505,13 @@ func (o *OwnershipDB) CanUseImage(realUID int, imageID string) bool {
 }
 
 // CanSeeImage 判断用户是否能在列表中看到某镜像（非特权查询路径）。
-// 规则：is_public=1 的镜像所有人可见；否则只有属主可见。
-// privileged_context=1 的镜像（sudo 创建）不出现在非 sudo 的列表查询结果中。
+// 规则：
+//  1. is_public=1 的镜像所有人可见；
+//  2. privileged_context=0 的镜像属主可见；
+//  3. 用户在 image_access 中有 privileged_context=0 的记录（自己做过非特权 pull）也可见；
+//     这覆盖了"先 sudo pull、后 regular pull 同一镜像"的场景：
+//     MIN 策略将 image_access.privileged_context 降为 0，用户应能在非特权列表中看到该镜像。
+//  4. privileged_context=1 的镜像（sudo 创建且未被 regular pull 覆盖）不可见。
 func (o *OwnershipDB) CanSeeImage(realUID int, imageID string) bool {
 	resolvedID := o.resolveImageIDInDB(imageID)
 	if resolvedID == "" {
@@ -514,16 +521,17 @@ func (o *OwnershipDB) CanSeeImage(realUID int, imageID string) bool {
 	err := o.DB.QueryRow(
 		`SELECT is_public, owner_uid FROM images WHERE image_id = ? AND privileged_context = 0`, resolvedID,
 	).Scan(&isPublic, &ownerUID)
-	if err != nil {
-		return false
+	if err == nil {
+		// 找到非特权镜像记录
+		if isPublic != 0 {
+			return true
+		}
+		if ownerUID == realUID {
+			return true
+		}
 	}
-	if isPublic != 0 {
-		return true
-	}
-	if ownerUID == realUID {
-		return true
-	}
-	// 用户曾经 pull 过（image_access 有记录）也可见
+	// 无论 images.privileged_context 如何，都检查 image_access：
+	// 若用户做过非特权 pull（privCtx=0 记录），则镜像在非特权列表中可见。
 	var count int
 	_ = o.DB.QueryRow(
 		`SELECT COUNT(*) FROM image_access WHERE image_id = ? AND user_uid = ? AND privileged_context = 0`,

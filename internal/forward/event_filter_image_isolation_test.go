@@ -107,7 +107,7 @@ func TestBug16_ImageEvent_LeaksToOtherUsers(t *testing.T) {
 
 	// ── RED ASSERTION A：image tag 事件不应泄漏给 bob ────────────────────
 	tagEvent := makeImageEvent("tag", sudoTestImageID, "image_sudo:test_sudo")
-	if p.eventBelongsToUser(tagEvent, bobUID3) {
+	if p.eventBelongsToUser(tagEvent, bobUID3, false) {
 		t.Errorf(
 			"BUG-16 [image tag 事件泄漏]:\n"+
 				"\tbob(uid=%d) 收到了 sudo_test(uid=%d) 的 image tag 事件\n"+
@@ -121,7 +121,7 @@ func TestBug16_ImageEvent_LeaksToOtherUsers(t *testing.T) {
 
 	// ── RED ASSERTION B：image create 事件不应泄漏给 bob ─────────────────
 	createEvent := makeImageEvent("create", sudoTestImageID, sudoTestImageID)
-	if p.eventBelongsToUser(createEvent, bobUID3) {
+	if p.eventBelongsToUser(createEvent, bobUID3, false) {
 		t.Errorf(
 			"BUG-16 [image create 事件泄漏]:\n"+
 				"\tbob(uid=%d) 收到了 sudo_test(uid=%d) 的 image create 事件\n"+
@@ -132,7 +132,7 @@ func TestBug16_ImageEvent_LeaksToOtherUsers(t *testing.T) {
 	}
 
 	// ── 正向断言：sudo_test 自己的镜像事件对 sudo_test 可见 ──────────────
-	if !p.eventBelongsToUser(tagEvent, sudoTestUID) {
+	if !p.eventBelongsToUser(tagEvent, sudoTestUID, false) {
 		t.Errorf(
 			"回归: sudo_test(uid=%d) 不应被过滤掉自己的 image tag 事件\n"+
 				"\t镜像 ID: %q",
@@ -162,7 +162,7 @@ func TestBug16_Reg1_PublicImage_VisibleToAll(t *testing.T) {
 	pullEvent := makeImageEvent("pull", publicImageID, "ubuntu:22.04")
 
 	for _, uid := range []int{bobUID3, sudoTestUID, 1001} {
-		if !p.eventBelongsToUser(pullEvent, uid) {
+		if !p.eventBelongsToUser(pullEvent, uid, false) {
 			t.Errorf(
 				"回归-1: 公共镜像事件应对 uid=%d 可见\n"+
 					"\t镜像 ID: %q\n"+
@@ -186,7 +186,7 @@ func TestBug16_Reg2_DBNotFound_Passthrough(t *testing.T) {
 	event := makeImageEvent("create", unknownID, unknownID)
 
 	for _, uid := range []int{bobUID3, sudoTestUID, 1001} {
-		if !p.eventBelongsToUser(event, uid) {
+		if !p.eventBelongsToUser(event, uid, false) {
 			t.Errorf(
 				"回归-2: DB 无记录的镜像事件应对 uid=%d 放行（不能误过滤）\n"+
 					"\t镜像 ID: %q\n"+
@@ -213,7 +213,7 @@ func TestBug16_Reg3_SymmetricIsolation(t *testing.T) {
 	bobEvent := makeImageEvent("tag", bobImageID, "bob-app:latest")
 
 	// sudo_test 不应收到 bob 的镜像事件
-	if p.eventBelongsToUser(bobEvent, sudoTestUID) {
+	if p.eventBelongsToUser(bobEvent, sudoTestUID, false) {
 		t.Errorf(
 			"回归-3 [对称隔离]: sudo_test(uid=%d) 收到了 bob(uid=%d) 的 image 事件\n"+
 				"\t镜像 ID: %q\n"+
@@ -223,7 +223,7 @@ func TestBug16_Reg3_SymmetricIsolation(t *testing.T) {
 	}
 
 	// bob 自己的镜像事件对 bob 可见
-	if !p.eventBelongsToUser(bobEvent, bobUID3) {
+	if !p.eventBelongsToUser(bobEvent, bobUID3, false) {
 		t.Errorf(
 			"回归-3: bob(uid=%d) 不应被过滤掉自己的 image 事件\n"+
 				"\t镜像 ID: %q",

@@ -127,7 +127,7 @@ func TestBug20_PullEvent_AfterPullComplete_LeaksToOtherUsers(t *testing.T) {
 	pullEvent := bug20MakePullEvent(bug20AlpineRef, "alpine")
 
 	// ── RED ASSERTION A：bob 不应收到 alice 的 pull 事件 ────────────────────
-	if p.eventBelongsToUser(pullEvent, bug20BobUID) {
+	if p.eventBelongsToUser(pullEvent, bug20BobUID, false) {
 		t.Errorf(
 			"BUG-20 [pull 完成后泄漏]:\n"+
 				"\tbob(uid=%d) 收到了 alice(uid=%d) 的 image pull 事件\n"+
@@ -141,7 +141,7 @@ func TestBug20_PullEvent_AfterPullComplete_LeaksToOtherUsers(t *testing.T) {
 	}
 
 	// ── RED ASSERTION B：charlie 同样不应收到 ───────────────────────────────
-	if p.eventBelongsToUser(pullEvent, bug20CharlieUID) {
+	if p.eventBelongsToUser(pullEvent, bug20CharlieUID, false) {
 		t.Errorf(
 			"BUG-20 [pull 完成后泄漏]: charlie(uid=%d) 收到了 alice(uid=%d) 的 pull 事件\n"+
 				"\t隔离失效对任意非拉取者均成立，不止 bob",
@@ -173,7 +173,7 @@ func TestBug20_Reg1_Alice_ReceivesOwnPullEvent_AfterComplete(t *testing.T) {
 
 	pullEvent := bug20MakePullEvent(bug20AlpineRef, "alpine")
 
-	if !p.eventBelongsToUser(pullEvent, bug20AliceUID) {
+	if !p.eventBelongsToUser(pullEvent, bug20AliceUID, false) {
 		t.Errorf(
 			"回归-1 [alice 自己的 pull 事件]: alice(uid=%d) 应能看到自己的 alpine:3.18 pull 事件\n"+
 				"\tpull 完成后归属路径应识别 alice 为拉取者",
@@ -202,14 +202,14 @@ func TestBug20_Reg2_SHA256ActorID_DBPath_Unaffected(t *testing.T) {
 	// 真实 Docker pull 事件不是这个格式，但用于验证 DB 路径不被修复破坏
 	pullEvent := makeImageEvent("pull", busyboxContentID, "busybox")
 
-	if p.eventBelongsToUser(pullEvent, bug20BobUID) {
+	if p.eventBelongsToUser(pullEvent, bug20BobUID, false) {
 		t.Errorf(
 			"回归-2 [sha256 content ID 格式]: bob(uid=%d) 不应收到 DB 中 alice 的镜像事件\n"+
 				"\t修复不得破坏 sha256 content ID 的 DB 过滤路径",
 			bug20BobUID,
 		)
 	}
-	if !p.eventBelongsToUser(pullEvent, bug20AliceUID) {
+	if !p.eventBelongsToUser(pullEvent, bug20AliceUID, false) {
 		t.Errorf(
 			"回归-2: alice(uid=%d) 应能看到自己的镜像事件（sha256 content ID，DB 路径）",
 			bug20AliceUID,
@@ -233,7 +233,7 @@ func TestBug20_Reg3_RaceWindow_PendingPullRefs_Unaffected(t *testing.T) {
 	pullEvent := bug20MakePullEvent(bug20AlpineRef, "alpine")
 
 	// bob 不应收到（路径 0b.2：pendingPullRefs 命中，ownerUID=alice ≠ bob）
-	if p.eventBelongsToUser(pullEvent, bug20BobUID) {
+	if p.eventBelongsToUser(pullEvent, bug20BobUID, false) {
 		t.Errorf(
 			"回归-3 [竞态窗口]: bob(uid=%d) 不应收到 alice(uid=%d) 的 alpine:3.18 pull 事件\n"+
 				"\tpendingPullRefs 已注册，路径 0b.2 应正确过滤",
@@ -241,7 +241,7 @@ func TestBug20_Reg3_RaceWindow_PendingPullRefs_Unaffected(t *testing.T) {
 		)
 	}
 	// alice 应收到自己的事件
-	if !p.eventBelongsToUser(pullEvent, bug20AliceUID) {
+	if !p.eventBelongsToUser(pullEvent, bug20AliceUID, false) {
 		t.Errorf(
 			"回归-3 [竞态窗口]: alice(uid=%d) 应能看到自己的 alpine:3.18 pull 事件（路径 0b.2）",
 			bug20AliceUID,
@@ -261,7 +261,7 @@ func TestBug20_Reg4_IntermediateLayer_Create_StillPassthrough(t *testing.T) {
 	createEvent := makeImageEvent("create", layerID, layerID) // name 也是 sha256
 
 	for _, uid := range []int{bug20AliceUID, bug20BobUID, bug20CharlieUID} {
-		if !p.eventBelongsToUser(createEvent, uid) {
+		if !p.eventBelongsToUser(createEvent, uid, false) {
 			t.Errorf(
 				"回归-4 [中间层 create 事件]: uid=%d 不应被过滤\n"+
 					"\t中间层 image create（sha256 name，DB 无记录）→ 路径3 放行\n"+

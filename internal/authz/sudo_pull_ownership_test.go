@@ -84,7 +84,7 @@ func TestSudoPull_FirstPull_OwnerIsSudoTestNotRoot(t *testing.T) {
 		t.Fatalf("SetImageOwner: %v", err)
 	}
 
-	owner, _, found := db.GetImageOwner(imageID)
+	owner, _, _, found := db.GetImageOwner(imageID)
 	if !found {
 		t.Fatal("image should exist after sudo_test first pull")
 	}
@@ -125,7 +125,7 @@ func TestSudoPull_SetImageOwner_UsesRealUID_NotEffectiveUID(t *testing.T) {
 		t.Fatalf("SetImageOwner: %v", err)
 	}
 
-	owner, _, found := db.GetImageOwner(imageID)
+	owner, _, _, found := db.GetImageOwner(imageID)
 	if !found {
 		t.Fatal("image should be found after sudo pull")
 	}
@@ -173,7 +173,7 @@ func TestSudoPull_Reg1_FirstPullerStaysOwner_RootPullAfter(t *testing.T) {
 		t.Fatalf("root SetImageOwner: %v", err)
 	}
 
-	owner, _, found := db.GetImageOwner(imageID)
+	owner, _, _, found := db.GetImageOwner(imageID)
 	if !found {
 		t.Fatal("[Reg-1] image not found")
 	}
@@ -205,10 +205,16 @@ func TestSudoPull_Reg2_ImageAccessRecordedWithRealUID(t *testing.T) {
 		t.Fatalf("SetImageOwner: %v", err)
 	}
 
-	// sudo_test 的 RealUID 应在 image_access 中，保证 CanSeeImage 返回 true
-	if !db.CanSeeImage(sudoTestUID, imageID) {
+	// sudo_test 的 RealUID 应在 image_access 中有记录
+	// 注意：CanSeeImage 对 privileged_context=1 的镜像在非特权视图中返回 false（正确行为）；
+	// 此处改用 HasUserImageAccess 直接验证 image_access 表存储的是 RealUID 而非 EffectiveUID(0)。
+	hasAccess, err := db.HasUserImageAccess(imageID, sudoTestUID)
+	if err != nil {
+		t.Fatalf("[Reg-2] HasUserImageAccess: %v", err)
+	}
+	if !hasAccess {
 		t.Errorf(
-			"[Reg-2] CanSeeImage(uid=%d) returned false after sudo pull\n"+
+			"[Reg-2] image_access has no record for uid=%d after sudo pull\n"+
 				"  image_access must store RealUID (%d), not EffectiveUID (0)",
 			sudoTestUID, sudoTestUID,
 		)
@@ -245,7 +251,7 @@ func TestSudoPull_Reg3_MultipleSudoPullers_FirstPullerStaysOwner(t *testing.T) {
 		t.Fatalf("sudoTest2 SetImageOwner: %v", err)
 	}
 
-	owner, _, found := db.GetImageOwner(imageID)
+	owner, _, _, found := db.GetImageOwner(imageID)
 	if !found {
 		t.Fatal("[Reg-3] image not found")
 	}
@@ -280,7 +286,7 @@ func TestSudoPull_Reg4_PublicFlagPreservedAfterSubsequentPull(t *testing.T) {
 		t.Fatalf("[Reg-4] setup SetImagePublic: %v", err)
 	}
 
-	_, prePublic, _ := db.GetImageOwner(imageID)
+	_, prePublic, _, _ := db.GetImageOwner(imageID)
 	if !prePublic {
 		t.Fatal("[Reg-4] pre-condition: image should be public after SetImagePublic")
 	}
@@ -290,7 +296,7 @@ func TestSudoPull_Reg4_PublicFlagPreservedAfterSubsequentPull(t *testing.T) {
 		t.Fatalf("[Reg-4] root subsequent pull SetImageOwner: %v", err)
 	}
 
-	_, postPublic, found := db.GetImageOwner(imageID)
+	_, postPublic, _, found := db.GetImageOwner(imageID)
 	if !found {
 		t.Fatal("[Reg-4] image should still exist after subsequent pull")
 	}
@@ -323,7 +329,7 @@ func TestSudoPull_Reg5_RegularUserPullAfterSudoPull_FirstPullerStaysOwner(t *tes
 		t.Fatalf("bob SetImageOwner: %v", err)
 	}
 
-	owner, _, found := db.GetImageOwner(imageID)
+	owner, _, _, found := db.GetImageOwner(imageID)
 	if !found {
 		t.Fatal("[Reg-5] image not found")
 	}

@@ -62,7 +62,7 @@ func TestBug8_Reg_FirstPull_RecordsCorrectOwner(t *testing.T) {
 		t.Fatalf("SetImageOwner: %v", err)
 	}
 
-	owner, isPublic, found := db.GetImageOwner(imageID)
+	owner, isPublic, _, found := db.GetImageOwner(imageID)
 	if !found {
 		t.Fatal("[Reg-1] image should be found after first pull")
 	}
@@ -96,7 +96,7 @@ func TestBug8_Reg_PullOverBuild_ShouldUpdateOwner(t *testing.T) {
 		t.Fatalf("bob pull SetImageOwner: %v", err)
 	}
 
-	owner, _, found := db.GetImageOwner(imageID)
+	owner, _, _, found := db.GetImageOwner(imageID)
 	if !found {
 		t.Fatal("[Reg-2] image not found")
 	}
@@ -123,7 +123,7 @@ func TestBug8_Reg_PullOverPull_PublicFlagNotReset(t *testing.T) {
 	_ = db.SetImageOwner(imageID, root, false, "pull")
 	_ = db.SetImagePublic(imageID, true)
 
-	preOwner, prePublic, _ := db.GetImageOwner(imageID)
+	preOwner, prePublic, _, _ := db.GetImageOwner(imageID)
 	if !prePublic {
 		t.Fatal("[Reg-4] pre-condition: image should be public")
 	}
@@ -133,7 +133,7 @@ func TestBug8_Reg_PullOverPull_PublicFlagNotReset(t *testing.T) {
 	_ = db.SetImageOwner(imageID, bob, false, "pull")
 
 	// is_public 不应被本次 pull 重置为 false
-	_, postPublic, found := db.GetImageOwner(imageID)
+	_, postPublic, _, found := db.GetImageOwner(imageID)
 	if !found {
 		t.Fatal("[Reg-4] image should still exist")
 	}
@@ -210,7 +210,7 @@ func TestBug8b_AliceCannotSeeImage_AfterRootPullThenBobPull(t *testing.T) {
 	// 无论 owner 是 root 还是 bob，is_public=0 → alice 都不应看到
 	if db.CanSeeImage(aliceUID, imageID) {
 		// 确认 owner 以便精确诊断
-		owner, isPublic, _ := db.GetImageOwner(imageID)
+		owner, isPublic, _, _ := db.GetImageOwner(imageID)
 		ownerUID := -1
 		if owner != nil {
 			ownerUID = owner.UID
@@ -271,7 +271,7 @@ func TestBug8_Reg_Sha256PrefixNormalization(t *testing.T) {
 	_ = db.SetImageOwner(withPrefix, bob, false, "pull")
 
 	// 不带前缀查询
-	owner1, _, found1 := db.GetImageOwner(rawID)
+	owner1, _, _, found1 := db.GetImageOwner(rawID)
 	if !found1 {
 		t.Error("[Reg-5] stored with sha256: prefix, but not queryable without prefix")
 	} else if owner1.UID != 1002 {
@@ -279,7 +279,7 @@ func TestBug8_Reg_Sha256PrefixNormalization(t *testing.T) {
 	}
 
 	// 带前缀查询
-	owner2, _, found2 := db.GetImageOwner(withPrefix)
+	owner2, _, _, found2 := db.GetImageOwner(withPrefix)
 	if !found2 {
 		t.Error("[Reg-5] not queryable with sha256: prefix either")
 	} else if owner2.UID != 1002 {

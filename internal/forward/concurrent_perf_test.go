@@ -684,7 +684,7 @@ func TestPerf_EventFilter_100Users(t *testing.T) {
 			ev := makeImageEvent("tag", imageID, fmt.Sprintf("testimage%d:latest", uid))
 			for i := 0; i < opsPerUser; i++ {
 				t0 := time.Now()
-				belongs := p.eventBelongsToUser(ev, uid)
+				belongs := p.eventBelongsToUser(ev, uid, false)
 				stat.record(time.Since(t0))
 				if belongs {
 					atomic.AddInt64(&matchCount, 1)

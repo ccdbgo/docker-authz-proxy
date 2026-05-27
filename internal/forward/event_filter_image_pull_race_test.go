@@ -94,7 +94,7 @@ func TestBug19_ImagePullRace_PullEventLeaksWhenDBEmpty(t *testing.T) {
 	pullEvent := makeImageEvent("pull", pullRaceImageID, pullRaceImageRef)
 
 	// ── RED ASSERTION A：image pull 事件不应泄漏给 bob ──────────────────
-	if p.eventBelongsToUser(pullEvent, pullRaceBobUID) {
+	if p.eventBelongsToUser(pullEvent, pullRaceBobUID, false) {
 		t.Errorf(
 			"BUG-19 [image pull 竞态泄漏]:\n"+
 				"\tbob(uid=%d) 收到了 alice(uid=%d) 的 image pull 事件\n"+
@@ -106,7 +106,7 @@ func TestBug19_ImagePullRace_PullEventLeaksWhenDBEmpty(t *testing.T) {
 	}
 
 	// ── RED ASSERTION B：charlie 同样不应收到 ────────────────────────────
-	if p.eventBelongsToUser(pullEvent, 1003) {
+	if p.eventBelongsToUser(pullEvent, 1003, false) {
 		t.Errorf(
 			"BUG-19 [竞态泄漏]: charlie(uid=1003) 收到了 alice 的 image pull 事件\n"+
 				"\t隔离失效对任意非拉取者均成立",
@@ -128,7 +128,7 @@ func TestBug19_Reg1_Puller_ReceivesOwnPullEvent(t *testing.T) {
 
 	pullEvent := makeImageEvent("pull", pullRaceImageID, pullRaceImageRef)
 
-	if !p.eventBelongsToUser(pullEvent, pullRaceAliceUID) {
+	if !p.eventBelongsToUser(pullEvent, pullRaceAliceUID, false) {
 		t.Errorf(
 			"回归-1: alice(uid=%d) 应能看到自己的 image pull 事件\n"+
 				"\tpendingPullRefs[%q]=%d → uid 匹配 → return true",
@@ -151,14 +151,14 @@ func TestBug19_Reg2_AfterPullComplete_DBFiltersCorrectly(t *testing.T) {
 
 	pullEvent := makeImageEvent("pull", pullRaceImageID, pullRaceImageRef)
 
-	if p.eventBelongsToUser(pullEvent, pullRaceBobUID) {
+	if p.eventBelongsToUser(pullEvent, pullRaceBobUID, false) {
 		t.Errorf(
 			"回归-2: bob(uid=%d) 不应收到 DB 已注册的 alice(uid=%d) image pull 事件\n"+
 				"\tBUG-16 的 DB 过滤路径应继续正确工作",
 			pullRaceBobUID, pullRaceAliceUID,
 		)
 	}
-	if !p.eventBelongsToUser(pullEvent, pullRaceAliceUID) {
+	if !p.eventBelongsToUser(pullEvent, pullRaceAliceUID, false) {
 		t.Errorf(
 			"回归-2: alice(uid=%d) 应收到自己的 image pull 事件（DB 路径）",
 			pullRaceAliceUID,
@@ -182,14 +182,14 @@ func TestBug19_Reg3_NonLatestTag_MatchesCorrectly(t *testing.T) {
 
 	event := makeImageEvent("pull", nginxID, nginxRef)
 
-	if p.eventBelongsToUser(event, pullRaceBobUID) {
+	if p.eventBelongsToUser(event, pullRaceBobUID, false) {
 		t.Errorf(
 			"回归-3 [非 latest tag]: bob(uid=%d) 收到了 alice 的 nginx:1.25.3 pull 事件\n"+
 				"\tpendingPullRefs[%q] 应保护该事件",
 			pullRaceBobUID, nginxRef,
 		)
 	}
-	if !p.eventBelongsToUser(event, pullRaceAliceUID) {
+	if !p.eventBelongsToUser(event, pullRaceAliceUID, false) {
 		t.Errorf(
 			"回归-3: alice(uid=%d) 应能看到自己的 nginx:1.25.3 pull 事件",
 			pullRaceAliceUID,
@@ -211,7 +211,7 @@ func TestBug19_Reg4_Sha256ImageCreate_StillPassthrough(t *testing.T) {
 	createEvent := makeImageEvent("create", pullRaceImageID, pullRaceImageID)
 
 	for _, uid := range []int{pullRaceBobUID, pullRaceAliceUID, 1003} {
-		if !p.eventBelongsToUser(createEvent, uid) {
+		if !p.eventBelongsToUser(createEvent, uid, false) {
 			t.Errorf(
 				"回归-4: uid=%d 不应被过滤 image create sha256 事件（路径0 不生效）\n"+
 					"\timageID=%q  name=%q（sha256 前缀，路径0 跳过 → 路径3 放行）\n"+
@@ -299,7 +299,7 @@ func TestBug_PullEvent_ActorIDHasTag_NameHasNoTag(t *testing.T) {
 	// 真实 Docker 事件格式：Actor.ID=完整 ref，attrs["name"]=仓库名（无 tag）
 	event := makeImageEvent("pull", fullRef, "alpine")
 
-	if p.eventBelongsToUser(event, pullRaceBobUID) {
+	if p.eventBelongsToUser(event, pullRaceBobUID, false) {
 		t.Errorf(
 			"[pull tag 泄漏]: bob(uid=%d) 收到了 alice(uid=%d) 的 image pull 事件\n"+
 				"\tActor.ID=%q  attrs[\"name\"]=%q  pendingPullRefs key=%q\n"+
@@ -307,7 +307,7 @@ func TestBug_PullEvent_ActorIDHasTag_NameHasNoTag(t *testing.T) {
 			pullRaceBobUID, pullRaceAliceUID, fullRef, "alpine", fullRef,
 		)
 	}
-	if !p.eventBelongsToUser(event, pullRaceAliceUID) {
+	if !p.eventBelongsToUser(event, pullRaceAliceUID, false) {
 		t.Errorf(
 			"alice(uid=%d) 应能看到自己的 alpine:3.18 pull 事件（路径0b.2 命中）",
 			pullRaceAliceUID,
@@ -331,13 +331,13 @@ func TestBug_PullEvent_ActorIDHasTag_Reg_Latest(t *testing.T) {
 	// 真实 Docker 事件：Actor.ID="busybox:latest", attrs["name"]="busybox"
 	event := makeImageEvent("pull", "busybox:latest", "busybox")
 
-	if p.eventBelongsToUser(event, pullRaceBobUID) {
+	if p.eventBelongsToUser(event, pullRaceBobUID, false) {
 		t.Errorf(
 			"回归 [latest tag]: bob(uid=%d) 不应收到 alice 的 busybox pull 事件",
 			pullRaceBobUID,
 		)
 	}
-	if !p.eventBelongsToUser(event, pullRaceAliceUID) {
+	if !p.eventBelongsToUser(event, pullRaceAliceUID, false) {
 		t.Errorf(
 			"回归 [latest tag]: alice(uid=%d) 应收到自己的 busybox pull 事件",
 			pullRaceAliceUID,

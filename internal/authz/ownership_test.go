@@ -104,7 +104,7 @@ func TestOwnershipDB_ImageSetGet(t *testing.T) {
 		t.Fatalf("SetImageOwner: %v", err)
 	}
 
-	owner, isPublic, found := db.GetImageOwner("sha256:img1")
+	owner, isPublic, _, found := db.GetImageOwner("sha256:img1")
 	if !found {
 		t.Fatal("image not found")
 	}
@@ -122,7 +122,7 @@ func TestOwnershipDB_ImagePublic(t *testing.T) {
 
 	_ = db.SetImageOwner("sha256:pub", root, true, "pull")
 
-	_, isPublic, found := db.GetImageOwner("sha256:pub")
+	_, isPublic, _, found := db.GetImageOwner("sha256:pub")
 	if !found {
 		t.Fatal("image not found")
 	}
@@ -140,7 +140,7 @@ func TestOwnershipDB_ImageDelete(t *testing.T) {
 		t.Fatalf("DeleteImage: %v", err)
 	}
 
-	_, _, found := db.GetImageOwner("sha256:del-img")
+	_, _, _, found := db.GetImageOwner("sha256:del-img")
 	if found {
 		t.Error("image should be gone after delete")
 	}
@@ -218,7 +218,7 @@ func TestCanUseImage_MultipleUsers(t *testing.T) {
 		t.Error("charlie should NOT be able to use image he never pulled")
 	}
 
-	owner, _, found := db.GetImageOwner("sha256:shared-img")
+	owner, _, _, found := db.GetImageOwner("sha256:shared-img")
 	if !found {
 		t.Fatal("image not found")
 	}
@@ -238,13 +238,13 @@ func TestMarkImagePublic(t *testing.T) {
 		t.Fatalf("MarkImagePublic: %v", err)
 	}
 
-	_, isPublic, _ := db.GetImageOwner("sha256:priv-img")
+	_, isPublic, _, _ := db.GetImageOwner("sha256:priv-img")
 	if !isPublic {
 		t.Error("image should be public after MarkImagePublic(true)")
 	}
 
 	_ = db.MarkImagePublic("sha256:priv-img", false)
-	_, isPublic, _ = db.GetImageOwner("sha256:priv-img")
+	_, isPublic, _, _ = db.GetImageOwner("sha256:priv-img")
 	if isPublic {
 		t.Error("image should be private after MarkImagePublic(false)")
 	}

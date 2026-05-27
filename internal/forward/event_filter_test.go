@@ -27,7 +27,7 @@ import (
 // 需要测试 image 事件隔离时请直接使用 ProxyServer.eventBelongsToUser 并传入真实 DB。
 func eventBelongsToUser(line []byte, uid int) bool {
 	p := &ProxyServer{}
-	return p.eventBelongsToUser(line, uid)
+	return p.eventBelongsToUser(line, uid, false)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

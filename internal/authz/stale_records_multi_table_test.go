@@ -623,7 +623,7 @@ func TestBug14_DeleteImage_TagName_AlsoLeaksImageAccess(t *testing.T) {
 	}
 
 	// images 表已清除
-	_, _, imagesFound := db.GetImageOwner(contentID)
+	_, _, _, imagesFound := db.GetImageOwner(contentID)
 
 	// image_access 也已级联清除（BUG-14 验证点）
 	refCountAfter, _ := db.GetImageRefCount(contentID)
@@ -655,7 +655,7 @@ func TestBug14_DeleteImage_ContentID_CascadesImageAccess(t *testing.T) {
 		t.Fatalf("[BUG-14-2] DeleteImage(sha256:...): %v", err)
 	}
 
-	_, _, imagesFound := db.GetImageOwner(contentID)
+	_, _, _, imagesFound := db.GetImageOwner(contentID)
 	refCount, _ := db.GetImageRefCount(contentID)
 
 	if imagesFound {
@@ -690,7 +690,7 @@ func TestBug14_Reg_DeleteImage_CascadesAccessRecords(t *testing.T) {
 
 	_ = db.DeleteImage(contentID)
 
-	_, _, imgFound := db.GetImageOwner(contentID)
+	_, _, _, imgFound := db.GetImageOwner(contentID)
 	if imgFound {
 		t.Error("[Reg-14-1] images record should be deleted")
 	}
@@ -726,7 +726,7 @@ func TestBug14_Reg_VirtualDelete_OnlyRemovesAccessNotOwnership(t *testing.T) {
 	}
 
 	// images 记录仍应存在（root 仍是属主）
-	_, _, imgFound := db.GetImageOwner(contentID)
+	_, _, _, imgFound := db.GetImageOwner(contentID)
 	if !imgFound {
 		t.Error("[Reg-14-2] images record must persist after virtual delete (owner still holds it)")
 	}
@@ -782,7 +782,7 @@ func TestBug14_Reg_PublicImageDelete_AllAccessRecordsCleared(t *testing.T) {
 
 	_ = db.DeleteImage(contentID)
 
-	_, _, imgFound := db.GetImageOwner(contentID)
+	_, _, _, imgFound := db.GetImageOwner(contentID)
 	if imgFound {
 		t.Error("[Reg-14-4] public image record should be deleted")
 	}

@@ -271,7 +271,7 @@ func TestBug5_Reg3_NonOwner_WithAccess_VirtualDelete_Returns200(t *testing.T) {
 	}
 
 	// 公共镜像本体不应被删（root 仍是属主）
-	_, _, found := p.db.GetImageOwner(bug5ImageFullHex)
+	_, _, _, found := p.db.GetImageOwner(bug5ImageFullHex)
 	if !found {
 		t.Errorf("[BUG-5 Reg3] 虚拟删除不应从 DB 删除公共镜像所有权记录（root 仍是属主）")
 	}

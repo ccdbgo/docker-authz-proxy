@@ -207,7 +207,7 @@ func TestOwnershipDB_SetImageOwner_Idempotent(t *testing.T) {
 		t.Fatalf("second SetImageOwner: %v", err)
 	}
 
-	owner, _, found := db.GetImageOwner("sha256:img-1")
+	owner, _, _, found := db.GetImageOwner("sha256:img-1")
 	if !found {
 		t.Fatal("image not found")
 	}
