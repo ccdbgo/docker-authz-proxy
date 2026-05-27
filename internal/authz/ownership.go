@@ -44,37 +44,41 @@ func NewOwnershipDB(path string) (*OwnershipDB, error) {
 func initSchema(db *sql.DB) error {
 	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS containers (
-			id             TEXT PRIMARY KEY,
-			owner_username TEXT NOT NULL,
-			owner_uid      INT  NOT NULL,
-			owner_gid      INT  NOT NULL,
-			image_id       TEXT DEFAULT '',
-			created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
+			id                 TEXT PRIMARY KEY,
+			owner_username     TEXT NOT NULL,
+			owner_uid          INT  NOT NULL,
+			owner_gid          INT  NOT NULL,
+			image_id           TEXT DEFAULT '',
+			privileged_context INTEGER NOT NULL DEFAULT 0,
+			created_at         DATETIME DEFAULT CURRENT_TIMESTAMP
 		);
 
 		CREATE TABLE IF NOT EXISTS images (
-			image_id       TEXT PRIMARY KEY,
-			owner_username TEXT NOT NULL,
-			owner_uid      INT  NOT NULL,
-			owner_gid      INT  NOT NULL,
-			is_public      INTEGER DEFAULT 0,
-			source         TEXT,
-			created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
+			image_id           TEXT PRIMARY KEY,
+			owner_username     TEXT NOT NULL,
+			owner_uid          INT  NOT NULL,
+			owner_gid          INT  NOT NULL,
+			is_public          INTEGER DEFAULT 0,
+			privileged_context INTEGER NOT NULL DEFAULT 0,
+			source             TEXT,
+			created_at         DATETIME DEFAULT CURRENT_TIMESTAMP
 		);
 
 		CREATE TABLE IF NOT EXISTS image_access (
-			image_id TEXT NOT NULL,
-			user_uid INT  NOT NULL,
+			image_id           TEXT NOT NULL,
+			user_uid           INT  NOT NULL,
+			privileged_context INTEGER NOT NULL DEFAULT 0,
 			PRIMARY KEY (image_id, user_uid)
 		);
 
 		CREATE TABLE IF NOT EXISTS networks (
-			network_id     TEXT PRIMARY KEY,
-			name           TEXT NOT NULL,
-			owner_uid      INT  NOT NULL,
-			owner_username TEXT NOT NULL,
-			is_shared      INTEGER DEFAULT 0,
-			created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
+			network_id         TEXT PRIMARY KEY,
+			name               TEXT NOT NULL,
+			owner_uid          INT  NOT NULL,
+			owner_username     TEXT NOT NULL,
+			is_shared          INTEGER DEFAULT 0,
+			privileged_context INTEGER NOT NULL DEFAULT 0,
+			created_at         DATETIME DEFAULT CURRENT_TIMESTAMP
 		);
 
 		CREATE TABLE IF NOT EXISTS network_access (
@@ -84,10 +88,11 @@ func initSchema(db *sql.DB) error {
 		);
 
 		CREATE TABLE IF NOT EXISTS volumes (
-			name           TEXT PRIMARY KEY,
-			owner_uid      INT  NOT NULL,
-			owner_username TEXT NOT NULL,
-			created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
+			name               TEXT PRIMARY KEY,
+			owner_uid          INT  NOT NULL,
+			owner_username     TEXT NOT NULL,
+			privileged_context INTEGER NOT NULL DEFAULT 0,
+			created_at         DATETIME DEFAULT CURRENT_TIMESTAMP
 		);
 
 		-- 端口映射记录表：全局唯一（host_port + protocol 组合唯一）
@@ -233,20 +238,31 @@ func initSchema(db *sql.DB) error {
 		created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
 	)`)
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_swarm_configs_owner ON swarm_configs(owner_uid)`)
+	// 迁移：为旧数据库添加 privileged_context 列（幂等；sqlite ALTER TABLE 忽略已存在列）
+	_, _ = db.Exec(`ALTER TABLE containers  ADD COLUMN privileged_context INTEGER NOT NULL DEFAULT 0`)
+	_, _ = db.Exec(`ALTER TABLE images      ADD COLUMN privileged_context INTEGER NOT NULL DEFAULT 0`)
+	_, _ = db.Exec(`ALTER TABLE image_access ADD COLUMN privileged_context INTEGER NOT NULL DEFAULT 0`)
+	_, _ = db.Exec(`ALTER TABLE networks    ADD COLUMN privileged_context INTEGER NOT NULL DEFAULT 0`)
+	_, _ = db.Exec(`ALTER TABLE volumes     ADD COLUMN privileged_context INTEGER NOT NULL DEFAULT 0`)
 	return nil
 }
 
 // ── 容器归属 ────────────────────────────────────────────────
 
 func (o *OwnershipDB) SetContainerOwner(id string, identity *auth.CallerIdentity, imageID string) error {
+	privCtx := 0
+	if identity.IsSudoCommand() {
+		privCtx = 1
+	}
 	_, err := o.DB.Exec(
-		`INSERT OR REPLACE INTO containers(id, owner_username, owner_uid, owner_gid, image_id, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
+		`INSERT OR REPLACE INTO containers(id, owner_username, owner_uid, owner_gid, image_id, privileged_context, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		id,
 		identity.RealUsername,
 		identity.RealUID,
 		identity.RealGID,
 		imageID,
+		privCtx,
 		time.Now().UTC(),
 	)
 	if err != nil {
@@ -304,9 +320,10 @@ func (o *OwnershipDB) CountAccessibleImages(uid int) (int, error) {
 	return count, err
 }
 
-// GetContainerIDsByOwner 返回某用户拥有的所有容器 ID
+// GetContainerIDsByOwner 返回某用户在非特权上下文中拥有的所有容器 ID。
+// privileged_context=1 的容器（sudo 创建）不出现在非 sudo 的列表查询中。
 func (o *OwnershipDB) GetContainerIDsByOwner(uid int) ([]string, error) {
-	rows, err := o.DB.Query(`SELECT id FROM containers WHERE owner_uid = ?`, uid)
+	rows, err := o.DB.Query(`SELECT id FROM containers WHERE owner_uid = ? AND privileged_context = 0`, uid)
 	if err != nil {
 		return nil, err
 	}
@@ -350,30 +367,40 @@ func (o *OwnershipDB) SetImageOwner(imageID string, identity *auth.CallerIdentit
 	if isPublic {
 		publicInt = 1
 	}
+	privCtx := 0
+	if identity.IsSudoCommand() {
+		privCtx = 1
+	}
 	_, err := o.DB.Exec(
-		`INSERT INTO images(image_id, owner_username, owner_uid, owner_gid, is_public, source, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO images(image_id, owner_username, owner_uid, owner_gid, is_public, privileged_context, source, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(image_id) DO UPDATE SET
-		     owner_username = excluded.owner_username,
-		     owner_uid      = excluded.owner_uid,
-		     owner_gid      = excluded.owner_gid,
-		     source         = excluded.source,
-		     created_at     = excluded.created_at
+		     owner_username     = excluded.owner_username,
+		     owner_uid          = excluded.owner_uid,
+		     owner_gid          = excluded.owner_gid,
+		     privileged_context = excluded.privileged_context,
+		     source             = excluded.source,
+		     created_at         = excluded.created_at
 		 WHERE images.source = 'build' AND excluded.source = 'pull'`,
 		imageID,
 		identity.RealUsername,
 		identity.RealUID,
 		identity.RealGID,
 		publicInt,
+		privCtx,
 		source,
 		time.Now().UTC(),
 	)
 	if err != nil {
 		return err
 	}
+	// 使用 MIN 策略：一旦存在非特权访问记录（privCtx=0），后续 sudo pull 不会将其提升回 1；
+	// 反之，sudo pull 后再 regular pull，会将记录从 1 降为 0，使镜像在非特权列表中重新可见。
 	_, err = o.DB.Exec(
-		`INSERT OR IGNORE INTO image_access(image_id, user_uid) VALUES (?, ?)`,
-		imageID, identity.RealUID,
+		`INSERT INTO image_access(image_id, user_uid, privileged_context) VALUES (?, ?, ?)
+		 ON CONFLICT(image_id, user_uid) DO UPDATE SET
+		     privileged_context = MIN(image_access.privileged_context, excluded.privileged_context)`,
+		imageID, identity.RealUID, privCtx,
 	)
 	return err
 }
@@ -428,8 +455,10 @@ func (o *OwnershipDB) GetImageOwner(imageID string) (*OwnerInfo, bool, bool) {
 	return &info, isPublicInt != 0, true
 }
 
-// HasImageAccess 判断用户是否在 image_access 表中拥有对某镜像的显式访问记录。
+// HasImageAccess 判断用户是否在 image_access 表中拥有对某镜像的非特权访问记录。
 // 用于 eventBelongsToUser 路径 2.5：镜像属于他人但当前用户曾经 pull 过。
+// 仅检查 privileged_context=0 的记录：sudo pull 建立的记录不视为非特权访问，
+// 避免 sudo 上下文的 pull 事件泄漏到同一用户的非 sudo 事件流。
 func (o *OwnershipDB) HasImageAccess(imageID string, uid int) bool {
 	imageID = normalizeImageID(imageID)
 	if imageID == "" {
@@ -437,7 +466,7 @@ func (o *OwnershipDB) HasImageAccess(imageID string, uid int) bool {
 	}
 	var count int
 	_ = o.DB.QueryRow(
-		`SELECT COUNT(*) FROM image_access WHERE image_id = ? AND user_uid = ?`,
+		`SELECT COUNT(*) FROM image_access WHERE image_id = ? AND user_uid = ? AND privileged_context = 0`,
 		imageID, uid,
 	).Scan(&count)
 	return count > 0
@@ -473,8 +502,9 @@ func (o *OwnershipDB) CanUseImage(realUID int, imageID string) bool {
 	return count > 0
 }
 
-// CanSeeImage 判断用户是否能在列表中看到某镜像
-// 规则：is_public=1 的镜像所有人可见；否则只有属主可见
+// CanSeeImage 判断用户是否能在列表中看到某镜像（非特权查询路径）。
+// 规则：is_public=1 的镜像所有人可见；否则只有属主可见。
+// privileged_context=1 的镜像（sudo 创建）不出现在非 sudo 的列表查询结果中。
 func (o *OwnershipDB) CanSeeImage(realUID int, imageID string) bool {
 	resolvedID := o.resolveImageIDInDB(imageID)
 	if resolvedID == "" {
@@ -482,7 +512,7 @@ func (o *OwnershipDB) CanSeeImage(realUID int, imageID string) bool {
 	}
 	var isPublic, ownerUID int
 	err := o.DB.QueryRow(
-		`SELECT is_public, owner_uid FROM images WHERE image_id = ?`, resolvedID,
+		`SELECT is_public, owner_uid FROM images WHERE image_id = ? AND privileged_context = 0`, resolvedID,
 	).Scan(&isPublic, &ownerUID)
 	if err != nil {
 		return false
@@ -496,7 +526,7 @@ func (o *OwnershipDB) CanSeeImage(realUID int, imageID string) bool {
 	// 用户曾经 pull 过（image_access 有记录）也可见
 	var count int
 	_ = o.DB.QueryRow(
-		`SELECT COUNT(*) FROM image_access WHERE image_id = ? AND user_uid = ?`,
+		`SELECT COUNT(*) FROM image_access WHERE image_id = ? AND user_uid = ? AND privileged_context = 0`,
 		resolvedID, realUID,
 	).Scan(&count)
 	return count > 0
@@ -675,10 +705,14 @@ func (o *OwnershipDB) IsImagePublic(imageID string) (bool, error) {
 
 // SetNetworkOwner 记录网络归属
 func (o *OwnershipDB) SetNetworkOwner(networkID, name string, identity *auth.CallerIdentity) error {
+	privCtx := 0
+	if identity.IsSudoCommand() {
+		privCtx = 1
+	}
 	_, err := o.DB.Exec(
-		`INSERT OR REPLACE INTO networks(network_id, name, owner_uid, owner_username, is_shared, created_at)
-		 VALUES (?, ?, ?, ?, 0, ?)`,
-		networkID, name, identity.RealUID, identity.RealUsername, time.Now().UTC(),
+		`INSERT OR REPLACE INTO networks(network_id, name, owner_uid, owner_username, is_shared, privileged_context, created_at)
+		 VALUES (?, ?, ?, ?, 0, ?, ?)`,
+		networkID, name, identity.RealUID, identity.RealUsername, privCtx, time.Now().UTC(),
 	)
 	return err
 }
@@ -780,10 +814,12 @@ func (o *OwnershipDB) GetNetworkIDsByOwner(uid int) ([]string, error) {
 	return ids, rows.Err()
 }
 
-// GetAccessibleNetworkIDs 返回用户可访问的所有网络 ID
+// GetAccessibleNetworkIDs 返回用户在非特权上下文中可访问的所有网络 ID。
+// privileged_context=1 的网络（sudo 创建）不出现在非 sudo 的列表查询中。
+// network_access 表由管理员授权写入，不区分特权上下文，始终可见。
 func (o *OwnershipDB) GetAccessibleNetworkIDs(uid int) ([]string, error) {
 	rows, err := o.DB.Query(`
-		SELECT network_id FROM networks WHERE owner_uid = ?
+		SELECT network_id FROM networks WHERE owner_uid = ? AND privileged_context = 0
 		UNION
 		SELECT network_id FROM network_access WHERE user_uid = ?
 	`, uid, uid)
@@ -806,10 +842,14 @@ func (o *OwnershipDB) GetAccessibleNetworkIDs(uid int) ([]string, error) {
 
 // SetVolumeOwner 记录 Volume 归属
 func (o *OwnershipDB) SetVolumeOwner(name string, identity *auth.CallerIdentity) error {
+	privCtx := 0
+	if identity.IsSudoCommand() {
+		privCtx = 1
+	}
 	_, err := o.DB.Exec(
-		`INSERT OR REPLACE INTO volumes(name, owner_uid, owner_username, created_at)
-		 VALUES (?, ?, ?, ?)`,
-		name, identity.RealUID, identity.RealUsername, time.Now().UTC(),
+		`INSERT OR REPLACE INTO volumes(name, owner_uid, owner_username, privileged_context, created_at)
+		 VALUES (?, ?, ?, ?, ?)`,
+		name, identity.RealUID, identity.RealUsername, privCtx, time.Now().UTC(),
 	)
 	return err
 }
@@ -854,9 +894,10 @@ func (o *OwnershipDB) GetAllVolumeNames() ([]string, error) {
 	return names, rows.Err()
 }
 
-// GetVolumeNamesByOwner 返回用户拥有的所有 Volume 名称
+// GetVolumeNamesByOwner 返回用户在非特权上下文中拥有的所有 Volume 名称。
+// privileged_context=1 的 volume（sudo 创建）不出现在非 sudo 的列表查询中。
 func (o *OwnershipDB) GetVolumeNamesByOwner(uid int) ([]string, error) {
-	rows, err := o.DB.Query(`SELECT name FROM volumes WHERE owner_uid = ?`, uid)
+	rows, err := o.DB.Query(`SELECT name FROM volumes WHERE owner_uid = ? AND privileged_context = 0`, uid)
 	if err != nil {
 		return nil, err
 	}

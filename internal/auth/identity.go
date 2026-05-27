@@ -90,6 +90,24 @@ func (id *CallerIdentity) IsPrivileged() bool {
 	return id.RealUID == 0 || id.UserType == UserTypeSudo
 }
 
+// IsSudoCommand 返回 true 表示当前命令由 sudo 用户以特权模式执行（UserTypeSudo）。
+//
+// 与 IsPrivileged() 语义不同：
+//   - IsPrivileged()  → 读路径决策：是否跳过资源隔离过滤
+//   - IsSudoCommand() → 写路径决策：创建资源时是否打上特权上下文标记（privileged_context=1）
+//
+// 只有 UserTypeSudo 需要此标记，原因：
+//   - UserTypeRoot：owner_uid=0，天然与普通用户隔离，filter 对 root 全走短路，无需标记
+//   - UserTypeRegular：Linux 本身阻止普通用户执行 sudo，无需检查
+//   - UserTypeSudo：sudo_test 的 sudo/非sudo 调用 RealUID 相同，必须靠此标记区分
+//
+// 示例：
+//   sudo docker pull  → UserTypeSudo  → IsSudoCommand()=true  → privileged_context=1
+//   docker image ls   → UserTypeRegular → IsSudoCommand()=false → 查询过滤 privileged_context=0
+func (id *CallerIdentity) IsSudoCommand() bool {
+	return id.UserType == UserTypeSudo
+}
+
 // compoundGroups 是 docker CLI 复合命令组名集合。
 // 这些命令以 "docker <group> <subcommand>" 形式调用，parseDockerCommand 会返回 "group/subcommand"。
 var compoundGroups = map[string]bool{
