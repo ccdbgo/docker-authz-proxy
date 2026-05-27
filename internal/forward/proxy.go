@@ -1981,6 +1981,14 @@ const pullEventDeliveryGrace = 30 * time.Second
 // 30s 提供足够的余量，与 pullEventDeliveryGrace 保持一致。
 const pruneEventDeliveryGrace = 30 * time.Second
 
+// pruneOwnerInfo 是 completedPruneOwner sync.Map 的值类型。
+// 记录 prune 删除时的属主 UID 和 privileged_context，
+// 供竞态窗口内 eventBelongsToUser 同时做属主和 privCtx 隔离判断。
+type pruneOwnerInfo struct {
+	ownerUID int
+	privCtx  int
+}
+
 // eventBelongsToUser 判断一行 docker events JSON 是否属于指定 uid 的用户。
 // 过滤规则：
 //   - volume 事件：通过卷名前缀 user-{uid}-volume-* 判断（卷 API 不支持自定义 Attributes 标签）
@@ -2063,7 +2071,17 @@ func (p *ProxyServer) eventBelongsToUser(line []byte, uid int, sudoCtx bool) boo
 				continue // digits 段为空或末尾无 _，不是有效 uid 段
 			}
 			foundUID := name[i+2 : j]
-			return foundUID == uidStr // 路径 2：匹配→true，不匹配→false
+			if foundUID != uidStr {
+				return false // 路径 2（不匹配）：他人网络
+			}
+			// 路径 2（匹配）：本用户网络，非 sudo 视图时检查 privileged_context。
+			// DB 无记录（如 prune 已删）时 found=false，不隐藏，让属主看到自己的 prune 事件。
+			if !sudoCtx && p.db != nil {
+				if privCtx, found := p.db.GetNetworkPrivCtxByName(name); found && privCtx == 1 {
+					return false
+				}
+			}
+			return true
 		}
 		return true // 路径 3：无 _u{digits}_ 段，系统内置网络，放行
 	}
@@ -2085,7 +2103,14 @@ func (p *ProxyServer) eventBelongsToUser(line []byte, uid int, sudoCtx bool) boo
 		}
 		ownPrefix := "user-" + uidStr + "-volume-"
 		if strings.HasPrefix(name, ownPrefix) {
-			return true // 路径 1：属于本用户
+			// 路径 1：属于本用户，非 sudo 视图时检查 privileged_context。
+			// DB 无记录（prune 已删除）时 found=false，不隐藏，让属主看到自己的 prune 事件。
+			if !sudoCtx && p.db != nil {
+				if privCtx, found := p.db.GetVolumePrivCtx(name); found && privCtx == 1 {
+					return false
+				}
+			}
+			return true
 		}
 		// 路径 2 / 路径 3：判断是否为其他用户的合法具名卷
 		if strings.HasPrefix(name, "user-") {
@@ -2100,8 +2125,8 @@ func (p *ProxyServer) eventBelongsToUser(line []byte, uid int, sudoCtx bool) boo
 		}
 		// 路径 prune：DB 记录已被 prune 删除，但事件尚在投递中（竞态补偿）
 		if v, ok := p.completedPruneOwner.Load("volume:" + name); ok {
-			if ownerUID, ok := v.(int); ok {
-				return ownerUID == uid
+			if entry, ok := v.(pruneOwnerInfo); ok {
+				return entry.ownerUID == uid
 			}
 		}
 		return true // 路径 3：系统卷或格式不合法，放行
@@ -2201,8 +2226,14 @@ func (p *ProxyServer) eventBelongsToUser(line []byte, uid int, sudoCtx bool) boo
 			}
 			// 路径 3：DB 无记录，先检查 completedPruneOwner 竞态补偿窗口
 			if v, ok := p.completedPruneOwner.Load("image:" + imageID); ok {
-				if ownerUID, ok := v.(int); ok {
-					return ownerUID == uid
+				if entry, ok := v.(pruneOwnerInfo); ok {
+					if entry.ownerUID != uid {
+						return false
+					}
+					if !sudoCtx && entry.privCtx == 1 {
+						return false
+					}
+					return true
 				}
 			}
 		}
@@ -2211,7 +2242,17 @@ func (p *ProxyServer) eventBelongsToUser(line []byte, uid int, sudoCtx bool) boo
 
 	// 其他事件：通过 system.authz.owner.uid 或 user_id 判断
 	if v, ok := attrs["system.authz.owner.uid"]; ok {
-		return v == uidStr
+		if v != uidStr {
+			return false
+		}
+		// 非 sudo 视图时过滤 sudo 创建的容器事件，与 docker ps 的 LabelCallerType 守卫对齐。
+		// LabelCallerType 由 InjectSystemLabels 在容器创建时注入（值 “sudo”/“regular”），
+		// 出现在 Docker 事件 Attributes 中，无需 DB 查询。
+		// 遗留容器（代理上线前创建，无此标签）：GetLastLabelValue("") == "" != "sudo"，正常放行。
+		if !sudoCtx && isolation.GetLastLabelValue(attrs[isolation.LabelCallerType]) == "sudo" {
+			return false
+		}
+		return true
 	}
 	if v, ok := attrs["user_id"]; ok {
 		return v == uidStr
@@ -5534,10 +5575,10 @@ func (p *ProxyServer) handleVolumePrune(w http.ResponseWriter, r *http.Request, 
 		if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
 			// 竞态补偿：先存 completedPruneOwner，再删 DB，确保事件到达时可查属主
 			pruneKey := "volume:" + volName
-			ownerUID := id.RealUID
-			p.completedPruneOwner.Store(pruneKey, ownerUID)
+			entry := pruneOwnerInfo{ownerUID: id.RealUID, privCtx: 0}
+			p.completedPruneOwner.Store(pruneKey, entry)
 			time.AfterFunc(pruneEventDeliveryGrace, func() {
-				p.completedPruneOwner.CompareAndDelete(pruneKey, ownerUID)
+				p.completedPruneOwner.CompareAndDelete(pruneKey, entry)
 			})
 			_ = p.db.DeleteVolume(volName)
 			// 普通用户：剥离 user-{uid}-volume- 前缀，还原用户可见名称
@@ -5708,10 +5749,10 @@ func (p *ProxyServer) handleContainerPrune(w http.ResponseWriter, id *auth.Calle
 			// 竞态补偿：container 事件通过 Attributes 中的 owner uid 判断，DB 删除不影响过滤；
 			// 但仍存入 completedPruneOwner 以应对未来格式变化或缺少 Attributes 的场景。
 			pruneKey := "container:" + cid
-			ownerUID := id.RealUID
-			p.completedPruneOwner.Store(pruneKey, ownerUID)
+			entry := pruneOwnerInfo{ownerUID: id.RealUID, privCtx: 0}
+			p.completedPruneOwner.Store(pruneKey, entry)
 			time.AfterFunc(pruneEventDeliveryGrace, func() {
-				p.completedPruneOwner.CompareAndDelete(pruneKey, ownerUID)
+				p.completedPruneOwner.CompareAndDelete(pruneKey, entry)
 			})
 			_ = p.db.DeleteContainer(cid)
 			_ = p.db.ReleasePortMappings(cid)
@@ -5796,10 +5837,11 @@ func (p *ProxyServer) handleImagePrune(w http.ResponseWriter, id *auth.CallerIde
 		if delResp.StatusCode == http.StatusOK {
 			// 竞态补偿：先存 completedPruneOwner，再删 DB
 			pruneKey := "image:" + img.ID
-			ownerUID := id.RealUID
-			p.completedPruneOwner.Store(pruneKey, ownerUID)
+			_, _, imgPrivCtx, _ := p.db.GetImageOwner(img.ID)
+			entry := pruneOwnerInfo{ownerUID: id.RealUID, privCtx: imgPrivCtx}
+			p.completedPruneOwner.Store(pruneKey, entry)
 			time.AfterFunc(pruneEventDeliveryGrace, func() {
-				p.completedPruneOwner.CompareAndDelete(pruneKey, ownerUID)
+				p.completedPruneOwner.CompareAndDelete(pruneKey, entry)
 			})
 			_ = p.db.DeleteImage(img.ID)
 			// Docker 返回 [{"Deleted":"sha256:..."},{"Untagged":"..."}] 格式
@@ -5887,10 +5929,10 @@ func (p *ProxyServer) handleNetworkPrune(w http.ResponseWriter, r *http.Request,
 			// network 事件通过名称前缀 _u{uid}_ 判断属主，DB 删除不影响名称；
 			// 仍存入以保持与其他资源类型行为一致，且可应对系统内置网络边界情形。
 			pruneKey := "network:" + netID
-			ownerUID := id.RealUID
-			p.completedPruneOwner.Store(pruneKey, ownerUID)
+			entry := pruneOwnerInfo{ownerUID: id.RealUID, privCtx: 0}
+			p.completedPruneOwner.Store(pruneKey, entry)
 			time.AfterFunc(pruneEventDeliveryGrace, func() {
-				p.completedPruneOwner.CompareAndDelete(pruneKey, ownerUID)
+				p.completedPruneOwner.CompareAndDelete(pruneKey, entry)
 			})
 			// [H1] 记录 DB 删除失败，防止幽灵记录静默堆积
 			if dbErr := p.db.DeleteNetwork(netID); dbErr != nil {

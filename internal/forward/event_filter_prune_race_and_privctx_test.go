@@ -182,7 +182,7 @@ func TestPruneRace_VolumeDestroyEvent_HiddenAfterDBDelete_regression(t *testing.
 	// 模拟竞态：alice 的卷已从 DB 删除，但 completedPruneOwner 中还有记录
 	volumeName := fmt.Sprintf("user-%d-volume-mydata", privCtxAliceUID)
 	pruneKey := "volume:" + volumeName
-	p.completedPruneOwner.Store(pruneKey, privCtxAliceUID)
+	p.completedPruneOwner.Store(pruneKey, pruneOwnerInfo{ownerUID: privCtxAliceUID, privCtx: 0})
 
 	destroyEvent := makeVolumeEventWithAction("destroy", volumeName)
 
@@ -219,7 +219,7 @@ func TestPruneRace_ImageDeleteEvent_HiddenAfterDBDelete_regression(t *testing.T)
 
 	// 模拟竞态：alice 的镜像已从 DB 删除，completedPruneOwner 中有 30s 的残留记录
 	pruneKey := "image:" + imageID
-	p.completedPruneOwner.Store(pruneKey, privCtxAliceUID)
+	p.completedPruneOwner.Store(pruneKey, pruneOwnerInfo{ownerUID: privCtxAliceUID, privCtx: 0})
 
 	deleteEvent := makeImageEvent("delete", imageID, imageID)
 
@@ -244,7 +244,7 @@ func TestPruneRace_ImageDeleteEvent_HiddenAfterDBDelete_regression(t *testing.T)
 	}
 
 	// 回归：竞态窗口过期后（手动清除 map），事件回到路径 3（放行）
-	p.completedPruneOwner.CompareAndDelete(pruneKey, privCtxAliceUID)
+	p.completedPruneOwner.CompareAndDelete(pruneKey, pruneOwnerInfo{ownerUID: privCtxAliceUID, privCtx: 0})
 	if !p.eventBelongsToUser(deleteEvent, privCtxBobUID, false) {
 		t.Errorf(
 			"回归：completedPruneOwner 过期后，无法判断属主的 sha256 镜像事件应透传（路径 3）",
@@ -260,7 +260,7 @@ func TestPruneRace_OtherUserCannotClaimViaCompletedPruneOwner_regression(t *test
 
 	volumeName := fmt.Sprintf("user-%d-volume-secret", privCtxAliceUID)
 	pruneKey := "volume:" + volumeName
-	p.completedPruneOwner.Store(pruneKey, privCtxAliceUID) // alice 是属主
+	p.completedPruneOwner.Store(pruneKey, pruneOwnerInfo{ownerUID: privCtxAliceUID, privCtx: 0}) // alice 是属主
 
 	destroyEvent := makeVolumeEventWithAction("destroy", volumeName)
 

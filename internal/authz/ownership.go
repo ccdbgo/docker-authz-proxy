@@ -474,6 +474,30 @@ func (o *OwnershipDB) HasImageAccess(imageID string, uid int) bool {
 	return count > 0
 }
 
+// GetVolumePrivCtx 返回卷的 privileged_context 值（0 或 1）及是否存在。
+// 用于 eventBelongsToUser 在非 sudo 视图中过滤 sudo 命令创建的卷事件。
+func (o *OwnershipDB) GetVolumePrivCtx(name string) (privCtx int, found bool) {
+	err := o.DB.QueryRow(
+		`SELECT privileged_context FROM volumes WHERE name = ?`, name,
+	).Scan(&privCtx)
+	if err != nil {
+		return 0, false
+	}
+	return privCtx, true
+}
+
+// GetNetworkPrivCtxByName 通过网络名查 privileged_context 值（0 或 1）及是否存在。
+// 用于 eventBelongsToUser 在非 sudo 视图中过滤 sudo 命令创建的网络事件。
+func (o *OwnershipDB) GetNetworkPrivCtxByName(name string) (privCtx int, found bool) {
+	err := o.DB.QueryRow(
+		`SELECT privileged_context FROM networks WHERE name = ?`, name,
+	).Scan(&privCtx)
+	if err != nil {
+		return 0, false
+	}
+	return privCtx, true
+}
+
 // CanUseImage 判断用户是否有权使用某镜像
 func (o *OwnershipDB) CanUseImage(realUID int, imageID string) bool {
 	resolvedID := o.resolveImageIDInDB(imageID)
