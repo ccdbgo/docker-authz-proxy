@@ -3937,6 +3937,10 @@ func (p *ProxyServer) handleHijack(w http.ResponseWriter, r *http.Request, id *a
 //  1. 新镜像（构建前不存在）：直接归属
 //  2. 相同 SHA 重建（Dockerfile/基础镜像未变，产生相同 manifest list SHA）：
 //     tag 指向的 SHA 不在 DB 中，也归属给当前用户
+//
+// 并发安全：仅归属命令行 -t 明确指定的 tag 对应的镜像。
+// 快照 diff 窗口内（~300ms）其他用户的并发构建也会产生"新 tag"，
+// 若不过滤会被错误归属给当前用户（BUG-25）。
 func (p *ProxyServer) trackBuildKitImages(id *auth.CallerIdentity, pre *imageSnapshot) {
 	// 注意：不在此处删除 pendingBuilds 记录。
 	// BuildKit 会建立多个 gRPC 连接，若第一个连接的 goroutine 删除了记录，
@@ -3953,6 +3957,18 @@ func (p *ProxyServer) trackBuildKitImages(id *auth.CallerIdentity, pre *imageSna
 
 	auditID := toAuditIdentity(id)
 
+	// BUG-25：仅归属命令行中 -t 明确指定的 tag 对应的镜像。
+	// 快照 diff 窗口内其他用户的并发构建也会产生"新 tag"，必须排除。
+	expectedTags := make(map[string]bool)
+	for _, tag := range parseBuildxTags(id.CmdLine) {
+		expectedTags[tag] = true
+	}
+	// 构建 imageID→tags 反向映射（otherIDs 阶段过滤用）
+	postIDToTags := make(map[string][]string)
+	for tag, imgID := range post.tagToID {
+		postIDToTags[imgID] = append(postIDToTags[imgID], tag)
+	}
+
 	// 收集需要归属的镜像 ID，tagged 镜像优先（避免竞态：rmi 先于无 tag 镜像写入）
 	taggedIDs := make(map[string]bool)
 	otherIDs := make(map[string]bool)
@@ -3962,13 +3978,20 @@ func (p *ProxyServer) trackBuildKitImages(id *auth.CallerIdentity, pre *imageSna
 	for tag, postID := range post.tagToID {
 		preID, existed := pre.tagToID[tag]
 		if !existed || preID != postID {
+			// 仅归属当前用户命令行指定的 tag；其他 tag 为并发构建产物，跳过归属。
+			if !expectedTags[tag] {
+				continue
+			}
 			taggedIDs[postID] = true
 			newTags = append(newTags, tag) // BUG-18b
 		} else {
 			// tag 存在且 SHA 相同：若不在 DB 中则归属（相同内容重建场景）
 			existingOwner, _, _, found := p.db.GetImageOwner(postID)
 			if !found {
-				taggedIDs[postID] = true
+				// 仅归属当前用户命令行指定的 tag
+				if expectedTags[tag] {
+					taggedIDs[postID] = true
+				}
 			} else if existingOwner.UID != id.RealUID {
 				// 镜像已被其他用户拥有：直接添加访问权限（允许虚拟删除）
 				if err := p.db.EnsureImageAccess(postID, id.RealUID); err != nil {
@@ -3988,8 +4011,22 @@ func (p *ProxyServer) trackBuildKitImages(id *auth.CallerIdentity, pre *imageSna
 	}
 
 	// 新增的无 tag 镜像（构建前不存在的 ID，且不在 taggedIDs 中）
+	// 跳过有 tag 但 tag 不属于当前用户的镜像（并发构建产物）
 	for imageID := range post.idSet {
 		if !pre.idSet[imageID] && !taggedIDs[imageID] {
+			// 若该镜像在 post-snapshot 中有 tag，且没有一个 tag 属于当前用户，跳过
+			if imgTags := postIDToTags[imageID]; len(imgTags) > 0 {
+				hasExpected := false
+				for _, t := range imgTags {
+					if expectedTags[t] {
+						hasExpected = true
+						break
+					}
+				}
+				if !hasExpected {
+					continue
+				}
+			}
 			otherIDs[imageID] = true
 		}
 	}
