@@ -796,9 +796,11 @@ func (o *OwnershipDB) CanUserAccessNetwork(networkID string, uid int) (bool, err
 	return count > 0, nil
 }
 
-// GetNetworkIDsByOwner 返回用户拥有的所有网络 ID
+// GetNetworkIDsByOwner 返回用户在非特权上下文中拥有的所有网络 ID。
+// privileged_context=1 的网络（sudo 创建）不出现在非 sudo 的查询中，
+// 与 GetContainerIDsByOwner、GetVolumeNamesByOwner 行为对齐。
 func (o *OwnershipDB) GetNetworkIDsByOwner(uid int) ([]string, error) {
-	rows, err := o.DB.Query(`SELECT network_id FROM networks WHERE owner_uid = ?`, uid)
+	rows, err := o.DB.Query(`SELECT network_id FROM networks WHERE owner_uid = ? AND privileged_context = 0`, uid)
 	if err != nil {
 		return nil, err
 	}

@@ -77,6 +77,12 @@ func FilterContainerListResponse(body []byte, realUID int, realUsername string, 
 			continue
 		}
 
+		// sudo 上下文容器（LabelCallerType = "sudo"）不得对非特权用户可见，
+		// 即使 UID/用户名匹配也必须跳过——与 path① 的 DB pc=0 过滤语义对齐。
+		if GetLastLabelValue(item.Labels[LabelCallerType]) == "sudo" {
+			continue
+		}
+
 		// ② system.authz.owner.uid 标签（防篡改，取末位值）
 		if uidStr := GetLastLabelValue(item.Labels[LabelOwnerUID]); uidStr != "" {
 			uid := parseUID(uidStr)
