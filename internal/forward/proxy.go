@@ -1820,6 +1820,15 @@ func (p *ProxyServer) preprocessRequest(r *http.Request, id *auth.CallerIdentity
 				newCtx := context.WithValue(r.Context(), rewrittenNameCtxKey, actualName)
 				r = r.WithContext(newCtx)
 			}
+		} else {
+			// 特权用户不注入前缀，但需将裸名存入 context，
+			// 供响应处理器写入 DB 的 name 字段（而非 fallback 为 hex ID）。
+			var req struct {
+				Name string `json:"Name"`
+			}
+			if json.Unmarshal(body, &req) == nil && req.Name != "" {
+				r = r.WithContext(context.WithValue(r.Context(), rewrittenNameCtxKey, req.Name))
+			}
 		}
 
 	case authz.ActionVolumeCreate:
@@ -2083,7 +2092,21 @@ func (p *ProxyServer) eventBelongsToUser(line []byte, uid int, sudoCtx bool) boo
 			}
 			return true
 		}
-		return true // 路径 3：无 _u{digits}_ 段，系统内置网络，放行
+		// 路径 3：无 _u{digits}_ 段，检查是否为 sudo 创建的裸名网络（BUG-26）。
+		// DB 有记录（create 事件窗口）→ 按 privileged_context 隐藏；
+		// DB 无记录（rm 竞态窗口）→ 查 completedPruneOwner 补偿；
+		// 两者均无 → 视为系统内置网络，放行。
+		if p.db != nil {
+			if privCtx, found := p.db.GetNetworkPrivCtxByName(name); found && privCtx == 1 && !sudoCtx {
+				return false
+			}
+		}
+		if v, ok := p.completedPruneOwner.Load("network:" + name); ok {
+			if entry, ok := v.(pruneOwnerInfo); ok && entry.privCtx == 1 && !sudoCtx {
+				return false
+			}
+		}
+		return true // 系统内置网络或未知网络，放行
 	}
 
 	// volume 事件：Docker volume 事件的卷名在 Actor.ID 中（Attributes 仅含 driver 等元数据）。
@@ -2992,6 +3015,17 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 		if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
 			networkID := isolation.ExtractNetworkID(requestURI)
 			if networkID != "" {
+				// 竞态补偿（BUG-26b）：sudo 裸名网络的 destroy 事件异步到达时 DB 记录已删，
+				// 先将属主信息存入 completedPruneOwner，供 eventBelongsToUser 路径3查询。
+				// 仅 privCtx==1 的网络需要此补偿；前缀网络由路径2的 found=false 逻辑自然保护。
+				if privCtx, found := p.db.GetNetworkPrivCtxByName(networkID); found && privCtx == 1 {
+					pruneKey := "network:" + networkID
+					entry := pruneOwnerInfo{ownerUID: id.RealUID, privCtx: 1}
+					p.completedPruneOwner.Store(pruneKey, entry)
+					time.AfterFunc(pruneEventDeliveryGrace, func() {
+						p.completedPruneOwner.CompareAndDelete(pruneKey, entry)
+					})
+				}
 				// requestURI 可能含有前缀名（如 alice_u1001_testnet），需解析为 Docker 网络 ID
 				if realID, found := p.db.GetNetworkIDByName(networkID); found {
 					networkID = realID
