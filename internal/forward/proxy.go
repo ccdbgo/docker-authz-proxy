@@ -2056,8 +2056,9 @@ type pruneOwnerInfo struct {
 // 该参数主要用于语义清晰及未来扩展。
 func (p *ProxyServer) eventBelongsToUser(line []byte, uid int, sudoCtx bool) bool {
 	var ev struct {
-		Type  string `json:"Type"`
-		Actor struct {
+		Type   string `json:"Type"`
+		Action string `json:"Action"`
+		Actor  struct {
 			ID         string            `json:"ID"`
 			Attributes map[string]string `json:"Attributes"`
 		} `json:"Actor"`
@@ -2275,6 +2276,29 @@ func (p *ProxyServer) eventBelongsToUser(line []byte, uid int, sudoCtx bool) boo
 					return entry.ownerUID == uid
 				}
 				// 类型断言失败（异常情况）：跳过路径 0b，降级到 DB 路径
+			}
+		}
+
+		// 路径 0a.3：Docker build/tag 事件中 attrs["name"] 仅含仓库名（如 myapp），不含 tag，
+		// 而 pendingBuildTags / completedBuildOwner 以完整 ref（如 myapp:test）为 key（BUG-29b）。
+		// Actor.ID 在 tag 事件中正好是完整 ref，用它补充查询覆盖此情形。
+		// 仅对非 pull 的 image 事件生效，避免 pull 事件与同名 build tag 碰撞产生误判。
+		if actorRef := ev.Actor.ID; actorRef != "" && !strings.HasPrefix(actorRef, "sha256:") && ev.Action != "pull" {
+			if v, ok := p.pendingBuildTags.Load(actorRef); ok {
+				if entry, ok := v.(pruneOwnerInfo); ok {
+					if !sudoCtx && entry.privCtx == 1 {
+						return false
+					}
+					return entry.ownerUID == uid
+				}
+			}
+			if v, ok := p.completedBuildOwner.Load(actorRef); ok {
+				if entry, ok := v.(pruneOwnerInfo); ok {
+					if !sudoCtx && entry.privCtx == 1 {
+						return false
+					}
+					return entry.ownerUID == uid
+				}
 			}
 		}
 
