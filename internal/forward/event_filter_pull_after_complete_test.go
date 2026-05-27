@@ -121,7 +121,7 @@ func TestBug20_PullEvent_AfterPullComplete_LeaksToOtherUsers(t *testing.T) {
 	}
 	// pendingPullRefs 未设置——模拟 defer CompareAndDelete 已执行
 	// completedPullOwner 已设置——模拟 postprocessResponse ActionPull 写入
-	p.completedPullOwner.Store(bug20AlpineRef, bug20AliceUID)
+	p.completedPullOwner.Store(bug20AlpineRef, pruneOwnerInfo{ownerUID: bug20AliceUID})
 
 	// 真实 Docker pull 事件：Actor.ID=完整 ref，attrs["name"]=仓库名
 	pullEvent := bug20MakePullEvent(bug20AlpineRef, "alpine")
@@ -169,7 +169,7 @@ func TestBug20_Reg1_Alice_ReceivesOwnPullEvent_AfterComplete(t *testing.T) {
 	}
 	// pendingPullRefs 未设置（pull 已完成）
 	// completedPullOwner 已设置（postprocessResponse ActionPull 写入）
-	p.completedPullOwner.Store(bug20AlpineRef, bug20AliceUID)
+	p.completedPullOwner.Store(bug20AlpineRef, pruneOwnerInfo{ownerUID: bug20AliceUID})
 
 	pullEvent := bug20MakePullEvent(bug20AlpineRef, "alpine")
 
@@ -226,8 +226,8 @@ func TestBug20_Reg3_RaceWindow_PendingPullRefs_Unaffected(t *testing.T) {
 	p := newTestProxy(t, httptest.NewServer(nil), nil)
 
 	// 模拟 pull 进行中：pendingPullRefs 已注册
-	p.pendingPullRefs.Store(bug20AlpineRef, bug20AliceUID)
-	defer p.pendingPullRefs.CompareAndDelete(bug20AlpineRef, bug20AliceUID)
+	p.pendingPullRefs.Store(bug20AlpineRef, pruneOwnerInfo{ownerUID: bug20AliceUID})
+	defer p.pendingPullRefs.CompareAndDelete(bug20AlpineRef, pruneOwnerInfo{ownerUID: bug20AliceUID})
 	// DB 尚未更新（竞态窗口）
 
 	pullEvent := bug20MakePullEvent(bug20AlpineRef, "alpine")
@@ -301,7 +301,7 @@ func TestBug20_Reg5_Integration_PullComplete_BobDoesNotSeeEvent(t *testing.T) {
 	if err := p.db.SetImageOwner(bug20AlpineContentID, aliceID, false, "pull"); err != nil {
 		t.Fatalf("SetImageOwner(alice/alpine): %v", err)
 	}
-	p.completedPullOwner.Store(bug20AlpineRef, bug20AliceUID)
+	p.completedPullOwner.Store(bug20AlpineRef, pruneOwnerInfo{ownerUID: bug20AliceUID})
 
 	// bob 自己的镜像已在 DB 中
 	bobID := regularIdentity("bob", bug20BobUID)

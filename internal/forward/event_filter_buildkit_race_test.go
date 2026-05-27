@@ -135,8 +135,8 @@ func TestBug18b_BuildKit_ImageTagRace_PendingTagBlocksOtherUsers(t *testing.T) {
 	// 修复前：此 Store 不存在，DB 为空 → 路径3 → bob 收到事件
 	// 修复后：Store 存在 → 路径0 → ownerUID(1005) ≠ bob(1002) → return false
 	p := newTestProxy(t, httptest.NewServer(nil), nil)
-	p.pendingBuildTags.Store(bug18Tag, sudoTestUID)
-	defer p.pendingBuildTags.CompareAndDelete(bug18Tag, sudoTestUID)
+	p.pendingBuildTags.Store(bug18Tag, pruneOwnerInfo{ownerUID: sudoTestUID})
+	defer p.pendingBuildTags.CompareAndDelete(bug18Tag, pruneOwnerInfo{ownerUID: sudoTestUID})
 	// DB 完全为空——模拟 trackBuildKitImages 300ms 等待窗口
 
 	tagEvent := makeImageEvent("tag", sudoTestImageID, bug18Tag)
@@ -212,10 +212,10 @@ func TestBug18b_Reg2_MultiTag_AllProtected(t *testing.T) {
 
 	tag1 := "image_sudo:test_sudo"
 	tag2 := "image_sudo:latest"
-	p.pendingBuildTags.Store(tag1, sudoTestUID)
-	defer p.pendingBuildTags.CompareAndDelete(tag1, sudoTestUID)
-	p.pendingBuildTags.Store(tag2, sudoTestUID)
-	defer p.pendingBuildTags.CompareAndDelete(tag2, sudoTestUID)
+	p.pendingBuildTags.Store(tag1, pruneOwnerInfo{ownerUID: sudoTestUID})
+	defer p.pendingBuildTags.CompareAndDelete(tag1, pruneOwnerInfo{ownerUID: sudoTestUID})
+	p.pendingBuildTags.Store(tag2, pruneOwnerInfo{ownerUID: sudoTestUID})
+	defer p.pendingBuildTags.CompareAndDelete(tag2, pruneOwnerInfo{ownerUID: sudoTestUID})
 
 	for _, tag := range []string{tag1, tag2} {
 		event := makeImageEvent("tag", sudoTestImageID, tag)
@@ -251,12 +251,12 @@ func TestBug18b_Reg3_CompareAndDelete_ConcurrentBuildSameTags(t *testing.T) {
 	tag := "image_sudo:test_sudo"
 
 	// sudo_test 先注册
-	p.pendingBuildTags.Store(tag, sudoTestUID)
+	p.pendingBuildTags.Store(tag, pruneOwnerInfo{ownerUID: sudoTestUID})
 	// bob 后注册（覆写）
-	p.pendingBuildTags.Store(tag, bobUID3)
+	p.pendingBuildTags.Store(tag, pruneOwnerInfo{ownerUID: bobUID3})
 
 	// sudo_test 的 CompareAndDelete（uid 不匹配，不删除）
-	p.pendingBuildTags.CompareAndDelete(tag, sudoTestUID)
+	p.pendingBuildTags.CompareAndDelete(tag, pruneOwnerInfo{ownerUID: sudoTestUID})
 
 	// 此时 bob 的记录仍在
 	event := makeImageEvent("tag", sudoTestImageID, tag)
@@ -275,7 +275,7 @@ func TestBug18b_Reg3_CompareAndDelete_ConcurrentBuildSameTags(t *testing.T) {
 	}
 
 	// bob 的 CompareAndDelete（匹配，删除）
-	p.pendingBuildTags.CompareAndDelete(tag, bobUID3)
+	p.pendingBuildTags.CompareAndDelete(tag, pruneOwnerInfo{ownerUID: bobUID3})
 
 	// 清理后 DB 也无记录 → 路径3 → 放行
 	afterClean := p.eventBelongsToUser(event, bobUID3, false)

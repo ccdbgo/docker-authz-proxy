@@ -534,7 +534,7 @@ func imageSetPublic(args []string, db *authz.OwnershipDB) error {
 			return fmt.Errorf("查询引用用户失败: %w", err)
 		}
 		// 获取属主，排除属主自身
-		owner, _, _ := db.GetImageOwner(resolvedID)
+		owner, _, _, _ := db.GetImageOwner(resolvedID)
 		var others []string
 		for _, uid := range refUIDs {
 			if owner != nil && uid == owner.UID {

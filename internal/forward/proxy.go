@@ -82,7 +82,7 @@ type ProxyServer struct {
 	// 生命周期与 case 返回不对齐，需独立修复（BUG-18b）。
 	//
 	// 并发安全：CompareAndDelete 确保两个并发 build 同一 tag 时不会互相删除对方记录。
-	pendingBuildTags sync.Map // map[string]int: tag → ownerUID
+	pendingBuildTags sync.Map // map[string]pruneOwnerInfo: tag → {ownerUID, privCtx}
 
 	// pendingPullRefs 记录正在进行 pull 操作的 imageRef → ownerUID 映射（BUG-19/21）。
 	// 用途：在 SetImageOwner 调用前的竞态窗口内，image pull 事件到达 eventBelongsToUser
@@ -93,7 +93,7 @@ type ProxyServer struct {
 	// 注意：并发 Store 时后者会覆盖前者的 ownerUID（sync.Map 无 CAS Store），
 	//   极端情况下前者 pull 进行中其事件会被以后者 ownerUID 过滤。此为已知局限，
 	//   概率极低（同一 ref 毫秒级并发），completedPullOwner 可补偿大多数情形。
-	pendingPullRefs sync.Map // map[string]int: imageRef → ownerUID
+	pendingPullRefs sync.Map // map[string]pruneOwnerInfo: imageRef → {ownerUID, privCtx}
 
 	// completedPullOwner 在 pull 完成后维持 imageRef → ownerUID 映射，
 	// 覆盖 pendingPullRefs 清除后 Docker 事件投递延迟的窗口（BUG-20）。
@@ -105,7 +105,7 @@ type ProxyServer struct {
 	//      无法可靠清理 ref 级别的条目（rmi by sha256 时尤为明显）。
 	// 并发安全：time.AfterFunc closure 使用 CompareAndDelete，
 	//   并发 pull 同一 ref 时各自的 timer 只删除与自身 ownerUID 匹配的条目。
-	completedPullOwner sync.Map // map[string]int: imageRef → ownerUID
+	completedPullOwner sync.Map // map[string]pruneOwnerInfo: imageRef → {ownerUID, privCtx}
 
 	// completedPruneOwner 在资源被 prune 删除后维持 "{type}:{id}" → ownerUID 映射，
 	// 覆盖 DB 记录已删除但 Docker daemon 事件尚未投递给订阅者的竞态窗口。
@@ -724,8 +724,12 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 若跳过则在 completedPullOwner 写入前事件已到达，非特权用户可见泄漏。
 	if action == authz.ActionPull {
 		if pullRef := parseImageRefFromURI(modifiedReq.URL.RequestURI()); pullRef != "" {
-			p.pendingPullRefs.Store(pullRef, identity.RealUID)
-			defer p.pendingPullRefs.CompareAndDelete(pullRef, identity.RealUID)
+			pullOwner := pruneOwnerInfo{ownerUID: identity.RealUID}
+			if identity.IsSudoCommand() {
+				pullOwner.privCtx = 1
+			}
+			p.pendingPullRefs.Store(pullRef, pullOwner)
+			defer p.pendingPullRefs.CompareAndDelete(pullRef, pullOwner)
 		}
 	}
 	forwardStart := time.Now()
@@ -2201,15 +2205,21 @@ func (p *ProxyServer) eventBelongsToUser(line []byte, uid int, sudoCtx bool) boo
 		name := attrs["name"]
 		if name != "" && !strings.HasPrefix(name, "sha256:") {
 			if v, ok := p.pendingBuildTags.Load(name); ok {
-				if ownerUID, ok := v.(int); ok {
-					return ownerUID == uid
+				if entry, ok := v.(pruneOwnerInfo); ok {
+					if !sudoCtx && entry.privCtx == 1 {
+						return false
+					}
+					return entry.ownerUID == uid
 				}
 				// 类型断言失败（异常情况）：跳过路径 0a，降级到后续路径
 			}
 			// 路径 0b：pendingPullRefs via attrs["name"]（pull 竞态窗口，BUG-19）
 			if v, ok := p.pendingPullRefs.Load(name); ok {
-				if ownerUID, ok := v.(int); ok {
-					return ownerUID == uid
+				if entry, ok := v.(pruneOwnerInfo); ok {
+					if !sudoCtx && entry.privCtx == 1 {
+						return false
+					}
+					return entry.ownerUID == uid
 				}
 				// 类型断言失败（异常情况）：跳过路径 0b，降级到 DB 路径
 			}
@@ -2220,8 +2230,11 @@ func (p *ProxyServer) eventBelongsToUser(line []byte, uid int, sudoCtx bool) boo
 		// Actor.ID 在 pull 事件中正好是完整 ref，用它补充查询覆盖此情形。
 		if actorRef := ev.Actor.ID; actorRef != "" && !strings.HasPrefix(actorRef, "sha256:") {
 			if v, ok := p.pendingPullRefs.Load(actorRef); ok {
-				if ownerUID, ok := v.(int); ok {
-					return ownerUID == uid
+				if entry, ok := v.(pruneOwnerInfo); ok {
+					if !sudoCtx && entry.privCtx == 1 {
+						return false
+					}
+					return entry.ownerUID == uid
 				}
 			}
 		}
@@ -2235,15 +2248,21 @@ func (p *ProxyServer) eventBelongsToUser(line []byte, uid int, sudoCtx bool) boo
 		//   ev.Actor.ID   覆盖非 latest tag 场景（key="alpine:3.18"，attrs="alpine"）
 		if name != "" && !strings.HasPrefix(name, "sha256:") {
 			if v, ok := p.completedPullOwner.Load(name); ok {
-				if ownerUID, ok := v.(int); ok {
-					return ownerUID == uid
+				if entry, ok := v.(pruneOwnerInfo); ok {
+					if !sudoCtx && entry.privCtx == 1 {
+						return false
+					}
+					return entry.ownerUID == uid
 				}
 			}
 		}
 		if actorID := ev.Actor.ID; actorID != "" && !strings.HasPrefix(actorID, "sha256:") {
 			if v, ok := p.completedPullOwner.Load(actorID); ok {
-				if ownerUID, ok := v.(int); ok {
-					return ownerUID == uid
+				if entry, ok := v.(pruneOwnerInfo); ok {
+					if !sudoCtx && entry.privCtx == 1 {
+						return false
+					}
+					return entry.ownerUID == uid
 				}
 			}
 		}
@@ -2770,10 +2789,14 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 				// completedPullOwner 延续 imageRef → ownerUID pullEventDeliveryGrace (30s)，
 				// 覆盖此投递延迟窗口。time.AfterFunc 确保条目自动清理，无内存泄漏。
 				// imageRef 此处必定非空（外层 if imageRef != "" 已守卫）。
-				ref, ownerUID := imageRef, id.RealUID
-				p.completedPullOwner.Store(ref, ownerUID)
+			ref := imageRef
+				pullOwner := pruneOwnerInfo{ownerUID: id.RealUID}
+				if id.IsSudoCommand() {
+					pullOwner.privCtx = 1
+				}
+				p.completedPullOwner.Store(ref, pullOwner)
 				time.AfterFunc(pullEventDeliveryGrace, func() {
-					p.completedPullOwner.CompareAndDelete(ref, ownerUID)
+					p.completedPullOwner.CompareAndDelete(ref, pullOwner)
 				})
 			}
 		}
@@ -2788,9 +2811,12 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 		if u, uErr := url.ParseRequestURI(requestURI); uErr == nil {
 			for _, tag := range u.Query()["t"] {
 				tag := tag
-				ownerUID := id.RealUID
-				p.pendingBuildTags.Store(tag, ownerUID)
-				defer p.pendingBuildTags.CompareAndDelete(tag, ownerUID)
+				buildOwner := pruneOwnerInfo{ownerUID: id.RealUID}
+				if id.IsSudoCommand() {
+					buildOwner.privCtx = 1
+				}
+				p.pendingBuildTags.Store(tag, buildOwner)
+				defer p.pendingBuildTags.CompareAndDelete(tag, buildOwner)
 			}
 		}
 		isolation.CopyHeaders(w, resp.Header)
@@ -3798,8 +3824,12 @@ func (p *ProxyServer) handleHijack(w http.ResponseWriter, r *http.Request, id *a
 		// 注意：使用 id.CmdLine（完整命令行），而非 id.DockerCommand（已解析子命令）。
 		// BuildKit gRPC 连接来自 docker-buildx 插件进程，parseDockerCommand 无法
 		// 解析其完整 cmdline，DockerCommand 为空字符串。
+		buildOwner := pruneOwnerInfo{ownerUID: id.RealUID}
+		if id.IsSudoCommand() {
+			buildOwner.privCtx = 1
+		}
 		for _, tag := range parseBuildxTags(id.CmdLine) {
-			p.pendingBuildTags.Store(tag, id.RealUID)
+			p.pendingBuildTags.Store(tag, buildOwner)
 		}
 	}
 	action := authz.OverrideActionByCommand(id.DockerCommand, authz.ClassifyAction(r.Method, r.URL.RequestURI()))
@@ -4153,8 +4183,12 @@ func (p *ProxyServer) trackBuildKitImages(id *auth.CallerIdentity, pre *imageSna
 	// BUG-18b：SetImageOwner 已调用，清理竞态窗口中注册的 pendingBuildTags 条目。
 	// 仅清理本次发现有新镜像的 tag（其他 goroutine 找不到新镜像则不清理，
 	// 由负责写入的 goroutine 负责），CompareAndDelete 保证并发安全。
+	cleanOwner := pruneOwnerInfo{ownerUID: id.RealUID}
+	if id.IsSudoCommand() {
+		cleanOwner.privCtx = 1
+	}
 	for _, tag := range newTags {
-		p.pendingBuildTags.CompareAndDelete(tag, id.RealUID)
+		p.pendingBuildTags.CompareAndDelete(tag, cleanOwner)
 	}
 }
 

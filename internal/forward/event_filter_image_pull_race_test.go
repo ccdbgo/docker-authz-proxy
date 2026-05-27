@@ -87,8 +87,8 @@ func makeRawImagePullEvent(imageID, name string) string {
 func TestBug19_ImagePullRace_PullEventLeaksWhenDBEmpty(t *testing.T) {
 	p := newTestProxy(t, httptest.NewServer(nil), nil)
 	// 模拟 ActionPull case 开头已注册（响应头到达时）
-	p.pendingPullRefs.Store(pullRaceImageRef, pullRaceAliceUID)
-	defer p.pendingPullRefs.CompareAndDelete(pullRaceImageRef, pullRaceAliceUID)
+	p.pendingPullRefs.Store(pullRaceImageRef, pruneOwnerInfo{ownerUID: pullRaceAliceUID})
+	defer p.pendingPullRefs.CompareAndDelete(pullRaceImageRef, pruneOwnerInfo{ownerUID: pullRaceAliceUID})
 	// DB 完全为空——模拟竞态窗口：SetImageOwner 尚未执行
 
 	pullEvent := makeImageEvent("pull", pullRaceImageID, pullRaceImageRef)
@@ -123,8 +123,8 @@ func TestBug19_ImagePullRace_PullEventLeaksWhenDBEmpty(t *testing.T) {
 // 回归-1：pendingPullRefs 已注册时，拉取者（alice）应能看到自己的 image pull 事件。
 func TestBug19_Reg1_Puller_ReceivesOwnPullEvent(t *testing.T) {
 	p := newTestProxy(t, httptest.NewServer(nil), nil)
-	p.pendingPullRefs.Store(pullRaceImageRef, pullRaceAliceUID)
-	defer p.pendingPullRefs.CompareAndDelete(pullRaceImageRef, pullRaceAliceUID)
+	p.pendingPullRefs.Store(pullRaceImageRef, pruneOwnerInfo{ownerUID: pullRaceAliceUID})
+	defer p.pendingPullRefs.CompareAndDelete(pullRaceImageRef, pruneOwnerInfo{ownerUID: pullRaceAliceUID})
 
 	pullEvent := makeImageEvent("pull", pullRaceImageID, pullRaceImageRef)
 
@@ -177,8 +177,8 @@ func TestBug19_Reg3_NonLatestTag_MatchesCorrectly(t *testing.T) {
 	nginxRef := "nginx:1.25.3"
 	nginxID := "sha256:aabbcc001122334455667788990011223344556677889900aabbccddeeff0011"
 
-	p.pendingPullRefs.Store(nginxRef, pullRaceAliceUID)
-	defer p.pendingPullRefs.CompareAndDelete(nginxRef, pullRaceAliceUID)
+	p.pendingPullRefs.Store(nginxRef, pruneOwnerInfo{ownerUID: pullRaceAliceUID})
+	defer p.pendingPullRefs.CompareAndDelete(nginxRef, pruneOwnerInfo{ownerUID: pullRaceAliceUID})
 
 	event := makeImageEvent("pull", nginxID, nginxRef)
 
@@ -204,8 +204,8 @@ func TestBug19_Reg3_NonLatestTag_MatchesCorrectly(t *testing.T) {
 func TestBug19_Reg4_Sha256ImageCreate_StillPassthrough(t *testing.T) {
 	p := newTestProxy(t, httptest.NewServer(nil), nil)
 	// pendingPullRefs 已注册（模拟正在进行的 pull）
-	p.pendingPullRefs.Store(pullRaceImageRef, pullRaceAliceUID)
-	defer p.pendingPullRefs.CompareAndDelete(pullRaceImageRef, pullRaceAliceUID)
+	p.pendingPullRefs.Store(pullRaceImageRef, pruneOwnerInfo{ownerUID: pullRaceAliceUID})
+	defer p.pendingPullRefs.CompareAndDelete(pullRaceImageRef, pruneOwnerInfo{ownerUID: pullRaceAliceUID})
 
 	// image create：name 为 sha256（中间层格式，非命名 tag）
 	createEvent := makeImageEvent("create", pullRaceImageID, pullRaceImageID)
@@ -237,8 +237,8 @@ func TestBug19_Reg5_Integration_PendingBlocksOtherUsers(t *testing.T) {
 
 	p := newTestProxy(t, upstream, nil)
 	// 模拟 ActionPull 开头已注册（alice 正在 pull busybox）
-	p.pendingPullRefs.Store(pullRaceImageRef, pullRaceAliceUID)
-	defer p.pendingPullRefs.CompareAndDelete(pullRaceImageRef, pullRaceAliceUID)
+	p.pendingPullRefs.Store(pullRaceImageRef, pruneOwnerInfo{ownerUID: pullRaceAliceUID})
+	defer p.pendingPullRefs.CompareAndDelete(pullRaceImageRef, pruneOwnerInfo{ownerUID: pullRaceAliceUID})
 
 	// bob 的镜像已在 DB 中（pull 已完成）
 	bobID := regularIdentity("bob", pullRaceBobUID)
@@ -293,8 +293,8 @@ func TestBug_PullEvent_ActorIDHasTag_NameHasNoTag(t *testing.T) {
 	p := newTestProxy(t, httptest.NewServer(nil), nil)
 
 	const fullRef = "alpine:3.18" // parseImageRefFromURI("?fromImage=alpine&tag=3.18")
-	p.pendingPullRefs.Store(fullRef, pullRaceAliceUID)
-	defer p.pendingPullRefs.CompareAndDelete(fullRef, pullRaceAliceUID)
+	p.pendingPullRefs.Store(fullRef, pruneOwnerInfo{ownerUID: pullRaceAliceUID})
+	defer p.pendingPullRefs.CompareAndDelete(fullRef, pruneOwnerInfo{ownerUID: pullRaceAliceUID})
 
 	// 真实 Docker 事件格式：Actor.ID=完整 ref，attrs["name"]=仓库名（无 tag）
 	event := makeImageEvent("pull", fullRef, "alpine")
@@ -325,8 +325,8 @@ func TestBug_PullEvent_ActorIDHasTag_Reg_Latest(t *testing.T) {
 	p := newTestProxy(t, httptest.NewServer(nil), nil)
 
 	// latest tag：parseImageRefFromURI 省略 :latest，存储 key="busybox"
-	p.pendingPullRefs.Store("busybox", pullRaceAliceUID)
-	defer p.pendingPullRefs.CompareAndDelete("busybox", pullRaceAliceUID)
+	p.pendingPullRefs.Store("busybox", pruneOwnerInfo{ownerUID: pullRaceAliceUID})
+	defer p.pendingPullRefs.CompareAndDelete("busybox", pruneOwnerInfo{ownerUID: pullRaceAliceUID})
 
 	// 真实 Docker 事件：Actor.ID="busybox:latest", attrs["name"]="busybox"
 	event := makeImageEvent("pull", "busybox:latest", "busybox")

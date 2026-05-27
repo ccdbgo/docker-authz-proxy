@@ -69,8 +69,8 @@ const bug18Tag = "image_sudo:test_sudo"
 func TestBug18_ImageTagRace_NamedTagLeaksWhenDBEmpty(t *testing.T) {
 	p := newTestProxy(t, httptest.NewServer(nil), nil)
 	// pendingBuildTags 模拟 ActionBuild case 开始时已注册（响应头到达时）
-	p.pendingBuildTags.Store(bug18Tag, sudoTestUID)
-	defer p.pendingBuildTags.CompareAndDelete(bug18Tag, sudoTestUID)
+	p.pendingBuildTags.Store(bug18Tag, pruneOwnerInfo{ownerUID: sudoTestUID})
+	defer p.pendingBuildTags.CompareAndDelete(bug18Tag, pruneOwnerInfo{ownerUID: sudoTestUID})
 	// DB 完全为空 —— 模拟竞态窗口：SetImageOwner 尚未执行
 
 	tagEvent := makeImageEvent("tag", sudoTestImageID, bug18Tag)
@@ -105,8 +105,8 @@ func TestBug18_ImageTagRace_NamedTagLeaksWhenDBEmpty(t *testing.T) {
 // 回归-1：pendingBuildTags 已注册时，构建者（sudo_test）应能看到自己的 image tag 事件。
 func TestBug18_Reg1_PendingBuild_BuilderAllowed(t *testing.T) {
 	p := newTestProxy(t, httptest.NewServer(nil), nil)
-	p.pendingBuildTags.Store(bug18Tag, sudoTestUID)
-	defer p.pendingBuildTags.CompareAndDelete(bug18Tag, sudoTestUID)
+	p.pendingBuildTags.Store(bug18Tag, pruneOwnerInfo{ownerUID: sudoTestUID})
+	defer p.pendingBuildTags.CompareAndDelete(bug18Tag, pruneOwnerInfo{ownerUID: sudoTestUID})
 
 	tagEvent := makeImageEvent("tag", sudoTestImageID, bug18Tag)
 
@@ -181,10 +181,10 @@ func TestBug18_Reg4_MultiTag_AllProtected(t *testing.T) {
 	tag1 := "image_sudo:test_sudo"
 	tag2 := "image_sudo:latest"
 	// 模拟 ActionBuild case 为两个 tag 均注册 pending
-	p.pendingBuildTags.Store(tag1, sudoTestUID)
-	defer p.pendingBuildTags.CompareAndDelete(tag1, sudoTestUID)
-	p.pendingBuildTags.Store(tag2, sudoTestUID)
-	defer p.pendingBuildTags.CompareAndDelete(tag2, sudoTestUID)
+	p.pendingBuildTags.Store(tag1, pruneOwnerInfo{ownerUID: sudoTestUID})
+	defer p.pendingBuildTags.CompareAndDelete(tag1, pruneOwnerInfo{ownerUID: sudoTestUID})
+	p.pendingBuildTags.Store(tag2, pruneOwnerInfo{ownerUID: sudoTestUID})
+	defer p.pendingBuildTags.CompareAndDelete(tag2, pruneOwnerInfo{ownerUID: sudoTestUID})
 
 	for _, tag := range []string{tag1, tag2} {
 		event := makeImageEvent("tag", sudoTestImageID, tag)
@@ -219,8 +219,8 @@ func TestBug18_Reg5_Integration_PendingBlocksOtherUsers(t *testing.T) {
 	defer upstream.Close()
 
 	p := newTestProxy(t, upstream, nil)
-	p.pendingBuildTags.Store(bug18Tag, sudoTestUID)
-	defer p.pendingBuildTags.CompareAndDelete(bug18Tag, sudoTestUID)
+	p.pendingBuildTags.Store(bug18Tag, pruneOwnerInfo{ownerUID: sudoTestUID})
+	defer p.pendingBuildTags.CompareAndDelete(bug18Tag, pruneOwnerInfo{ownerUID: sudoTestUID})
 
 	bobID := regularIdentity("bob", bobUID3)
 	if err := p.db.SetImageOwner(bobImageID, bobID, false, "build"); err != nil {
