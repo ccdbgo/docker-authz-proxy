@@ -2123,10 +2123,33 @@ func (p *ProxyServer) eventBelongsToUser(line []byte, uid int, sudoCtx bool) boo
 				return false // 路径 2：格式合法，但属于其他用户
 			}
 		}
-		// 路径 prune：DB 记录已被 prune 删除，但事件尚在投递中（竞态补偿）
+		// 路径 prune/rm：DB 记录已被 prune/rm 删除，但事件尚在投递中（竞态补偿，BUG-26b）。
+		// 同时检查 privCtx：!sudoCtx && privCtx==1 时对非 sudo 视图隐藏。
 		if v, ok := p.completedPruneOwner.Load("volume:" + name); ok {
 			if entry, ok := v.(pruneOwnerInfo); ok {
-				return entry.ownerUID == uid
+				if entry.ownerUID != uid {
+					return false
+				}
+				if !sudoCtx && entry.privCtx == 1 {
+					return false // sudo 上下文卷：非 sudo 视图不可见
+				}
+				return true
+			}
+		}
+		// 路径 DB fallback：格式无标准前缀（sudo 直接创建的裸名卷），
+		// 查 DB 判断归属和 privileged_context（BUG-26a）。
+		// found=false（系统卷/DB 已删）时退化到路径 3，不引入过度过滤。
+		if p.db != nil {
+			if owner, ok := p.db.GetVolumeOwner(name); ok {
+				if owner.UID != uid {
+					return false // 属于其他用户
+				}
+				if !sudoCtx {
+					if privCtx, found := p.db.GetVolumePrivCtx(name); found && privCtx == 1 {
+						return false // sudo 上下文卷：非 sudo 视图不可见
+					}
+				}
+				return true
 			}
 		}
 		return true // 路径 3：系统卷或格式不合法，放行
@@ -3055,6 +3078,23 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 		if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
 			volName := isolation.ExtractVolumeName(requestURI)
 			if volName != "" {
+				// 竞态补偿：先存 completedPruneOwner，再删 DB（BUG-26b）。
+				// 保证 Docker 异步 destroy 事件到达时仍能查到属主和 privileged_context，
+				// 与 handleVolumePrune 的 prune 竞态窗口机制对齐。
+				if p.db != nil {
+					if owner, ok := p.db.GetVolumeOwner(volName); ok {
+						privCtx := 0
+						if pc, found := p.db.GetVolumePrivCtx(volName); found {
+							privCtx = pc
+						}
+						pruneKey := "volume:" + volName
+						entry := pruneOwnerInfo{ownerUID: owner.UID, privCtx: privCtx}
+						p.completedPruneOwner.Store(pruneKey, entry)
+						time.AfterFunc(pruneEventDeliveryGrace, func() {
+							p.completedPruneOwner.CompareAndDelete(pruneKey, entry)
+						})
+					}
+				}
 				_ = p.db.DeleteVolume(volName)
 			}
 		}
