@@ -107,6 +107,18 @@ type ProxyServer struct {
 	//   并发 pull 同一 ref 时各自的 timer 只删除与自身 ownerUID 匹配的条目。
 	completedPullOwner sync.Map // map[string]pruneOwnerInfo: imageRef → {ownerUID, privCtx}
 
+	// completedBuildOwner 在 build 完成后维持 tag → ownerInfo 映射，
+	// 覆盖 pendingBuildTags 清除后 Docker 事件投递延迟的窗口（BUG-28）。
+	//
+	// 解决场景：用户 A 先构建 myapp:test 成为 DB owner；用户 B 以相同内容重建时
+	// trackBuildKitImages 仅添加 image_access（owner 不变），build 完成后
+	// pendingBuildTags 已清除，DB owner 仍为 A，导致 build 事件泄漏给 A。
+	//
+	// 生命周期：build 完成时 Store（ActionBuild defer / trackBuildKitImages CompareAndDelete 前），
+	// buildEventDeliveryGrace 后由 time.AfterFunc 自动清除。
+	// 并发安全：CompareAndDelete 确保 timer 只删除与自身 entry 匹配的条目。
+	completedBuildOwner sync.Map // map[string]pruneOwnerInfo: tag → {ownerUID, privCtx}
+
 	// completedPruneOwner 在资源被 prune 删除后维持 "{type}:{id}" → ownerUID 映射，
 	// 覆盖 DB 记录已删除但 Docker daemon 事件尚未投递给订阅者的竞态窗口。
 	// key 格式："{type}:{id}"，如 "volume:user-1001-volume-foo"、"image:sha256:abc…"
@@ -1989,6 +2001,10 @@ func (e *upstreamError) Unwrap() error { return e.cause }
 // 30s 提供足够的余量，同时防止无限期内存占用。
 const pullEventDeliveryGrace = 30 * time.Second
 
+// buildEventDeliveryGrace 是 build 完成后 completedBuildOwner 条目的 TTL（BUG-28）。
+// Docker 的 image build/tag 事件通常在数秒内投递，30s 提供足够余量，与 pull 保持一致。
+const buildEventDeliveryGrace = 30 * time.Second
+
 // pruneEventDeliveryGrace 是 prune 删除 DB 记录后 completedPruneOwner 条目的 TTL。
 // Docker 事件在资源删除后通常在数毫秒到数秒内投递给所有订阅者；
 // 30s 提供足够的余量，与 pullEventDeliveryGrace 保持一致。
@@ -2186,8 +2202,9 @@ func (p *ProxyServer) eventBelongsToUser(line []byte, uid int, sudoCtx bool) boo
 	// image 事件的 Actor.ID：pull/tag/untag 事件为 image ref（如 alpine:3.18），
 	//   delete/create 事件为 sha256: 开头的 content ID。
 	// Attributes["name"]：仅含仓库名（如 alpine），不含 tag。
-	// 九条路径：
+	// 十条路径：
 	//   0a.   pendingBuildTags 中有命名 tag 记录（经典 builder/BuildKit 竞态窗口）→ 按 uid 判断
+	//   0a.2. completedBuildOwner 中有命名 tag 记录（build 完成后投递窗口，BUG-28）→ 按 uid 判断
 	//   0b.   pendingPullRefs 中有命名 ref，用 attrs["name"] 查命中              → 按 uid 判断
 	//   0b.2. pendingPullRefs 中有命名 ref，用 Actor.ID 查命中（含完整 tag）      → 按 uid 判断
 	//   0c.   completedPullOwner 中有命名 ref，用 attrs["name"] 查命中           → 按 uid 判断
@@ -2212,6 +2229,19 @@ func (p *ProxyServer) eventBelongsToUser(line []byte, uid int, sudoCtx bool) boo
 					return entry.ownerUID == uid
 				}
 				// 类型断言失败（异常情况）：跳过路径 0a，降级到后续路径
+			}
+			// 路径 0a.2：completedBuildOwner（build 完成后事件投递窗口，BUG-28）。
+			// pendingBuildTags 已清除，但 Docker 事件仍可能在数秒内迟到。
+			// 优先于 DB owner 检查：DB owner 反映原始构建者，不反映最近构建者；
+			// 当用户 B 重建用户 A 曾构建的同 sha256 镜像时，DB owner 仍为 A，
+			// 若不在此拦截，build 事件会泄漏给 A 的事件流。
+			if v, ok := p.completedBuildOwner.Load(name); ok {
+				if entry, ok := v.(pruneOwnerInfo); ok {
+					if !sudoCtx && entry.privCtx == 1 {
+						return false
+					}
+					return entry.ownerUID == uid
+				}
 			}
 			// 路径 0b：pendingPullRefs via attrs["name"]（pull 竞态窗口，BUG-19）
 			if v, ok := p.pendingPullRefs.Load(name); ok {
@@ -2817,6 +2847,16 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 				}
 				p.pendingBuildTags.Store(tag, buildOwner)
 				defer p.pendingBuildTags.CompareAndDelete(tag, buildOwner)
+				// 路径 0a.2 保障（BUG-28）：build 完成时写入 completedBuildOwner，
+				// 覆盖 pendingBuildTags 清除后到 Docker 事件到达订阅者的投递延迟窗口。
+				// 此 defer 在 CompareAndDelete defer 之后注册，因 LIFO 先于其执行，
+				// 确保 completedBuildOwner 在 pendingBuildTags 清除前已可查询。
+				defer func(t string, o pruneOwnerInfo) {
+					p.completedBuildOwner.Store(t, o)
+					time.AfterFunc(buildEventDeliveryGrace, func() {
+						p.completedBuildOwner.CompareAndDelete(t, o)
+					})
+				}(tag, buildOwner)
 			}
 		}
 		isolation.CopyHeaders(w, resp.Header)
@@ -4188,6 +4228,13 @@ func (p *ProxyServer) trackBuildKitImages(id *auth.CallerIdentity, pre *imageSna
 		cleanOwner.privCtx = 1
 	}
 	for _, tag := range newTags {
+		tag := tag
+		// 路径 0a.2 保障（BUG-28）：在清除 pendingBuildTags 之前写入 completedBuildOwner，
+		// 确保 Docker 事件在投递延迟窗口内能找到最近构建者而非 DB 原始 owner。
+		p.completedBuildOwner.Store(tag, cleanOwner)
+		time.AfterFunc(buildEventDeliveryGrace, func() {
+			p.completedBuildOwner.CompareAndDelete(tag, cleanOwner)
+		})
 		p.pendingBuildTags.CompareAndDelete(tag, cleanOwner)
 	}
 }
