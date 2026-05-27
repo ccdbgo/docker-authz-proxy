@@ -5779,9 +5779,11 @@ func (p *ProxyServer) handleContainerPrune(w http.ResponseWriter, id *auth.Calle
 }
 
 // handleImagePrune 拦截非特权用户的 POST /images/prune 请求。
-// 只删除该用户拥有的悬空镜像（RepoTags 为空或 ["<none>:<none>"]）。
 // 通过查询 Docker GET /images/json?filters={"dangling":["true"]} 获取悬空镜像列表，
-// 再与用户的 image_access 取交集，逐个调 DELETE /images/{id} 删除。
+// 按以下规则逐个调 DELETE /images/{id} 删除：
+//   - DB 中无记录（无主镜像，代理部署前已存在或注册失败）→ 允许删除
+//   - DB 中有记录且 owner.UID == caller → 允许删除（自有镜像）
+//   - DB 中有记录且 owner.UID != caller → 跳过（他人镜像，隔离保留）
 // 返回 true 表示已拦截处理，调用方应直接 return；返回 false 表示放行正常流程。
 func (p *ProxyServer) handleImagePrune(w http.ResponseWriter, id *auth.CallerIdentity) bool {
 	if id.IsPrivileged() {
@@ -5819,9 +5821,12 @@ func (p *ProxyServer) handleImagePrune(w http.ResponseWriter, id *auth.CallerIde
 	var imagesDeleted []pruneDeleted
 
 	for _, img := range danglingImages {
-		// 只删除用户可访问的悬空镜像
-		if !p.db.CanSeeImage(id.RealUID, img.ID) {
-			continue
+		// 跳过已知属于他人的悬空镜像；DB 中无记录（无主/代理部署前）的镜像允许清理。
+		// 原 CanSeeImage 对 DB 无记录的镜像始终返回 false，导致历史镜像永远无法被 prune。
+		// GetImageOwner 能区分"他人镜像（found && owner.UID!=caller）"和"无主镜像（!found）"。
+		imgOwner, _, _, imgFound := p.db.GetImageOwner(img.ID)
+		if imgFound && imgOwner != nil && imgOwner.UID != id.RealUID {
+			continue // 已知属于他人：跳过
 		}
 		delReq, err := http.NewRequest("DELETE", "http://docker/images/"+img.ID, nil)
 		if err != nil {
@@ -5963,6 +5968,10 @@ func (p *ProxyServer) handleNetworkPrune(w http.ResponseWriter, r *http.Request,
 // handleSystemPrune 拦截非特权用户的 POST /system/prune 请求。
 // 依次调用 container / image / network / volume prune，各自只清理用户自己的资源，
 // 合并结果后返回与 Docker 原生 system prune 格式一致的响应。
+// 镜像清理与 handleImagePrune 语义一致：
+//   - DB 中无记录（无主镜像）→ 允许删除
+//   - DB 中有记录且 owner.UID == caller → 允许删除
+//   - DB 中有记录且 owner.UID != caller → 跳过（隔离保留）
 // 返回 true 表示已拦截处理，调用方应直接 return；返回 false 表示放行正常流程。
 func (p *ProxyServer) handleSystemPrune(w http.ResponseWriter, r *http.Request, id *auth.CallerIdentity) bool {
 	if id.IsPrivileged() {
@@ -6005,8 +6014,10 @@ func (p *ProxyServer) handleSystemPrune(w http.ResponseWriter, r *http.Request, 
 			}
 			if json.Unmarshal(listBody, &danglingImages) == nil {
 				for _, img := range danglingImages {
-					if !p.db.CanSeeImage(id.RealUID, img.ID) {
-						continue
+					// 跳过已知属于他人的悬空镜像；DB 中无记录（无主/代理部署前）的镜像允许清理。
+					imgOwner, _, _, imgFound := p.db.GetImageOwner(img.ID)
+					if imgFound && imgOwner != nil && imgOwner.UID != id.RealUID {
+						continue // 已知属于他人：跳过
 					}
 					delReq, _ := http.NewRequest("DELETE", "http://docker/images/"+img.ID, nil)
 					if delReq == nil {
@@ -6019,6 +6030,14 @@ func (p *ProxyServer) handleSystemPrune(w http.ResponseWriter, r *http.Request, 
 					delBody, _ := io.ReadAll(delResp.Body)
 					delResp.Body.Close()
 					if delResp.StatusCode == http.StatusOK {
+						// 竞态补偿：先存 completedPruneOwner，再删 DB
+						pruneKey := "image:" + img.ID
+						_, _, imgPrivCtx, _ := p.db.GetImageOwner(img.ID)
+						entry := pruneOwnerInfo{ownerUID: id.RealUID, privCtx: imgPrivCtx}
+						p.completedPruneOwner.Store(pruneKey, entry)
+						time.AfterFunc(pruneEventDeliveryGrace, func() {
+							p.completedPruneOwner.CompareAndDelete(pruneKey, entry)
+						})
 						_ = p.db.DeleteImage(img.ID)
 						var items []pruneDeleted
 						if json.Unmarshal(delBody, &items) == nil {
