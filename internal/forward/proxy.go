@@ -744,6 +744,20 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			defer p.pendingPullRefs.CompareAndDelete(pullRef, pullOwner)
 		}
 	}
+	// BUG-29 sudo 裸名卷 create 事件竞态防护：特权用户创建的裸名卷（无 user-{uid}-volume- 前缀）
+	// 在 SetVolumeOwner 写入 DB 前 Docker 已发出 create 事件，eventBelongsToUser 走路径3放行泄漏。
+	// 在 forward 前预注册 completedPruneOwner，覆盖从请求发出到 DB 写入之间的竞态窗口。
+	if action == authz.ActionVolumeCreate && identity.IsPrivileged() {
+		if volName, ok := modifiedReq.Context().Value(rewrittenNameCtxKey).(string); ok && volName != "" {
+			volCreateEntry := pruneOwnerInfo{ownerUID: identity.RealUID}
+			if identity.IsSudoCommand() {
+				volCreateEntry.privCtx = 1
+			}
+			volCreateKey := "volume:" + volName
+			p.completedPruneOwner.Store(volCreateKey, volCreateEntry)
+			defer p.completedPruneOwner.CompareAndDelete(volCreateKey, volCreateEntry)
+		}
+	}
 	forwardStart := time.Now()
 	resp, err := p.forward(modifiedReq, isSlowAction(action))
 	latencyMs := time.Since(forwardStart).Milliseconds()
@@ -1850,6 +1864,15 @@ func (p *ProxyServer) preprocessRequest(r *http.Request, id *auth.CallerIdentity
 	case authz.ActionVolumeCreate:
 		if !id.IsPrivileged() {
 			body, _ = isolation.InjectVolumeNamePrefix(body, id)
+		} else {
+			// 特权用户不注入前缀，但需将裸名存入 context，
+			// 供 ServeHTTP 在 forward 前注册竞态防护条目（BUG-29）。
+			var req struct {
+				Name string `json:"Name"`
+			}
+			if json.Unmarshal(body, &req) == nil && req.Name != "" {
+				r = r.WithContext(context.WithValue(r.Context(), rewrittenNameCtxKey, req.Name))
+			}
 		}
 
 	case authz.ActionRename:
