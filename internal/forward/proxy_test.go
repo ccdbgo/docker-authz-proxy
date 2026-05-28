@@ -77,7 +77,7 @@ func TestStreamAndCaptureLoadedImageIDs_Single(t *testing.T) {
 		Header:     http.Header{},
 	}
 	rw := httptest.NewRecorder()
-	ids := streamAndCaptureLoadedImageIDs(rw, resp)
+	ids := streamAndCaptureLoadedImageIDs(rw, resp, nil)
 
 	if len(ids) != 1 {
 		t.Fatalf("expected 1 image ID, got %d: %v", len(ids), ids)
@@ -100,7 +100,7 @@ func TestStreamAndCaptureLoadedImageIDs_Multiple(t *testing.T) {
 		Header:     http.Header{},
 	}
 	rw := httptest.NewRecorder()
-	ids := streamAndCaptureLoadedImageIDs(rw, resp)
+	ids := streamAndCaptureLoadedImageIDs(rw, resp, nil)
 
 	if len(ids) != 2 {
 		t.Errorf("expected 2 image IDs, got %d: %v", len(ids), ids)
@@ -116,10 +116,16 @@ func TestStreamAndCaptureLoadedImageIDs_ByTag(t *testing.T) {
 		Header:     http.Header{},
 	}
 	rw := httptest.NewRecorder()
-	ids := streamAndCaptureLoadedImageIDs(rw, resp)
+	var calledWith []string
+	ids := streamAndCaptureLoadedImageIDs(rw, resp, func(tag string) {
+		calledWith = append(calledWith, tag)
+	})
 
 	if len(ids) != 0 {
 		t.Errorf("expected 0 IDs for tag-only load line, got %d: %v", len(ids), ids)
+	}
+	if len(calledWith) != 1 || calledWith[0] != "nginx:latest" {
+		t.Errorf("onTagLoaded expected [nginx:latest], got %v", calledWith)
 	}
 }
 

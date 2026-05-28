@@ -744,6 +744,33 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			defer p.pendingPullRefs.CompareAndDelete(pullRef, pullOwner)
 		}
 	}
+	// BUG-30 ActionCommit tag 事件竞态防护：
+	// docker commit 有 ?repo= 参数时，Docker 会发出 image tag 事件，Actor.ID 为完整 ref。
+	// 在 forward 前预注册 pendingBuildTags，覆盖 DB 写入前的竞态窗口（复用 build tag 路径）。
+	// tag 为空时 Docker 默认使用 "latest"，必须补全以匹配事件 Actor.ID。
+	if action == authz.ActionCommit {
+		if repo := r.URL.Query().Get("repo"); repo != "" {
+			tag := r.URL.Query().Get("tag")
+			if tag == "" {
+				tag = "latest"
+			}
+			ref := repo + ":" + tag
+			commitTagOwner := pruneOwnerInfo{ownerUID: identity.RealUID}
+			if identity.IsSudoCommand() {
+				commitTagOwner.privCtx = 1
+			}
+			p.pendingBuildTags.Store(ref, commitTagOwner)
+			defer p.pendingBuildTags.CompareAndDelete(ref, commitTagOwner)
+			// LIFO：此 defer 后注册先执行，确保 completedBuildOwner 在 pendingBuildTags
+			// 清除前已可查询，对齐 ActionBuild 的竞态保障模式（BUG-28）。
+			defer func(r string, o pruneOwnerInfo) {
+				p.completedBuildOwner.Store(r, o)
+				time.AfterFunc(buildEventDeliveryGrace, func() {
+					p.completedBuildOwner.CompareAndDelete(r, o)
+				})
+			}(ref, commitTagOwner)
+		}
+	}
 	// BUG-29 sudo 裸名卷 create 事件竞态防护：特权用户创建的裸名卷（无 user-{uid}-volume- 前缀）
 	// 在 SetVolumeOwner 写入 DB 前 Docker 已发出 create 事件，eventBelongsToUser 走路径3放行泄漏。
 	// 在 forward 前预注册 completedPruneOwner，覆盖从请求发出到 DB 写入之间的竞态窗口。
@@ -2316,6 +2343,23 @@ func (p *ProxyServer) eventBelongsToUser(line []byte, uid int, sudoCtx bool) boo
 			}
 		}
 
+		// 路径 0a.4：commit/load 的 image create 事件（BUG-30）。
+		// Actor.ID 为 sha256:xxx，completedBuildOwner 以相同 key 注册（改动B/C）。
+		// 不查 pendingBuildTags（commit/load 不向其注册 sha256 key）。
+		// 仅对 Action="create" 生效：delete 等其他事件由后续 DB 路径处理，避免短路。
+		if ev.Action == "create" {
+			if actorRef := ev.Actor.ID; strings.HasPrefix(actorRef, "sha256:") {
+				if v, ok := p.completedBuildOwner.Load(actorRef); ok {
+					if entry, ok := v.(pruneOwnerInfo); ok {
+						if !sudoCtx && entry.privCtx == 1 {
+							return false
+						}
+						return entry.ownerUID == uid
+					}
+				}
+			}
+		}
+
 		// 路径 0c / 0c.2：completedPullOwner（pull 完成后事件投递窗口，BUG-20）
 		// pendingPullRefs 在 ServeHTTP defer 运行时已清除，但 Docker 事件仍可能在此后
 		// 数秒内到达订阅者（异步投递延迟）。completedPullOwner 在 SetImageOwner 调用后
@@ -2572,7 +2616,26 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 		isolation.CopyHeaders(w, resp.Header)
 		w.WriteHeader(resp.StatusCode)
 		if resp.StatusCode == http.StatusOK {
-			imageIDs := streamAndCaptureLoadedImageIDs(w, resp)
+			loadOwner := pruneOwnerInfo{ownerUID: id.RealUID}
+			if id.IsSudoCommand() {
+				loadOwner.privCtx = 1
+			}
+			// BUG-30：onTagLoaded 在流扫描到 "Loaded image: repo:tag" 行时立即回调。
+			// 必须在扫描循环内同步注册 completedBuildOwner，不能等函数返回后再注册，
+			// 因为 Docker tag 事件在该行输出时即将发出，延迟注册无法覆盖竞态窗口。
+			// normalizeImageRef 剥离 "docker.io/library/" 前缀，与事件 Actor.ID 格式对齐。
+			onTagLoaded := func(tagRef string) {
+				tagRef = normalizeImageRef(tagRef)
+				if tagRef == "" {
+					return
+				}
+				o := loadOwner // 值拷贝，不依赖外部变量后续变化
+				p.completedBuildOwner.Store(tagRef, o)
+				time.AfterFunc(buildEventDeliveryGrace, func() {
+					p.completedBuildOwner.CompareAndDelete(tagRef, o)
+				})
+			}
+			imageIDs := streamAndCaptureLoadedImageIDs(w, resp, onTagLoaded)
 			for _, imageID := range imageIDs {
 				if err := p.db.SetImageOwner(imageID, id, false, "load"); err != nil {
 					p.logger.Error("save_image_owner_failed",
@@ -2581,10 +2644,18 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 						zap.Int("real_uid", id.RealUID),
 						zap.Error(err))
 				} else {
+					_ = p.db.EnsureImageAccess(imageID, id.RealUID)
 					p.logger.Info("image_loaded",
 						append(audit.LogIdentityFields(auditID),
 							zap.String("image_id", truncID(imageID)),
 						)...)
+					// BUG-30：sha256 key 覆盖 create 事件（path 0a.4），
+					// 兜底 SetImageOwner 写入后到事件投递的延迟窗口。
+					o := loadOwner // 值拷贝，安全捕获
+					p.completedBuildOwner.Store(imageID, o)
+					time.AfterFunc(buildEventDeliveryGrace, func() {
+						p.completedBuildOwner.CompareAndDelete(imageID, o)
+					})
 				}
 			}
 		} else {
@@ -2609,12 +2680,25 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 						zap.String("real_username", id.RealUsername),
 						zap.Int("real_uid", id.RealUID),
 						zap.Error(err))
-				} else {
+					} else {
 					_ = p.db.EnsureImageAccess(imageID, id.RealUID)
 					p.logger.Info("image_committed",
 						append(audit.LogIdentityFields(auditID),
 							zap.String("image_id", truncID(imageID)),
 						)...)
+					// BUG-30：commit create 事件竞态兜底。
+					// ReadFullBody 同步读完才写 DB，Docker create 事件可能已在此之前广播。
+					// 以 "sha256:"+imageID 为 key 注册 completedBuildOwner（30s TTL），
+					// eventBelongsToUser path 0a.4 查此 key 实现归属判断。
+					sha256Key := "sha256:" + imageID
+					commitOwner := pruneOwnerInfo{ownerUID: id.RealUID}
+					if id.IsSudoCommand() {
+						commitOwner.privCtx = 1
+					}
+					p.completedBuildOwner.Store(sha256Key, commitOwner)
+					time.AfterFunc(buildEventDeliveryGrace, func() {
+						p.completedBuildOwner.CompareAndDelete(sha256Key, commitOwner)
+					})
 				}
 			}
 		}
@@ -5181,8 +5265,10 @@ func (p *ProxyServer) resolveContainerDockerID(nameOrID string) string {
 	return c.ID
 }
 
-// streamAndCaptureLoadedImageIDs 流式转发 docker load 响应，捕获加载的镜像 ID
-func streamAndCaptureLoadedImageIDs(w http.ResponseWriter, resp *http.Response) []string {
+// streamAndCaptureLoadedImageIDs 流式转发 docker load 响应，捕获加载的镜像 ID。
+// onTagLoaded 在扫描到 "Loaded image: repo:tag" 行时立即回调（可为 nil）。
+// 回调在扫描循环内同步调用，调用方不得在回调中阻塞。
+func streamAndCaptureLoadedImageIDs(w http.ResponseWriter, resp *http.Response, onTagLoaded func(string)) []string {
 	flusher, canFlush := w.(http.Flusher)
 	var imageIDs []string
 
@@ -5203,6 +5289,15 @@ func streamAndCaptureLoadedImageIDs(w http.ResponseWriter, resp *http.Response) 
 				id := strings.TrimSpace(strings.TrimPrefix(msg.Stream, "Loaded image ID: "))
 				if id != "" {
 					imageIDs = append(imageIDs, id)
+				}
+			} else if strings.HasPrefix(msg.Stream, "Loaded image: ") {
+				// 含 tag 格式："Loaded image: [registry/]repo:tag"
+				// 立即回调而非缓存后返回，确保 completedBuildOwner 在事件发出前注册。
+				if onTagLoaded != nil {
+					tag := strings.TrimSpace(strings.TrimPrefix(msg.Stream, "Loaded image: "))
+					if tag != "" {
+						onTagLoaded(tag)
+					}
 				}
 			}
 		}
