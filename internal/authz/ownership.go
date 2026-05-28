@@ -295,6 +295,20 @@ func (o *OwnershipDB) GetContainerOwner(id string) (*OwnerInfo, bool) {
 	return &info, true
 }
 
+// GetContainerOwnerAndPrivCtx 返回容器的归属 UID 与 privileged_context（BUG-31）。
+// 用于 eventBelongsToUser network connect/disconnect 路径：内置网络（bridge/host/none）
+// 无用户前缀，需回退到容器归属判断可见性。
+// 返回 found=false 时表示容器不在 DB（竞态窗口或系统容器），调用方应放行。
+func (o *OwnershipDB) GetContainerOwnerAndPrivCtx(id string) (ownerUID int, privCtx int, found bool) {
+	err := o.DB.QueryRow(
+		`SELECT owner_uid, privileged_context FROM containers WHERE id = ?`, id,
+	).Scan(&ownerUID, &privCtx)
+	if err != nil {
+		return 0, 0, false
+	}
+	return ownerUID, privCtx, true
+}
+
 // DeleteContainer 删除容器归属记录
 func (o *OwnershipDB) DeleteContainer(id string) error {
 	_, err := o.DB.Exec(`DELETE FROM containers WHERE id = ?`, id)

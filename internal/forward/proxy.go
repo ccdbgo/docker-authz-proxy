@@ -2176,9 +2176,10 @@ func (p *ProxyServer) eventBelongsToUser(line []byte, uid int, sudoCtx bool) boo
 			return true
 		}
 		// 路径 3：无 _u{digits}_ 段，检查是否为 sudo 创建的裸名网络（BUG-26/29b）。
-		// DB 有记录（正常窗口）→ 按 privileged_context 隐藏；
+		// DB 有记录（正常窗口）→ 按 privileged_context 隐藏（裸名 sudo 网络）；
 		// DB 无记录（create/rm 竞态窗口）→ 查 completedPruneOwner 补偿；
-		// 两者均无 → 视为系统内置网络，放行。
+		// 两者均无，但 attrs["container"] 非空 → 按容器归属过滤（BUG-31，内置网络场景）；
+		// 三者均无 → 视为系统内置网络，放行。
 		if p.db != nil {
 			if privCtx, found := p.db.GetNetworkPrivCtxByName(name); found && privCtx == 1 && !sudoCtx {
 				return false
@@ -2187,6 +2188,37 @@ func (p *ProxyServer) eventBelongsToUser(line []byte, uid int, sudoCtx bool) boo
 		if v, ok := p.completedPruneOwner.Load("network:" + name); ok {
 			if entry, ok := v.(pruneOwnerInfo); ok && entry.privCtx == 1 && !sudoCtx {
 				return false
+			}
+		}
+		// path 3 末尾：network connect/disconnect 携带 attrs["container"] 时，
+		// 通过容器归属过滤（BUG-31）。
+		// 场景：sudo docker run → docker 将容器接入内置 bridge/host/none 网络，
+		//       connect/disconnect 事件不含用户前缀，原逻辑全部放行导致泄漏。
+		// 变量命名 ctnOwnerUID/ctnPrivCtx：与上方网络 privCtx 区分，避免视觉混淆。
+		// 补偿路径（else if）：容器 prune 后 DB 记录已删除但事件投递延迟（30s 窗口），
+		//   与 handleContainerPrune 的 completedPruneOwner.Store("container:"+cid) 对称。
+		//   注意：handleContainerPrune 仅 prune privileged_context=0 的容器，
+		//   因此补偿条目的 privCtx 在生产中始终为 0，else if 内的 privCtx==1 分支不可达，
+		//   保留仅作防御性处理。
+		// found=false 且无补偿记录（--rm 销毁竞态窗口或系统容器）→ 维持放行，不引入误过滤。
+		if ctnID := attrs["container"]; ctnID != "" && p.db != nil {
+			if ctnOwnerUID, ctnPrivCtx, found := p.db.GetContainerOwnerAndPrivCtx(ctnID); found {
+				if ctnOwnerUID != uid {
+					return false // 属于其他用户的容器
+				}
+				if !sudoCtx && ctnPrivCtx == 1 {
+					return false // sudo 上下文容器：非 sudo 视图不可见
+				}
+			} else if v, ok := p.completedPruneOwner.Load("container:" + ctnID); ok {
+				// 竞态补偿：container prune 已删 DB，但 network 事件投递延迟
+				if entry, ok := v.(pruneOwnerInfo); ok {
+					if entry.ownerUID != uid {
+						return false
+					}
+					if !sudoCtx && entry.privCtx == 1 {
+						return false
+					}
+				}
 			}
 		}
 		return true // 系统内置网络或未知网络，放行
