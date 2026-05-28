@@ -3132,6 +3132,17 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 					if item.Deleted == "" {
 						continue // Untagged-only：镜像未被物理删除，保留 DB 记录
 					}
+					// 竞态补偿：先存 completedPruneOwner，再删 DB（与 handleImagePrune / ActionVolumeRemove 对称）。
+					// 保证 Docker 异步 delete 事件到达 eventBelongsToUser 路径3时仍能查到属主和 privCtx。
+					// 仅对私有镜像注册：公共镜像删除事件应对所有用户可见，不做隔离限制。
+					if imgOwner, isPublic, imgPrivCtx, imgFound := p.db.GetImageOwner(item.Deleted); imgFound && !isPublic {
+						key := "image:" + item.Deleted
+						entry := pruneOwnerInfo{ownerUID: imgOwner.UID, privCtx: imgPrivCtx}
+						p.completedPruneOwner.Store(key, entry)
+						time.AfterFunc(pruneEventDeliveryGrace, func() {
+							p.completedPruneOwner.CompareAndDelete(key, entry)
+						})
+					}
 					// item.Deleted 格式为 "sha256:xxx"，DeleteImage 内 normalizeImageID 去前缀
 					_ = p.db.DeleteImage(item.Deleted)
 					p.logger.Info("image_deleted",
