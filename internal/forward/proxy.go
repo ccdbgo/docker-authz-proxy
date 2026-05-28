@@ -797,6 +797,32 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			defer p.completedPruneOwner.CompareAndDelete(netCreateKey, netCreateEntry)
 		}
 	}
+	// BUG-33b sudo/root rmi 时序竞态防护：
+	// Docker daemon 在执行 DELETE /images 期间先广播 image untag/delete 事件，
+	// 再返回 HTTP 响应（实测事件比响应早 ~7ms）。postprocessResponse 写入
+	// completedPruneOwner 的时机晚于事件到达 eventBelongsToUser，导致路径3 miss，
+	// 未追踪镜像（imgFound=false）的事件对所有用户透传泄漏。
+	// 修复：在 forward() 前为未追踪镜像预注册 completedPruneOwner，
+	// 覆盖从 DELETE 请求发出到 HTTP 响应返回之间的竞态窗口。
+	// 预注册条目的 TTL 依赖 defer CompareAndDelete（forward 返回后立即替换为
+	// postprocessResponse 写入的 time.AfterFunc 30s 条目，无二次覆盖风险）。
+	if action == authz.ActionRemoveImage && identity.IsPrivileged() {
+		rmiRef := authz.ExtractImageID(modifiedReq.URL.Path)
+		if rmiRef != "" {
+			if rmiResolvedID := p.resolveImageIDByRef(rmiRef); rmiResolvedID != "" {
+				_, _, _, rmiImgFound := p.db.GetImageOwner(rmiResolvedID)
+				if !rmiImgFound {
+					rmiPreEntry := pruneOwnerInfo{ownerUID: identity.RealUID}
+					if identity.IsSudoCommand() {
+						rmiPreEntry.privCtx = 1
+					}
+					rmiPreKey := "image:" + rmiResolvedID
+					p.completedPruneOwner.Store(rmiPreKey, rmiPreEntry)
+					defer p.completedPruneOwner.CompareAndDelete(rmiPreKey, rmiPreEntry)
+				}
+			}
+		}
+	}
 	forwardStart := time.Now()
 	resp, err := p.forward(modifiedReq, isSlowAction(action))
 	latencyMs := time.Since(forwardStart).Milliseconds()
@@ -3128,26 +3154,91 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 				Untagged string `json:"Untagged"`
 			}
 			if json.Unmarshal(body, &rmiItems) == nil {
+				// ── 两遍扫描：将 rmiItems 按 Deleted 为边界分组 ────────────────────
+				// Docker rmi 响应中同一镜像的 Untagged 条目通常先于对应的 Deleted，
+				// 但层共享等边缘场景（B5）可能顺序颠倒（Untagged 在 Deleted 之后）。
+				// 两遍扫描保证顺序无关，且严格按区间归属，避免跨镜像 Untagged 污染。
+				//
+				// 分组策略：
+				//   - 遇到 Deleted 时新建/完结一个 group，其前后的 Untagged 均归属该 group。
+				//   - 在首个 Deleted 之前出现的 Untagged（orphan）延迟归入后续第一个 Deleted。
+				//   - 全为 Untagged 无 Deleted 的 orphan（镜像仍存在，只是解除引用）忽略。
+				//
+				// BUG-33b: imgFound=false 且调用方为特权用户时以请求方 UID 兜底，
+				//   防止 sha256 格式事件泄漏给其他用户。
+				// BUG-33:  同时注册本 Deleted 直属 Untagged 的补偿条目，
+				//   供 Docker 异步 untag 事件的 completedPruneOwner 路径匹配。
+				type rmiGroup struct {
+					deletedID string
+					untagged  []string
+				}
+				var groups []rmiGroup
+				curGroup := -1
 				for _, item := range rmiItems {
-					if item.Deleted == "" {
-						continue // Untagged-only：镜像未被物理删除，保留 DB 记录
+					if item.Deleted != "" {
+						groups = append(groups, rmiGroup{deletedID: item.Deleted})
+						curGroup = len(groups) - 1
+					} else if item.Untagged != "" {
+						if curGroup >= 0 {
+							// 后置 Untagged（Untagged 在 Deleted 之后）：归属当前 group
+							groups[curGroup].untagged = append(groups[curGroup].untagged, item.Untagged)
+						} else {
+							// 前置 Untagged（首个 Deleted 之前）：存入无 deletedID 的占位 group
+							groups = append(groups, rmiGroup{untagged: []string{item.Untagged}})
+						}
 					}
-					// 竞态补偿：先存 completedPruneOwner，再删 DB（与 handleImagePrune / ActionVolumeRemove 对称）。
-					// 保证 Docker 异步 delete 事件到达 eventBelongsToUser 路径3时仍能查到属主和 privCtx。
-					// 仅对私有镜像注册：公共镜像删除事件应对所有用户可见，不做隔离限制。
-					if imgOwner, isPublic, imgPrivCtx, imgFound := p.db.GetImageOwner(item.Deleted); imgFound && !isPublic {
-						key := "image:" + item.Deleted
-						entry := pruneOwnerInfo{ownerUID: imgOwner.UID, privCtx: imgPrivCtx}
-						p.completedPruneOwner.Store(key, entry)
+				}
+				// 合并：将无 deletedID 的前置 orphan 归入紧随其后的第一个有 Deleted 的 group
+				var merged []rmiGroup
+				var orphanUntagged []string
+				for _, g := range groups {
+					if g.deletedID == "" {
+						orphanUntagged = append(orphanUntagged, g.untagged...)
+					} else {
+						g.untagged = append(orphanUntagged, g.untagged...)
+						orphanUntagged = nil
+						merged = append(merged, g)
+					}
+				}
+				// orphanUntagged 有剩余：全为 Untagged 无 Deleted（镜像未物理删除），忽略
+
+				for _, g := range merged {
+					imgOwner, isPublic, imgPrivCtx, imgFound := p.db.GetImageOwner(g.deletedID)
+					var rmiEntry pruneOwnerInfo
+					var storeEntry bool
+					if imgFound && !isPublic {
+						rmiEntry = pruneOwnerInfo{ownerUID: imgOwner.UID, privCtx: imgPrivCtx}
+						storeEntry = true
+					} else if !imgFound && id != nil && id.IsPrivileged() {
+						privCtx := 0
+						if id.IsSudoCommand() {
+							privCtx = 1
+						}
+						rmiEntry = pruneOwnerInfo{ownerUID: id.RealUID, privCtx: privCtx}
+						storeEntry = true
+					}
+					if storeEntry {
+						key := "image:" + g.deletedID
+						p.completedPruneOwner.Store(key, rmiEntry)
 						time.AfterFunc(pruneEventDeliveryGrace, func() {
-							p.completedPruneOwner.CompareAndDelete(key, entry)
+							p.completedPruneOwner.CompareAndDelete(key, rmiEntry)
 						})
+						for _, tag := range g.untagged {
+							if tag == "" {
+								continue
+							}
+							tagKey := "image:" + tag
+							p.completedPruneOwner.Store(tagKey, rmiEntry)
+							time.AfterFunc(pruneEventDeliveryGrace, func() {
+								p.completedPruneOwner.CompareAndDelete(tagKey, rmiEntry)
+							})
+						}
 					}
-					// item.Deleted 格式为 "sha256:xxx"，DeleteImage 内 normalizeImageID 去前缀
-					_ = p.db.DeleteImage(item.Deleted)
+					// g.deletedID 格式为 "sha256:xxx"，DeleteImage 内 normalizeImageID 去前缀
+					_ = p.db.DeleteImage(g.deletedID)
 					p.logger.Info("image_deleted",
 						append(audit.LogIdentityFields(auditID),
-							zap.String("image_id", truncID(item.Deleted)),
+							zap.String("image_id", truncID(g.deletedID)),
 						)...)
 				}
 			}
