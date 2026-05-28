@@ -124,7 +124,7 @@ type ProxyServer struct {
 	// key 格式："{type}:{id}"，如 "volume:user-1001-volume-foo"、"image:sha256:abc…"
 	// 生命周期：删 DB 前 Store，pruneEventDeliveryGrace 后由 time.AfterFunc 自动清除。
 	// 并发安全：CompareAndDelete 确保 timer 只删除与自身 ownerUID 匹配的条目。
-	completedPruneOwner sync.Map // map[string]int: "{type}:{id}" → ownerUID
+	completedPruneOwner sync.Map // map[string]pruneOwnerInfo: "{type}:{id}" → {ownerUID, privCtx}
 }
 
 // ProxyOptions 可选配置参数
@@ -783,6 +783,18 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			volCreateKey := "volume:" + volName
 			p.completedPruneOwner.Store(volCreateKey, volCreateEntry)
 			defer p.completedPruneOwner.CompareAndDelete(volCreateKey, volCreateEntry)
+		}
+	}
+	// BUG-29b sudo 裸名网络 create 事件竞态防护：与 BUG-29 对称，覆盖 SetNetworkOwner 写入 DB 前的窗口。
+	if action == authz.ActionNetworkCreate && identity.IsPrivileged() {
+		if netName, ok := modifiedReq.Context().Value(rewrittenNameCtxKey).(string); ok && netName != "" {
+			netCreateEntry := pruneOwnerInfo{ownerUID: identity.RealUID}
+			if identity.IsSudoCommand() {
+				netCreateEntry.privCtx = 1
+			}
+			netCreateKey := "network:" + netName
+			p.completedPruneOwner.Store(netCreateKey, netCreateEntry)
+			defer p.completedPruneOwner.CompareAndDelete(netCreateKey, netCreateEntry)
 		}
 	}
 	forwardStart := time.Now()
@@ -2163,9 +2175,9 @@ func (p *ProxyServer) eventBelongsToUser(line []byte, uid int, sudoCtx bool) boo
 			}
 			return true
 		}
-		// 路径 3：无 _u{digits}_ 段，检查是否为 sudo 创建的裸名网络（BUG-26）。
-		// DB 有记录（create 事件窗口）→ 按 privileged_context 隐藏；
-		// DB 无记录（rm 竞态窗口）→ 查 completedPruneOwner 补偿；
+		// 路径 3：无 _u{digits}_ 段，检查是否为 sudo 创建的裸名网络（BUG-26/29b）。
+		// DB 有记录（正常窗口）→ 按 privileged_context 隐藏；
+		// DB 无记录（create/rm 竞态窗口）→ 查 completedPruneOwner 补偿；
 		// 两者均无 → 视为系统内置网络，放行。
 		if p.db != nil {
 			if privCtx, found := p.db.GetNetworkPrivCtxByName(name); found && privCtx == 1 && !sudoCtx {
@@ -6264,15 +6276,6 @@ func (p *ProxyServer) handleNetworkPrune(w http.ResponseWriter, r *http.Request,
 		_, _ = io.Copy(io.Discard, delResp.Body)
 		delResp.Body.Close()
 		if delResp.StatusCode == http.StatusNoContent || delResp.StatusCode == http.StatusOK {
-			// 竞态补偿：先存 completedPruneOwner，再删 DB
-			// network 事件通过名称前缀 _u{uid}_ 判断属主，DB 删除不影响名称；
-			// 仍存入以保持与其他资源类型行为一致，且可应对系统内置网络边界情形。
-			pruneKey := "network:" + netID
-			entry := pruneOwnerInfo{ownerUID: id.RealUID, privCtx: 0}
-			p.completedPruneOwner.Store(pruneKey, entry)
-			time.AfterFunc(pruneEventDeliveryGrace, func() {
-				p.completedPruneOwner.CompareAndDelete(pruneKey, entry)
-			})
 			// [H1] 记录 DB 删除失败，防止幽灵记录静默堆积
 			if dbErr := p.db.DeleteNetwork(netID); dbErr != nil {
 				p.logger.Error("network_prune_db_delete_failed",
