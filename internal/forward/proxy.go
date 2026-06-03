@@ -3699,50 +3699,76 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 			(strings.Contains(resp.Header.Get("Transfer-Encoding"), "chunked") ||
 				strings.Contains(r.URL.Path, "/events") ||
 				strings.Contains(r.URL.Path, "/stats"))
-		if isStreaming {
-			// 删除上游的 Transfer-Encoding 头：Go HTTP server 会自动对流式响应做
-			// chunked 编码，若保留该头会造成双重 chunked，客户端报 unexpected EOF。
-			w.Header().Del("Transfer-Encoding")
+
+		// stats 响应中容器名需剥离用户前缀（"name":"/user-1002-xxx" → "name":"/xxx"）
+		isStats := !id.IsPrivileged() && strings.HasSuffix(r.URL.Path, "/stats")
+		var statsNameOld, statsNameNew []byte
+		if isStats {
+			statsNameOld = []byte(`"name":"/` + isolation.UserContainerPrefix(id.RealUID))
+			statsNameNew = []byte(`"name":"/`)
 		}
-		w.WriteHeader(resp.StatusCode)
-		if flusher, ok := w.(http.Flusher); ok && isStreaming {
-			// /events 流：逐行读取，按 owner label 过滤，只向当前用户推送自己的事件。
-			// privileged 用户（root/sudo）可看到所有事件。
-			// 其他流式响应（/stats 等）直接透传不过滤。
-			isEvents := strings.Contains(r.URL.Path, "/events")
-			br := bufio.NewReaderSize(resp.Body, 64*1024)
-			for {
-				// ReadLine 不受单行长度限制（isPrefix=true 时分段拼接）
-				var line []byte
+
+		if isStats && !isStreaming {
+			// 非流式 stats（stream=false）：先读 body，剥离名称前缀，重算 Content-Length
+			body, _ := isolation.ReadFullBody(resp.Body)
+			body = bytes.Replace(body, statsNameOld, statsNameNew, 1)
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+			w.WriteHeader(resp.StatusCode)
+			_, _ = w.Write(body)
+		} else {
+			if isStreaming {
+				// 删除上游的 Transfer-Encoding 头：Go HTTP server 会自动对流式响应做
+				// chunked 编码，若保留该头会造成双重 chunked，客户端报 unexpected EOF。
+				w.Header().Del("Transfer-Encoding")
+			}
+			w.WriteHeader(resp.StatusCode)
+			if flusher, ok := w.(http.Flusher); ok && isStreaming {
+				// 立即 flush 响应头：docker stats（无参数）的 CLI 先订阅 /events 流，
+				// 阻塞等待响应头返回后才继续列出容器。若不 flush，下方 ReadLine 阻塞时
+				// 客户端永远收不到响应头，导致 docker stats 卡死。
+				flusher.Flush()
+				// /events 流：逐行读取，按 owner label 过滤，只向当前用户推送自己的事件。
+				// privileged 用户（root/sudo）可看到所有事件。
+				// 其他流式响应（/stats 等）直接透传不过滤。
+				isEvents := strings.Contains(r.URL.Path, "/events")
+				br := bufio.NewReaderSize(resp.Body, 64*1024)
 				for {
-					seg, isPrefix, err := br.ReadLine()
-					line = append(line, seg...)
-					if !isPrefix || err != nil {
-						break
+					// ReadLine 不受单行长度限制（isPrefix=true 时分段拼接）
+					var line []byte
+					for {
+						seg, isPrefix, err := br.ReadLine()
+						line = append(line, seg...)
+						if !isPrefix || err != nil {
+							break
+						}
 					}
-				}
-				if len(line) == 0 {
-					// 检查是否已到流末尾
-					if _, peekErr := br.Peek(1); peekErr != nil {
-						break
-					}
-					continue
-				}
-				// /events 过滤：非 privileged 用户只看自己的事件
-				if isEvents && !id.IsPrivileged() {
-					if !p.eventBelongsToUser(line, id.RealUID, id.IsSudoCommand()) {
+					if len(line) == 0 {
+						// 检查是否已到流末尾
+						if _, peekErr := br.Peek(1); peekErr != nil {
+							break
+						}
 						continue
 					}
+					// /events 过滤：非 privileged 用户只看自己的事件
+					if isEvents && !id.IsPrivileged() {
+						if !p.eventBelongsToUser(line, id.RealUID, id.IsSudoCommand()) {
+							continue
+						}
+					}
+					// stats 流式响应：剥离容器名用户前缀
+					if isStats {
+						line = bytes.Replace(line, statsNameOld, statsNameNew, 1)
+					}
+					_, _ = w.Write(line)
+					_, _ = w.Write([]byte("\n"))
+					flusher.Flush()
 				}
-				_, _ = w.Write(line)
-				_, _ = w.Write([]byte("\n"))
-				flusher.Flush()
+			} else {
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
+				_, _ = io.Copy(w, resp.Body)
 			}
-		} else {
-			if f, ok := w.(http.Flusher); ok {
-				f.Flush()
-			}
-			_, _ = io.Copy(w, resp.Body)
 		}
 	}
 
