@@ -1307,7 +1307,7 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 						zap.String("action", action),
 					)...)
 				p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "volume_not_tracked", "", http.StatusNotFound))
-				writeDockerNotFound(w, "volume", volName)
+				writeDockerNotFound(w, "volume", strings.TrimPrefix(volName, prefix))
 				return r, false
 			} else if owner.UID != id.RealUID {
 				auditID := toAuditIdentity(id)
@@ -1318,7 +1318,7 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 						zap.String("action", action),
 					)...)
 				p.auditLog.WriteEntry(makeAuditEntry(id, r, action, "deny", "not_your_volume", "", http.StatusNotFound))
-				writeDockerNotFound(w, "volume", volName)
+				writeDockerNotFound(w, "volume", strings.TrimPrefix(volName, prefix))
 				return r, false
 			}
 		}
@@ -2908,9 +2908,17 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 
 	case authz.ActionStartContainer, authz.ActionRestart, authz.ActionStop,
 		authz.ActionKill, authz.ActionPause, authz.ActionUnpause:
+		body, _ := io.ReadAll(resp.Body)
+		// 错误响应中可能包含内部容器名前缀（user-{uid}-），对普通用户剥离
+		if resp.StatusCode >= 400 && !id.IsPrivileged() {
+			body = stripInternalPrefixFromErrorMessage(p, body, id)
+		}
 		isolation.CopyHeaders(w, resp.Header)
+		if len(body) > 0 {
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		}
 		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, resp.Body)
+		_, _ = w.Write(body)
 
 	case authz.ActionRemoveContainer:
 		if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
@@ -2921,9 +2929,17 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 				_ = p.db.ReleasePortMappings(containerID)
 			}
 		}
+		body, _ := io.ReadAll(resp.Body)
+		// 错误响应中可能包含内部容器名前缀（user-{uid}-），对普通用户剥离
+		if resp.StatusCode >= 400 && !id.IsPrivileged() {
+			body = stripInternalPrefixFromErrorMessage(p, body, id)
+		}
 		isolation.CopyHeaders(w, resp.Header)
+		if len(body) > 0 {
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		}
 		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, resp.Body)
+		_, _ = w.Write(body)
 
 	case authz.ActionImport:
 		isolation.CopyHeaders(w, resp.Header)
@@ -3376,9 +3392,17 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 				_ = p.db.DeleteNetwork(networkID)
 			}
 		}
+		body, _ := io.ReadAll(resp.Body)
+		// 错误响应中可能包含内部网络名前缀（{username}_u{uid}_），对普通用户剥离
+		if resp.StatusCode >= 400 && !id.IsPrivileged() {
+			body = stripInternalPrefixFromErrorMessage(p, body, id)
+		}
 		isolation.CopyHeaders(w, resp.Header)
+		if len(body) > 0 {
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		}
 		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, resp.Body)
+		_, _ = w.Write(body)
 
 	case authz.ActionVolumeCreate:
 		body, err := isolation.ReadFullBody(resp.Body)
@@ -3475,9 +3499,21 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 				_ = p.db.DeleteVolume(volName)
 			}
 		}
+		body, _ := io.ReadAll(resp.Body)
+		// 错误响应中可能包含内部卷名前缀（user-{uid}-volume-），对普通用户剥离
+		// 注意：卷前缀为 "user-{uid}-volume-"，不能用 stripInternalPrefixFromErrorMessage
+		//（该函数仅剥离 "user-{uid}-" 会残留 "volume-"）。
+		// 与 ActionVolumeInspect (line 3460) 对齐，使用 bytes.ReplaceAll 精确匹配完整前缀。
+		if resp.StatusCode >= 400 && !id.IsPrivileged() {
+			body = bytes.ReplaceAll(body,
+				[]byte(isolation.UserVolumePrefix(id.RealUID)), nil)
+		}
 		isolation.CopyHeaders(w, resp.Header)
+		if len(body) > 0 {
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		}
 		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, resp.Body)
+		_, _ = w.Write(body)
 
 	// ── Swarm service ────────────────────────────────────────────────────────
 
