@@ -330,7 +330,17 @@ SO_PEERCRED       →  eUID = 0（sudo 提权后的有效 UID）
 |------|----------|------|----------|
 | != 0 | 任意 | 普通用户（或 su 到普通用户） | `UserTypeRegular` |
 | 0 | > 0 | 普通用户通过 sudo/su 获得 root | `UserTypeSudo` |
-| 0 | 0 或未设置 | 直接以 root 身份登录 | `UserTypeRoot` |
+| 0 | 0 或未设置 | 优先检查 `SUDO_UID` 环境变量（见下） | `UserTypeSudo` 或 `UserTypeRoot` |
+
+**loginUID=0 时的补充识别路径**（适用于非 PAM 登录环境）：
+
+当 `loginuid` 为 0 或未设置时，代理按顺序尝试三条路径识别 sudo 身份：
+
+| 路径 | 数据源 | 说明 |
+|------|--------|------|
+| 路径1 | `/proc/<pid>/environ` 中的 `SUDO_UID` | sudo 运行时注入到进程环境，数值 UID 权威；双向 `/etc/passwd` 验证防止伪造 |
+| 路径2 | `/proc/<pid>/status` 中的 `Uid`（rUID） | 适用于旧内核或非 PAM 的 su 切换场景（rUID != 0 说明存在切换） |
+| 路径3 | 以上均不可用 | 视为直接以 root 身份登录（`UserTypeRoot`） |
 
 sudo 用户的 `RealUID` 保持原始登录 UID（如 1001），**不会**改为 0。
 

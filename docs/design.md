@@ -28,6 +28,31 @@ sudo 用户的 `RealUID` 保持原始登录 UID，不改为 0。`IsPrivileged()`
 
 **关键区别**：`IsPrivileged()` 控制资源隔离（列表过滤、归属检查），policy deny 规则使用 `RealUID`，sudo 用户仍受 deny 规则约束。**配额检查对所有用户生效（含 sudo、root），无豁免，配额值为 0 表示不限制**。
 
+### 1.2 loginUID=0 时的补充识别路径
+
+当 `eUID=0` 且 `loginuid` 为 0 或未设置（常见于非 PAM 登录、容器内、旧内核等场景），代理按顺序尝试三条路径识别 sudo 身份：
+
+**路径1：`SUDO_UID` 环境变量**（最可靠）
+
+sudo 运行时会向子进程环境注入 `SUDO_UID` 变量。代理通过读取 `/proc/<pid>/environ` 获取该值，以数字 UID 为权威，并与 `/etc/passwd` 进行双向验证（正向：`LookupUsername(sudoUID)` → 用户名，反向：`LookupUID(username)` == sudoUID），防止构造伪造的用户名字符串。
+
+**路径2：`/proc/<pid>/status` 中的 rUID**（旧内核 / 非 PAM su）
+
+若 `SUDO_UID` 不可用，读取 `/proc/<pid>/status` 中的 `Uid` 行。若实际 UID（rUID）不为 0，说明是通过 su 切换但 loginuid 未被正确设置（旧内核或非 PAM 登录），此时 rUID 即为原始用户 UID。
+
+**路径3：视为直接 root 登录**
+
+以上均不可用时，视为 `UserTypeRoot`（直接 root 登录）。
+
+判断流程：
+
+```
+eUID=0, loginUID=0 或未设置
+  ├→ SUDO_UID > 0 in /proc/environ? → UserTypeSudo（原始用户为 SUDO_UID）
+  ├→ /proc/status rUID != 0?        → UserTypeSudo（原始用户为 rUID）
+  └→ 以上均否                        → UserTypeRoot
+```
+
 ---
 
 ## 二、镜像归属与删除
@@ -79,6 +104,72 @@ if !found {
     _ = p.db.EnsureImageAccess(postID, id.RealUID)
 }
 ```
+
+---
+
+## 二·四、镜像 Pull 事件归属追踪与竞态修复
+
+Docker 事件流（`GET /events`）以异步方式投递 image pull 事件，与 pull 请求完成存在时间窗口，需要多层保护机制防止用户 A 的 pull 事件泄漏给用户 B。
+
+### 事件归属判断路径（`eventBelongsToUser`）
+
+```
+image create/pull 事件（Actor.ID = "alpine:3.18"）
+  路径0a：pendingBuildTags（build 竞态窗口，BUG-18/18b）
+  路径0b：pendingPullRefs via attrs["name"]（BUG-19）
+  路径0b.2：pendingPullRefs via Actor.ID（BUG-20/attrs["name"] 缺失时）
+  路径0c：completedPullOwner via attrs["name"]（BUG-20 事件延迟窗口）
+  路径0c.2：completedPullOwner via Actor.ID
+  路径1：DB images 表精确/前缀匹配（已写入 DB 的正常路径）
+  路径2：DB image_access 表（EnsureImageAccess 添加的额外访问权限）
+  路径2.5：HasImageAccess（owner 为他人但当前用户曾 pull 过，BUG-19）
+  路径3：上述均无匹配 → 透传给所有人（image sha256 前缀 name，无 tag 时无意义）
+```
+
+### pendingPullRefs（BUG-19：pull 竞态窗口）
+
+`ServeHTTP` 转发请求**前**（非 post-process）注册 `pullRef → ownerUID`，覆盖从请求发出到 DB 写入之间的竞态窗口：
+
+```go
+p.pendingPullRefs.Store(pullRef, identity.RealUID)
+defer p.pendingPullRefs.CompareAndDelete(pullRef, identity.RealUID)
+```
+
+对于缓存命中的镜像，Docker 几乎同步发出事件，若等到 `postprocessResponse` 才写入则来不及。
+
+**路径2.5**：当 DB 中 owner 为他人，但当前用户曾 pull 过（`image_access` 中有记录），允许该用户看到自己的 pull 事件。
+
+### completedPullOwner（BUG-20：pull 完成后事件延迟）
+
+`pendingPullRefs` 在 `ServeHTTP` defer 返回时立即清除。但 Docker 事件流存在**异步投递延迟**（最多数秒），pull 完成后事件仍可能在 `defer` 之后到达各订阅者。
+
+`postprocessResponse ActionPull` 在 `SetImageOwner` 后写入：
+
+```go
+p.completedPullOwner.Store(ref, ownerUID)
+time.AfterFunc(pullEventDeliveryGrace, func() {
+    p.completedPullOwner.CompareAndDelete(ref, ownerUID)
+})
+// pullEventDeliveryGrace = 30s
+```
+
+### normalizeImageRef（BUG-20b：Docker CLI 29.x 路径标准化）
+
+Docker CLI 29.x 将 pull 请求的 `fromImage` 参数标准化为完整 registry 路径：
+
+```
+/v1.54/images/create?fromImage=docker.io%2Flibrary%2Falpine&tag=3.18
+```
+
+`parseImageRefFromURI` 返回 `docker.io/library/alpine:3.18`，而 Docker daemon 发出的事件 `Actor.ID` 为 `alpine:3.18`（短名）。
+
+`normalizeImageRef()` 剥离 `docker.io/library/` 前缀，确保 `pendingPullRefs` / `completedPullOwner` 的 key 与事件 `Actor.ID` 匹配。非 `docker.io/library` 的 registry（如 `registry.example.com/foo`）保持原样。
+
+### BUG-21：特权用户 pull 事件的正确传播
+
+修复前，`eventBelongsToUser` 在路径 0b/0b.2/0c/0c.2 有 `!IsPrivileged()` 守卫，导致特权用户（root/sudo）执行 pull 时，其 pull 事件被路径3 透传给所有普通用户。
+
+修复：移除路径 0b/0b.2/0c/0c.2 中的 `!IsPrivileged()` 守卫，确保特权用户的 pull 事件也走 `pendingPullRefs` / `completedPullOwner` 归属匹配路径，不再泄漏给无关普通用户。
 
 ---
 
@@ -348,7 +439,188 @@ var cmdActionOverrides = map[string]string{
 
 ---
 
-## 七、关键文件索引
+## 七、数据库 Schema（SQLite）
+
+数据库文件路径：`/var/lib/docker-authz/owners.db`，由 `internal/authz/ownership.go` 的 `initSchema` 初始化。
+
+### 7.1 容器归属
+
+```sql
+CREATE TABLE containers (
+    id                 TEXT PRIMARY KEY,   -- Docker 容器 ID（hex）
+    owner_username     TEXT NOT NULL,
+    owner_uid          INT  NOT NULL,
+    owner_gid          INT  NOT NULL,
+    image_id           TEXT DEFAULT '',    -- 创建容器所用的镜像 content ID
+    privileged_context INTEGER NOT NULL DEFAULT 0,  -- 1 = sudo/root 上下文创建
+    created_at         DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_containers_owner_uid ON containers(owner_uid);
+```
+
+### 7.2 镜像归属
+
+```sql
+CREATE TABLE images (
+    image_id           TEXT PRIMARY KEY,   -- hex content ID，无 "sha256:" 前缀
+    owner_username     TEXT NOT NULL,
+    owner_uid          INT  NOT NULL,
+    owner_gid          INT  NOT NULL,
+    is_public          INTEGER DEFAULT 0,  -- 1 = 公共镜像（所有人可见）
+    privileged_context INTEGER NOT NULL DEFAULT 0,  -- 1 = sudo/root 上下文创建
+    source             TEXT,               -- 来源标注（如 pull/build）
+    created_at         DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_images_owner_uid ON images(owner_uid);
+```
+
+### 7.3 镜像多用户访问权限
+
+```sql
+CREATE TABLE image_access (
+    image_id           TEXT NOT NULL,
+    user_uid           INT  NOT NULL,
+    privileged_context INTEGER NOT NULL DEFAULT 0,  -- 记录该访问记录是否在 sudo 上下文下产生
+    PRIMARY KEY (image_id, user_uid)
+);
+CREATE INDEX idx_image_access_uid ON image_access(user_uid);
+```
+
+> `EnsureImageAccess(imageID, uid)` 向此表插入记录（`INSERT OR IGNORE`，幂等）。非 owner 用户对镜像执行 `docker rmi` 时删除对应行（虚拟删除），不通知 Docker daemon。
+
+### 7.4 网络归属
+
+```sql
+CREATE TABLE networks (
+    network_id         TEXT PRIMARY KEY,   -- Docker hex 网络 ID
+    name               TEXT NOT NULL,      -- 带用户前缀的网络名（如 alice_u1001_mynet）
+    owner_uid          INT  NOT NULL,
+    owner_username     TEXT NOT NULL,
+    is_shared          INTEGER DEFAULT 0,  -- 1 = 管理员开启的共享网络
+    privileged_context INTEGER NOT NULL DEFAULT 0,
+    created_at         DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_networks_owner_uid ON networks(owner_uid);
+```
+
+### 7.5 网络访问授权
+
+```sql
+CREATE TABLE network_access (
+    network_id TEXT NOT NULL,
+    user_uid   INT  NOT NULL,
+    PRIMARY KEY (network_id, user_uid)
+);
+CREATE INDEX idx_network_access_uid ON network_access(user_uid);
+```
+
+> 由 `SetNetworkShared` / `allow-network-peer` 管理员操作写入（`INSERT OR IGNORE`，只增不删）。
+
+### 7.6 卷归属
+
+```sql
+CREATE TABLE volumes (
+    name               TEXT PRIMARY KEY,   -- 带用户前缀的卷名（如 alice_u1001_data）
+    owner_uid          INT  NOT NULL,
+    owner_username     TEXT NOT NULL,
+    privileged_context INTEGER NOT NULL DEFAULT 0,
+    created_at         DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_volumes_owner_uid ON volumes(owner_uid);
+```
+
+### 7.7 端口映射记录
+
+```sql
+CREATE TABLE port_mappings (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    host_port      INT  NOT NULL,
+    protocol       TEXT NOT NULL DEFAULT 'tcp',
+    container_port INT  NOT NULL,
+    container_id   TEXT NOT NULL,
+    owner_uid      INT  NOT NULL,
+    owner_username TEXT NOT NULL,
+    created_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(host_port, protocol)             -- 全局唯一：同一宿主机端口+协议只允许一个容器占用
+);
+CREATE INDEX idx_port_mappings_container ON port_mappings(container_id);
+CREATE INDEX idx_port_mappings_owner     ON port_mappings(owner_uid);
+```
+
+> 容器删除时自动清除对应记录。`UNIQUE(host_port, protocol)` 防止多用户端口冲突。
+
+### 7.8 跨用户网络互通（NetworkPeer）
+
+```sql
+CREATE TABLE network_peers (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    uid_a           INT  NOT NULL,
+    uid_b           INT  NOT NULL,
+    peer_network_id TEXT NOT NULL,           -- 共享辅助桥接网络 ID（peer-{minUID}-{maxUID}）
+    container_id_a  TEXT NOT NULL DEFAULT '', -- 用户 A 的容器 ID（空 = 用户级互通）
+    container_id_b  TEXT NOT NULL DEFAULT '', -- 用户 B 的容器 ID（空 = 用户级互通）
+    created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(uid_a, uid_b, container_id_a, container_id_b)
+);
+```
+
+> 由管理员工具 `docker-authz-proxy-ctl allow-network-peer` 写入。空 `container_id_*` 表示该用户的所有容器均可互通。
+
+### 7.9 --volumes-from 授权
+
+```sql
+CREATE TABLE volumes_from_access (
+    container_id TEXT NOT NULL,
+    grantee_uid  INT  NOT NULL,   -- -1 表示授权给所有用户
+    granted_by   INT  NOT NULL DEFAULT 0,  -- 授权人 UID
+    created_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (container_id, grantee_uid)
+);
+CREATE INDEX idx_volumes_from_container ON volumes_from_access(container_id);
+```
+
+### 7.10 Swarm 服务归属（暂未使用）
+
+```sql
+CREATE TABLE swarm_services (
+    service_id     TEXT PRIMARY KEY,
+    name           TEXT NOT NULL,
+    owner_uid      INT  NOT NULL,
+    owner_username TEXT NOT NULL,
+    created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_swarm_services_owner ON swarm_services(owner_uid);
+```
+
+### 7.11 Swarm Secret 归属（暂未使用）
+
+```sql
+CREATE TABLE swarm_secrets (
+    secret_id      TEXT PRIMARY KEY,
+    name           TEXT NOT NULL,
+    owner_uid      INT  NOT NULL,
+    owner_username TEXT NOT NULL,
+    created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_swarm_secrets_owner ON swarm_secrets(owner_uid);
+```
+
+### 7.12 Swarm Config 归属（暂未使用）
+
+```sql
+CREATE TABLE swarm_configs (
+    config_id      TEXT PRIMARY KEY,
+    name           TEXT NOT NULL,
+    owner_uid      INT  NOT NULL,
+    owner_username TEXT NOT NULL,
+    created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_swarm_configs_owner ON swarm_configs(owner_uid);
+```
+
+---
+
+## 八、关键文件索引
 
 | 文件 | 职责 |
 |------|------|

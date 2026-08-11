@@ -1,8 +1,8 @@
 # docker-authz-proxy 测试指南
 
-> 版本：基于当前代码库（2025-07）
-> 测试环境：Linux Ubuntu 6.8.0（192.168.2.7），Go 1.22.2，Docker 28.2.2
-> 最近执行：2025-07，全部 PASS（含 `-race` 竞态检测）
+> 版本：基于当前代码库（2025-07 更新至 BUG-21）
+> 测试环境：Linux Ubuntu 6.8.0（192.168.2.7），Go 1.22.2，Docker 28.2.2+
+> 最近执行：全部 PASS（含 `-race` 竞态检测）
 
 ---
 
@@ -11,20 +11,45 @@
 ```
 docker-authz-proxy/
 ├── internal/
-│   ├── auth/           auth_test.go              JWT 认证、身份解析
-│   ├── authz/          policy_test.go            策略分类、规则匹配
-│   │                   ownership_test.go         归属数据库 CRUD
-│   │                   scenario_test.go          场景测试（策略/归属/分类边界）
-│   ├── isolation/      filter_test.go            响应过滤
-│   │                   labels_test.go            标签注入
-│   │                   storage_test.go           存储路径校验
-│   │                   quota_network_test.go     配额注入、网络前缀
-│   │                   scenario_test.go          场景测试（配额/前缀/并发）
-│   ├── audit/          audit_test.go             审计日志写入与查询
-│   │                   scenario_test.go          场景测试（并发/轮转/nil 安全）
-│   └── forward/        proxy_test.go             工具函数单元测试
-│                       proxy_integration_test.go 代理核心集成测试
-│                       scenario_test.go          场景测试（归属/策略/过滤）
+│   ├── auth/           auth_test.go                         JWT 认证、身份解析
+│   ├── authz/          policy_test.go                       策略分类、规则匹配
+│   │                   ownership_test.go                    归属数据库 CRUD
+│   │                   scenario_test.go                     场景测试（策略/归属/分类边界）
+│   │                   image_stale_record_bug_test.go       BUG-10 镜像孤儿脏数据
+│   │                   stale_records_multi_table_test.go    BUG-11/12/13/14 多表脏数据
+│   │                   image_pull_ownership_bug_test.go     BUG-8 pull 归属边界
+│   ├── isolation/      filter_test.go                       响应过滤
+│   │                   labels_test.go                       标签注入
+│   │                   storage_test.go                      存储路径校验
+│   │                   quota_network_test.go                配额注入、网络前缀
+│   │                   scenario_test.go                     场景测试（配额/前缀/并发）
+│   │                   network_bridge_name_test.go          BUG-6 bridge.name 注入
+│   ├── audit/          audit_test.go                        审计日志写入与查询
+│   │                   scenario_test.go                     场景测试（并发/轮转/nil 安全）
+│   └── forward/        proxy_test.go                        工具函数单元测试
+│                       proxy_integration_test.go            代理核心集成测试
+│                       scenario_test.go                     场景测试（归属/策略/过滤）
+│                       network_peer_test.go                 跨用户网络互通（9 用例）
+│                       bug_regression_test.go               BUG-1/2/3 回归
+│                       rmi_public_image_force_test.go       BUG-5 强制删除公共镜像
+│                       shared_network_access_test.go        BUG-5 共享网络访问
+│                       sudo_volume_prune_test.go            BUG-7 sudo volume prune
+│                       volume_prune_response_test.go        BUG-9 volume prune 响应前缀
+│                       event_filter_test.go                 事件过滤基础（volume/container/network）
+│                       event_filter_volume_isolation_test.go BUG-8 volume 事件流隔离
+│                       event_filter_image_isolation_test.go BUG-16 image 事件流隔离
+│                       event_filter_image_build_race_test.go BUG-18 经典 builder 竞态
+│                       event_filter_buildkit_race_test.go   BUG-18b BuildKit 竞态
+│                       event_filter_image_pull_race_test.go BUG-19 pull 竞态窗口
+│                       event_filter_pull_after_complete_test.go BUG-20 pull 完成后延迟
+│                       alice_prune_bob_events_test.go       volume prune 事件跨用户隔离
+│                       bob_events_alice_named_volumes_test.go 命名卷事件跨用户隔离
+│                       network_inspect_test.go              network inspect 前缀剥除
+│                       network_prune_test.go                network prune 归属过滤
+│                       container_inspect_network_test.go    container inspect 网络键前缀
+│                       sudo_docker_host_test.go             DOCKER_HOST 配置写入
+│                       event_stream_integration_test.go     事件流端到端集成
+│                       concurrent_perf_test.go              100 用户并发压测
 ```
 
 **测试分层：**
@@ -816,4 +841,101 @@ ok  docker-authz-proxy/internal/forward
 | `BridgeManager` 不可在单元测试中 mock | 其内部 `dockerClient` 硬编码 Unix socket transport，fake upstream 无法拦截；`connectContainerToPeerNetworks` 的完整链路需端到端测试 |
 | peer 记录方向无关 | `GetNetworkPeer(uidA, uidB)` 与 `GetNetworkPeer(uidB, uidA)` 均能找到同一条记录 |
 | 辅助网络命名约定 | `peer-{min_uid}-{max_uid}`，较小 uid 在前 |
+
+---
+
+## 八、BUG 修复专项测试文件（2025-07 后续补充）
+
+### 8.1 总览
+
+下表汇总了场景测试（第七节）之后陆续新增的专项 BUG 修复测试文件：
+
+| 文件 | 模块 | 覆盖 BUG / 功能 | 用例数 |
+|------|------|----------------|--------|
+| `authz/image_stale_record_bug_test.go` | authz | BUG-10：rmi 后 images 表孤儿脏数据 + 12 字符短 ID 删除 | 7 |
+| `authz/stale_records_multi_table_test.go` | authz | BUG-11/12/13/14：容器/网络/系统 prune 脏数据 | 10+ |
+| `authz/image_pull_ownership_bug_test.go` | authz | BUG-8：pull 归属竞态边界 | 3 |
+| `isolation/network_bridge_name_test.go` | isolation | BUG-6：network create 后 bridge.name 注入 | 7 |
+| `forward/bug_regression_test.go` | forward | BUG-1/2/3a/3b 回归 | 8 |
+| `forward/rmi_public_image_force_test.go` | forward | BUG-5：root/sudo -f 强制删除公共镜像 | 3 |
+| `forward/shared_network_access_test.go` | forward | BUG-5：共享网络 inspect/connect URL 重写 | 2 |
+| `forward/sudo_volume_prune_test.go` | forward | BUG-7：sudo volume prune 具名卷处理 | 5 |
+| `forward/volume_prune_response_test.go` | forward | BUG-9：volume prune 响应中内部前缀剥除 | 7 |
+| `forward/event_filter_test.go` | forward | 事件过滤基础（volume/container/network 路由） | 5 |
+| `forward/event_filter_volume_isolation_test.go` | forward | BUG-8：volume 事件流用户隔离（Actor.ID 路径） | 5 |
+| `forward/event_filter_image_isolation_test.go` | forward | BUG-16：image 事件流用户隔离（DB 归属路径） | 5 |
+| `forward/event_filter_image_build_race_test.go` | forward | BUG-18：经典 builder tag 竞态窗口 | 6 |
+| `forward/event_filter_buildkit_race_test.go` | forward | BUG-18b：BuildKit gRPC tag 竞态窗口 + parseBuildxTags | 8 |
+| `forward/event_filter_image_pull_race_test.go` | forward | BUG-19：pull 竞态窗口 + Actor.ID attrs["name"] 不一致 | 8 |
+| `forward/event_filter_pull_after_complete_test.go` | forward | BUG-20：pull 完成后事件投递延迟 | 6 |
+| `forward/alice_prune_bob_events_test.go` | forward | volume prune 事件在多用户流中的隔离 | 5 |
+| `forward/bob_events_alice_named_volumes_test.go` | forward | 命名卷 prune 事件跨用户隔离 | 5 |
+| `forward/network_inspect_test.go` | forward | network inspect 响应中前缀剥除正确性 | 8 |
+| `forward/network_prune_test.go` | forward | network prune 仅删除自己的网络 | 5 |
+| `forward/container_inspect_network_test.go` | forward | container inspect 响应中网络键/DNSNames 前缀处理 | 8 |
+| `forward/sudo_docker_host_test.go` | forward | DOCKER_HOST 安装配置写入与幂等性 | 7 |
+| `forward/event_stream_integration_test.go` | forward | 事件流 HTTP handler 层端到端集成 | - |
+| `forward/concurrent_perf_test.go` | forward | 100 用户并发压测（ContainerList/ImagePull/Events/DB 竞争等 8 场景） | 8 |
+
+### 8.2 事件流隔离测试体系
+
+事件流（`GET /events`）的用户隔离由 `eventBelongsToUser` 实现，专项测试按资源类型和竞态场景分组：
+
+#### 8.2.1 volume 事件（`event_filter_test.go` + `event_filter_volume_isolation_test.go`）
+
+| 用例 | 验证点 |
+|------|--------|
+| `TestBUG7_VolumeDestroyEvent_*` | Actor.ID 字段（非 attrs["name"]）为 volume 名权威来源 |
+| `TestEventBelongsToUser_VolumeEvent_NamePrefix_MultiUser` | `user-{uid}-` 前缀精确匹配，alice 事件不泄漏给 bob |
+| `TestEventBelongsToUser_VolumeEvent_AllActions_*` | create/destroy/mount/unmount 全动作一致路由 |
+| `TestEventBelongsToUser_VolumeEvent_SystemVolumes_Passthrough` | 无前缀的系统卷事件透传给所有用户 |
+
+#### 8.2.2 image 事件竞态防护
+
+| 文件 | BUG | 竞态窗口 | 防护机制 |
+|------|-----|----------|---------|
+| `event_filter_image_build_race_test.go` | BUG-18 | 经典 builder 完成到 ActionBuild 响应处理之间 | `pendingBuildTags`（tag→ownerUID） |
+| `event_filter_buildkit_race_test.go` | BUG-18b | BuildKit gRPC 关闭到 `trackBuildKitImages` 写入之间 | `parseBuildxTags(CmdLine)` + `pendingBuildTags` |
+| `event_filter_image_pull_race_test.go` | BUG-19 | pull 请求到 `SetImageOwner` + path 2.5 | `pendingPullRefs`（ServeHTTP 前注册）+ `HasImageAccess` |
+| `event_filter_pull_after_complete_test.go` | BUG-20/20b | `pendingPullRefs` 清除后 Docker 异步投递延迟 | `completedPullOwner`（30s 宽限） + `normalizeImageRef` |
+
+#### 8.2.3 关键行为：BUG-20b normalizeImageRef
+
+Docker CLI 29.x 将 `fromImage` 标准化为 `docker.io/library/alpine`，而 Docker 事件 `Actor.ID` 为短名 `alpine:3.18`。`normalizeImageRef` 剥离 `docker.io/library/` 前缀，使两侧 key 对齐。
+
+测试用例 `TestBug20_Reg5_Integration_PullComplete_BobDoesNotSeeEvent` 使用真实注册格式（`docker.io/library/alpine`）验证端到端路径。
+
+### 8.3 并发压测（`concurrent_perf_test.go`）
+
+100 用户并发压测，每场景均跑 `-race` 竞态检测：
+
+| 场景 | 验证点 |
+|------|--------|
+| `TestPerf_ContainerList_100Users` | 100 goroutine 并发 GET /containers/json，各自只看到自己的容器 |
+| `TestPerf_ImageList_100Users` | 并发镜像列表，公共镜像对所有用户可见 |
+| `TestPerf_ContainerCreate_100Users` | 并发容器创建，归属写入无竞争 |
+| `TestPerf_Events_100Users` | 100 用户同时订阅事件流，事件按归属正确路由 |
+| `TestPerf_ImagePull_100Users` | 并发 pull，pendingPullRefs 无死锁 |
+| `TestPerf_MixedLoad_100Users` | 混合读写负载（list + create + delete） |
+| `TestPerf_DBWriteContention_100Users` | 100 goroutine 并发写 DB，SQLite WAL 无崩溃 |
+| `TestPerf_EventFilter_100Users` | 高频事件过滤，`eventBelongsToUser` 无数据竞争 |
+
+### 8.4 网络响应处理测试
+
+| 文件 | 核心验证 |
+|------|---------|
+| `network_inspect_test.go` | `GET /networks/{id}/json` 响应中 `Name` 字段的内部前缀（`alice_u1001_`）被正确剥除，用户看到原始名 |
+| `network_prune_test.go` | `POST /networks/prune` 只删除发出请求用户的网络，不误删他人网络 |
+| `container_inspect_network_test.go` | `GET /containers/{id}/json` 响应中 `NetworkSettings.Networks` 的 key（网络名）前缀处理（已知弱点：非紧凑 JSON 时剥除无效） |
+
+### 8.5 身份与系统配置测试
+
+**`sudo_docker_host_test.go`** 验证安装脚本辅助函数：
+
+| 用例 | 验证点 |
+|------|--------|
+| `TestEnsureSudoersEnvKeepInDir_*` | sudoers `env_keep` 文件创建、权限 0440、幂等性 |
+| `TestSetUserDockerHost_Reg1_AllShellConfigsWritten` | bash_profile/bashrc/profile 均写入 DOCKER_HOST 配置 |
+| `TestSetUserDockerHost_Reg2_Idempotent` | 重复调用不追加重复行 |
+| `TestSetUserDockerHost_Reg4_DockerHostPathFormat` | socket 路径格式 `unix:///run/docker-authz/{user}/docker.sock` |
 

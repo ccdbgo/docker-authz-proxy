@@ -13,10 +13,15 @@ import (
 	"net/url"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 )
 
 // ── 用户桥接网络 ──────────────────────────────────────────────
+
+// isolationMigrated 记录本进程生命周期内已完成 iptables 规则迁移的 bridge 网络 ID。
+// 避免每次 EnsureUserBridge（每次 docker run 都会调用）重复执行 iptables 命令。
+var isolationMigrated sync.Map
 
 // UserBridgeName 返回用户专属桥接网络名称，格式：user-{uid}-bridge
 func UserBridgeName(uid int) string {
@@ -54,6 +59,14 @@ func (m *BridgeManager) EnsureUserBridge(uid int, username string) (string, erro
 	name := UserBridgeName(uid)
 
 	if id, err := m.client.findNetworkByName(name); err == nil && id != "" {
+		// 已存在的 bridge：首次访问时迁移 iptables 规则到新格式（BUG-7 修复）。
+		// isolationMigrated 保证每个 bridge 在本进程生命周期内只迁移一次，
+		// 避免每次 docker run 都执行 1 次 HTTP + 6 次 iptables exec。
+		if _, loaded := isolationMigrated.LoadOrStore(id, true); !loaded {
+			if brIface, err := m.client.getBridgeInterface(id); err == nil && brIface != "" {
+				_ = addIsolationRules(brIface)
+			}
+		}
 		return id, nil
 	}
 
@@ -188,26 +201,64 @@ func (m *BridgeManager) GetContainersByOwner(uid int) ([]string, error) {
 
 // ── iptables 隔离规则 ─────────────────────────────────────────
 //
-// 在 DOCKER-USER 链中添加规则（Docker 重启不会清除该链）：
-//   -I DOCKER-USER -o <br-xxxx> ! -i <br-xxxx> -j DROP  阻断其他网桥→本网桥
-//   -I DOCKER-USER -i <br-xxxx> ! -o <br-xxxx> -j DROP  阻断本网桥→其他网桥
+// 两阶段隔离（BUG-7 修复后）：
+//
+//   DOCKER-USER 链（每个 bridge 一条跳转规则）：
+//     -I DOCKER-USER -i <br-xxxx> ! -o <br-xxxx> -j DOCKER-AUTHZ-ISOLATION
+//
+//   DOCKER-AUTHZ-ISOLATION 子链（每个 bridge 一条 DROP 规则）：
+//     -A DOCKER-AUTHZ-ISOLATION -o <br-xxxx> -j DROP
+//
+//   效果：跨 bridge 流量被 DROP，容器→外网（eth0）不匹配子链→RETURN→放行。
 //
 // 注意：辅助网络（peer-*）的网桥不添加 DROP 规则，允许双方容器通过辅助网络通信。
+// 注意：BridgeManager 无锁，并发调用 addIsolationRules 依赖 iptables 内核级 xtables lock
+//       保证单条规则原子性，但多步操作序列非原子（已知限制，与修复前一致）。
 
-const iptablesChain = "DOCKER-USER"
+const (
+	iptablesChain  = "DOCKER-USER"
+	isolationChain = "DOCKER-AUTHZ-ISOLATION"
+)
+
+// ensureIsolationChain 创建隔离子链（幂等，已存在则忽略）
+func ensureIsolationChain() {
+	_ = iptables("-N", isolationChain)
+}
 
 func addIsolationRules(brIface string) error {
-	if err := iptables("-I", iptablesChain, "-o", brIface, "!", "-i", brIface, "-j", "DROP"); err != nil {
-		return fmt.Errorf("add inbound drop for %s: %w", brIface, err)
+	ensureIsolationChain()
+
+	// 兼容升级：清除旧格式 DROP 规则（BUG-7 修复前的格式），防止升级后残留
+	_ = iptables("-D", iptablesChain, "-o", brIface, "!", "-i", brIface, "-j", "DROP")
+	_ = iptables("-D", iptablesChain, "-i", brIface, "!", "-o", brIface, "-j", "DROP")
+
+	// 幂等：先删除子链中已有的同名规则，再追加，防止重复膨胀
+	_ = iptables("-D", isolationChain, "-o", brIface, "-j", "DROP")
+
+	// 在隔离子链中添加：目标为该 bridge 的流量 → DROP
+	// （其他 bridge 的出站跳入子链后，若目标是本 bridge 则被丢弃）
+	if err := iptables("-A", isolationChain, "-o", brIface, "-j", "DROP"); err != nil {
+		return fmt.Errorf("add isolation drop for %s: %w", brIface, err)
 	}
-	if err := iptables("-I", iptablesChain, "-i", brIface, "!", "-o", brIface, "-j", "DROP"); err != nil {
-		_ = iptables("-D", iptablesChain, "-o", brIface, "!", "-i", brIface, "-j", "DROP")
-		return fmt.Errorf("add outbound drop for %s: %w", brIface, err)
+
+	// 幂等：先删除 DOCKER-USER 中已有的同名跳转规则，再插入
+	_ = iptables("-D", iptablesChain, "-i", brIface, "!", "-o", brIface, "-j", isolationChain)
+
+	// 在 DOCKER-USER 中添加：从该 bridge 出发、目标非自身 → 跳入隔离子链
+	//   目标 = eth0（外网）→ 子链无匹配 → RETURN → 放行（BUG-7 修复点）
+	//   目标 = 其他 bridge → 子链匹配 → DROP（保持跨用户隔离）
+	if err := iptables("-I", iptablesChain, "-i", brIface, "!", "-o", brIface, "-j", isolationChain); err != nil {
+		_ = iptables("-D", isolationChain, "-o", brIface, "-j", "DROP")
+		return fmt.Errorf("add outbound isolation for %s: %w", brIface, err)
 	}
 	return nil
 }
 
 func removeIsolationRules(brIface string) {
+	// 清除新格式规则
+	_ = iptables("-D", iptablesChain, "-i", brIface, "!", "-o", brIface, "-j", isolationChain)
+	_ = iptables("-D", isolationChain, "-o", brIface, "-j", "DROP")
+	// 兼容：清除旧格式规则（BUG-7 修复前），确保升级过渡期无残留
 	_ = iptables("-D", iptablesChain, "-o", brIface, "!", "-i", brIface, "-j", "DROP")
 	_ = iptables("-D", iptablesChain, "-i", brIface, "!", "-o", brIface, "-j", "DROP")
 }
