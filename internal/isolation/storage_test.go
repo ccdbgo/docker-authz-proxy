@@ -107,21 +107,21 @@ func TestParseBindMounts_Mounts(t *testing.T) {
 
 func TestValidateBindMounts_AllowedPath(t *testing.T) {
 	body := []byte(`{"HostConfig":{"Binds":["/var/docker/user-storage/user-1001/data:/data"]}}`)
-	if err := ValidateBindMounts(body, "/var/docker/user-storage", 1001); err != nil {
+	if err := ValidateBindMounts(body, "/var/docker/user-storage", 1001, ""); err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
 }
 
 func TestValidateBindMounts_UserRootItself(t *testing.T) {
 	body := []byte(`{"HostConfig":{"Binds":["/var/docker/user-storage/user-1001:/mnt"]}}`)
-	if err := ValidateBindMounts(body, "/var/docker/user-storage", 1001); err != nil {
+	if err := ValidateBindMounts(body, "/var/docker/user-storage", 1001, ""); err != nil {
 		t.Errorf("mounting user root itself should be allowed: %v", err)
 	}
 }
 
 func TestValidateBindMounts_ForbiddenPath(t *testing.T) {
 	body := []byte(`{"HostConfig":{"Binds":["/etc/passwd:/etc/passwd:ro"]}}`)
-	err := ValidateBindMounts(body, "/var/docker/user-storage", 1001)
+	err := ValidateBindMounts(body, "/var/docker/user-storage", 1001, "")
 	if err == nil {
 		t.Error("expected error for /etc/passwd, got nil")
 	}
@@ -130,7 +130,7 @@ func TestValidateBindMounts_ForbiddenPath(t *testing.T) {
 func TestValidateBindMounts_OtherUserPath(t *testing.T) {
 	// user 1001 trying to mount user 1002's directory
 	body := []byte(`{"HostConfig":{"Binds":["/var/docker/user-storage/user-1002/data:/data"]}}`)
-	err := ValidateBindMounts(body, "/var/docker/user-storage", 1001)
+	err := ValidateBindMounts(body, "/var/docker/user-storage", 1001, "")
 	if err == nil {
 		t.Error("expected error for other user's directory, got nil")
 	}
@@ -139,7 +139,7 @@ func TestValidateBindMounts_OtherUserPath(t *testing.T) {
 func TestValidateBindMounts_PathTraversal(t *testing.T) {
 	// attempt to escape via path traversal
 	body := []byte(`{"HostConfig":{"Binds":["/var/docker/user-storage/user-1001/../user-1002/data:/data"]}}`)
-	err := ValidateBindMounts(body, "/var/docker/user-storage", 1001)
+	err := ValidateBindMounts(body, "/var/docker/user-storage", 1001, "")
 	if err == nil {
 		t.Error("expected error for path traversal, got nil")
 	}
@@ -148,7 +148,7 @@ func TestValidateBindMounts_PathTraversal(t *testing.T) {
 func TestValidateBindMounts_NamedVolume(t *testing.T) {
 	// named volumes (no leading /) are allowed - handled by volume prefix
 	body := []byte(`{"HostConfig":{"Binds":["myvolume:/data"]}}`)
-	if err := ValidateBindMounts(body, "/var/docker/user-storage", 1001); err != nil {
+	if err := ValidateBindMounts(body, "/var/docker/user-storage", 1001, ""); err != nil {
 		t.Errorf("named volume should be allowed: %v", err)
 	}
 }
@@ -156,14 +156,71 @@ func TestValidateBindMounts_NamedVolume(t *testing.T) {
 func TestValidateBindMounts_Root(t *testing.T) {
 	// root user bypasses all checks
 	body := []byte(`{"HostConfig":{"Binds":["/etc/passwd:/etc/passwd:ro"]}}`)
-	if err := ValidateBindMounts(body, "/var/docker/user-storage", 0); err != nil {
+	if err := ValidateBindMounts(body, "/var/docker/user-storage", 0, ""); err != nil {
 		t.Errorf("root should bypass validation: %v", err)
 	}
 }
 
 func TestValidateBindMounts_Empty(t *testing.T) {
 	body := []byte(`{"HostConfig":{}}`)
-	if err := ValidateBindMounts(body, "/var/docker/user-storage", 1001); err != nil {
+	if err := ValidateBindMounts(body, "/var/docker/user-storage", 1001, ""); err != nil {
 		t.Errorf("no mounts should pass: %v", err)
+	}
+}
+
+// ── allow-home-bind：homeDir 非空时额外放行 home 下任意路径 ──────────────────────
+
+func TestValidateBindMounts_HomeAllowedWhenEnabled(t *testing.T) {
+	// homeDir 设置后，home 下任意深度路径均放行。
+	for _, p := range []string{
+		"/home/rpcu_29/pve/t1/data",
+		"/home/rpcu_29/a/b/c/d",
+		"/home/rpcu_29", // home 本身
+	} {
+		body := []byte(`{"HostConfig":{"Binds":["` + p + `:/data"]}}`)
+		if err := ValidateBindMounts(body, "/var/docker/user-storage", 1001, "/home/rpcu_29"); err != nil {
+			t.Errorf("home path %q should be allowed when home-bind on: %v", p, err)
+		}
+	}
+}
+
+func TestValidateBindMounts_HomeRejectedWhenDisabled(t *testing.T) {
+	// homeDir="" (开关关) → home 路径仍被拒（回归旧行为）。
+	body := []byte(`{"HostConfig":{"Binds":["/home/rpcu_29/pve/t1/data:/data"]}}`)
+	if err := ValidateBindMounts(body, "/var/docker/user-storage", 1001, ""); err == nil {
+		t.Error("home path must be rejected when home-bind disabled")
+	}
+}
+
+func TestValidateBindMounts_StorageStillAllowedWithHome(t *testing.T) {
+	// 开启 home-bind 后，storage-root 仍放行（两根并存）。
+	body := []byte(`{"HostConfig":{"Binds":["/var/docker/user-storage/user-1001/x:/data"]}}`)
+	if err := ValidateBindMounts(body, "/var/docker/user-storage", 1001, "/home/rpcu_29"); err != nil {
+		t.Errorf("storage-root should still be allowed: %v", err)
+	}
+}
+
+func TestValidateBindMounts_OutsideBothRejected(t *testing.T) {
+	// 既不在 home 也不在 storage-root → 拒。
+	body := []byte(`{"HostConfig":{"Binds":["/etc:/data"]}}`)
+	if err := ValidateBindMounts(body, "/var/docker/user-storage", 1001, "/home/rpcu_29"); err == nil {
+		t.Error("path outside both roots must be rejected")
+	}
+}
+
+func TestValidateBindMounts_HomeTraversalRejected(t *testing.T) {
+	// home 前缀但经 .. 逃逸 → Clean 后不在 home 下 → 拒。
+	body := []byte(`{"HostConfig":{"Binds":["/home/rpcu_29/../rpcu_30/secret:/data"]}}`)
+	if err := ValidateBindMounts(body, "/var/docker/user-storage", 1001, "/home/rpcu_29"); err == nil {
+		t.Error("path traversal out of home must be rejected")
+	}
+}
+
+// TestValidateBindMounts_HomePrefixSibling 防前缀误判：/home/rpcu_29x 不应被当作
+// /home/rpcu_29 的子路径（underAnyRoot 用 root+"/" 判前缀，字符串前缀不够）。
+func TestValidateBindMounts_HomePrefixSibling(t *testing.T) {
+	body := []byte(`{"HostConfig":{"Binds":["/home/rpcu_29x/data:/data"]}}`)
+	if err := ValidateBindMounts(body, "/var/docker/user-storage", 1001, "/home/rpcu_29"); err == nil {
+		t.Error("sibling dir sharing name prefix must be rejected")
 	}
 }

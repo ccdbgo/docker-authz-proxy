@@ -49,22 +49,40 @@ func EnsureUserStorageDir(base string, uid, gid int) error {
 
 // BindMountViolation 描述一次挂载路径违规
 type BindMountViolation struct {
-	Source    string // 被拒绝的宿主机路径
-	UserRoot  string // 允许的用户目录
+	Source       string   // 被拒绝的宿主机路径
+	AllowedRoots []string // 允许的根目录（storage-root [+ home]）
 }
 
 func (e *BindMountViolation) Error() string {
 	return fmt.Sprintf(
-		"bind mount '%s' is not allowed: only paths under '%s' are permitted for non-root users",
-		e.Source, e.UserRoot,
+		"bind mount '%s' is not allowed: only paths under %v are permitted for non-root users",
+		e.Source, e.AllowedRoots,
 	)
 }
 
+// underAnyRoot 报告 cleanSrc 是否等于某个 root 或在其 root/ 之下（子目录深度不限）。
+func underAnyRoot(cleanSrc string, roots []string) bool {
+	for _, r := range roots {
+		if r != "" && (cleanSrc == r ||
+			strings.HasPrefix(cleanSrc, r+string(filepath.Separator))) {
+			return true
+		}
+	}
+	return false
+}
+
 // ValidateBindMounts 校验容器创建请求中的宿主机目录挂载路径。
-// 非 root 用户（uid != 0）只能挂载自身专属存储目录下的路径；
+// 非 root 用户（uid != 0）只能挂载：自身专属存储目录 <storageBase>/user-<uid> 下的路径；
+// 若 homeDir 非空（--allow-home-bind 开启），额外允许自身 home 下任意路径。
+// homeDir 由调用方按内核 RealUID 从 /etc/passwd 反查传入（不可伪造）。
 // named volume（无 / 前缀）跳过校验，由 Volume 前缀机制约束。
 // 返回第一个违规项的 *BindMountViolation，无违规则返回 nil。
-func ValidateBindMounts(body []byte, storageBase string, uid int) error {
+//
+// 已知风险（后续硬化）：本校验为字符串前缀判断，不解析符号链接。用户可在自身 home/存储目录
+// 下建软链指向该目录外（如 ~/x→/etc）绕过——严格 PVE 流下挂载路径含不可测 task_id 故不可行，
+// 交互式 docker 面需靠 policy 限制。彻底闭合见"选项3：解析并把请求体 bind 源改写为规范路径"。
+// 注：storage-root 校验原本即同一口径，本次 home-bind 不使其变差。
+func ValidateBindMounts(body []byte, storageBase string, uid int, homeDir string) error {
 	if uid == 0 {
 		return nil
 	}
@@ -74,7 +92,10 @@ func ValidateBindMounts(body []byte, storageBase string, uid int) error {
 		return nil
 	}
 
-	userRoot := filepath.Clean(UserStorageRoot(storageBase, uid))
+	roots := []string{filepath.Clean(UserStorageRoot(storageBase, uid))}
+	if homeDir != "" {
+		roots = append(roots, filepath.Clean(homeDir))
+	}
 
 	for _, src := range entries {
 		// named volume 不是路径，跳过
@@ -82,9 +103,8 @@ func ValidateBindMounts(body []byte, storageBase string, uid int) error {
 			continue
 		}
 		cleanSrc := filepath.Clean(src)
-		// 允许精确匹配用户目录本身，或其子路径
-		if cleanSrc != userRoot && !strings.HasPrefix(cleanSrc, userRoot+string(filepath.Separator)) {
-			return &BindMountViolation{Source: src, UserRoot: userRoot}
+		if !underAnyRoot(cleanSrc, roots) {
+			return &BindMountViolation{Source: src, AllowedRoots: roots}
 		}
 	}
 	return nil

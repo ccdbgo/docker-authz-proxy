@@ -52,6 +52,7 @@ type ProxyServer struct {
 	bridge         *isolation.BridgeManager  // 用户桥接网络管理
 	storage        *isolation.StorageManager // 用户存储资源管理
 	storageBase    string                    // 用户存储根目录
+	allowHomeBind  bool                      // 允许非 root 用户 bind 挂载自身 home 下路径（默认关）
 
 	// requestTimeout 单请求超时（含上游响应），0 表示不限制
 	requestTimeout time.Duration
@@ -139,6 +140,9 @@ type ProxyOptions struct {
 	StorageBase string
 	// StorageCleanupInterval 定期清理孤立 Volume 的间隔，0 表示不启用清理，建议 5m
 	StorageCleanupInterval time.Duration
+	// AllowHomeBind 允许非 root 用户 bind 挂载自身 home 目录下路径（按 RealUID 从 /etc/passwd
+	// 反查，不可伪造）。默认 false=仅允许 storage-root。PVE 场景（数据落用户 home）需开启。
+	AllowHomeBind bool
 }
 
 func NewProxyServer(socketDir, upstreamSock string, policy *authz.Policy, db *authz.OwnershipDB,
@@ -198,6 +202,7 @@ func NewProxyServer(socketDir, upstreamSock string, policy *authz.Policy, db *au
 		bridge:         isolation.NewBridgeManager(upstreamSock),
 		storageBase:    storageBase,
 		storage:        isolation.NewStorageManager(storageBase, upstreamSock),
+		allowHomeBind:  opts.AllowHomeBind,
 		requestTimeout:  opts.RequestTimeout,
 		semaphore:       sem,
 		streamSemaphore: streamSem,
@@ -1029,8 +1034,13 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 			body, _ := io.ReadAll(r.Body)
 			r.Body.Close()
 
-			// 挂载路径校验：bind mount 源路径必须在用户专属存储目录下
-			if mountErr := isolation.ValidateBindMounts(body, p.storageBase, id.RealUID); mountErr != nil {
+			// 挂载路径校验：bind mount 源路径必须在用户专属存储目录下（开启 allow-home-bind
+			// 时额外允许自身 home 下路径；home 按内核 RealUID 反查 /etc/passwd，不可伪造）。
+			homeDir := ""
+			if p.allowHomeBind {
+				homeDir = auth.LookupHomeDir(id.RealUID)
+			}
+			if mountErr := isolation.ValidateBindMounts(body, p.storageBase, id.RealUID, homeDir); mountErr != nil {
 				auditID := toAuditIdentity(id)
 				p.logger.Warn("bind_mount_violation",
 					append(audit.LogIdentityFields(auditID),

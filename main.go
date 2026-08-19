@@ -41,6 +41,7 @@ func main() {
 		maxConcurrentStreams = flag.Int("max-concurrent-streams", 0, "长连接最大并发数（events/stats/logs-f/attach/exec），0 表示不限制")
 		// 存储资源隔离
 		storageRoot            = flag.String("storage-root", "/var/docker/user-storage", "用户存储根目录")
+		allowHomeBind          = flag.Bool("allow-home-bind", false, "允许非 root 用户 bind 挂载自身 home 下任意路径（按 RealUID 从 /etc/passwd 反查，不可伪造）；默认仅允许 storage-root")
 		storageCleanupInterval = flag.Int("storage-cleanup-interval", 5, "存储清理间隔（分钟），0 表示不启用清理")
 		// 资源配额
 		quotaFile = flag.String("quota-file", "", "资源配额配置文件（空表示不限制）")
@@ -130,6 +131,7 @@ func main() {
 		zap.Int("max_concurrent_streams", *maxConcurrentStreams),
 		zap.String("storage_root", *storageRoot),
 		zap.Int("storage_cleanup_interval_min", *storageCleanupInterval),
+		zap.Bool("allow_home_bind", *allowHomeBind),
 	)
 
 	// 确保数据库目录存在
@@ -222,6 +224,7 @@ func main() {
 		MaxConcurrentStreams:   *maxConcurrentStreams,
 		StorageBase:            *storageRoot,
 		StorageCleanupInterval: time.Duration(*storageCleanupInterval) * time.Minute,
+		AllowHomeBind:          *allowHomeBind,
 	}
 	proxy := forward.NewProxyServer(*socketDir, *upstreamSock, policy, db, logger, quota, auditLog, authenticators, proxyOpts)
 	if err := proxy.Start(); err != nil {

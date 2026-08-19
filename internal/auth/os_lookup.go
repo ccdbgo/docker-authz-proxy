@@ -12,6 +12,12 @@ func LookupUsername(uid int) string {
 	return lookupPasswdField(strconv.Itoa(uid), 2, 0)
 }
 
+// LookupHomeDir 通过 UID 从 /etc/passwd 反查 home 目录（第 6 列）；查不到返回 ""。
+// 数据源=内核校验的 RealUID → /etc/passwd，不可被 API/请求字段伪造。
+func LookupHomeDir(uid int) string {
+	return lookupPasswdField(strconv.Itoa(uid), 2, 5)
+}
+
 // LookupUID 通过用户名查找 UID
 func LookupUID(username string) int {
 	s := lookupPasswdField(username, 0, 2)
