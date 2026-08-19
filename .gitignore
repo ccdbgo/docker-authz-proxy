@@ -9,3 +9,6 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# Claude Code 运行期本地状态(锁/会话),勿入库
+.claude/
