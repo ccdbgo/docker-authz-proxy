@@ -1,16 +1,15 @@
 # docker-authz-proxy 授权策略配置
 # 版本：1
 #
-# 设计原则：
-#   - 白名单模式（default_action: allow）：默认允许所有操作，通过 deny_rules 禁止特定操作
-#   - 所有用户（含 root）均受此策略约束，无豁免
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ 默认模版：不禁止任何操作。                                                │
+# │ default_action: allow + 空 deny_rules = 所有用户可执行所有操作。          │
+# │ 需要限制时，取消下方 deny_rules 示例注释并按需修改。                      │
+# └─────────────────────────────────────────────────────────────────────────┘
 #
-# 用户角色说明：
-#   root          - 超级管理员，无限制（不配置 deny_rules）
-#   test-sudo     - sudo 组成员，可做大多数操作，禁止 push/swarm/plugin/secret/config
-#   test-docker-g - docker 组成员，受限用户，禁止 build/push/commit/load/save/swarm/plugin/secret/config
-#   bob           - 普通开发者，禁止 exec/build/push/commit/load/save/swarm/plugin/secret/config
-#   alice         - 受限用户，禁止 ps/exec/build/push/commit/load/save/prune/swarm/plugin/secret/config
+# 设计原则：
+#   - 白名单模式（default_action: allow）：默认允许所有操作，通过 deny_rules 逐条禁止
+#   - 所有用户（含 root）均受此策略约束，无内置豁免；不给某用户配 deny_rules 即不限制
 #
 # ⚠️  安全提示：容器创建参数的安全风险
 # ─────────────────────────────────────────────────────────────────────────────
@@ -30,33 +29,42 @@
 #   --cap-add NET_ADMIN   可修改宿主机网络配置
 #   --userns=host         禁用用户命名空间隔离
 #
-# 建议：对于不受信任的普通用户（如 alice 类角色），应在 deny_rules 中
-# 禁止 create_container，仅允许使用管理员预先创建好的容器（start/stop/logs）。
-# 示例（禁止 alice 自行创建容器）：
-#   - users: [alice]
-#     actions: [create_container, ...]
+# 建议：对不受信任的普通用户，应在 deny_rules 中禁止 create_container，
+# 仅允许其使用管理员预先创建好的容器（start/stop/logs）。
 # ─────────────────────────────────────────────────────────────────────────────
 
 version: 1
 default_action: allow
 
-deny_rules:
-  # ── test-sudo：sudo 组成员，禁止推送镜像和插件管理 ──────────────────────────
-  - users: [test-sudo]
-    actions: [push, plugin]
+# ── 拒绝规则：默认为空 = 不限制任何用户 ───────────────────────────────────────
+deny_rules: []
 
-  # ── test-docker-g：docker 组成员，禁止构建/推送/提交/导入导出 ──────────────
-  - users: [test-docker-g]
-    actions: [build, push, commit, load, save, plugin]
-
-  # ── bob：普通开发者，无禁止操作 ────────────────────────────────────────────
-  - users: [bob]
-    actions: []
-
-  # ── alice：受限用户，无禁止操作 ────────────────────────────────────────────
-  - users: [alice]
-    actions: []
-
+# ══════════════════════════════════════════════════════════════════════════════
+# deny_rules 配置示例（默认全部注释；按需取消注释并修改）
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# 每条规则包含：
+#   users:   适用的用户名列表（可多个）
+#   groups:  适用的系统组列表（可多个，与 users 可同时存在）
+#   actions: 禁止的操作/别名列表（见文末别名展开说明）
+#
+# deny_rules:
+#   # sudo 组成员：禁止推送镜像和插件管理
+#   - users: [test-sudo]
+#     actions: [push, plugin]
+#
+#   # docker 组成员：禁止构建/推送/提交/导入导出/插件
+#   - users: [test-docker-g]
+#     actions: [build, push, commit, load, save, plugin]
+#
+#   # 受限用户：仅允许使用管理员预建的容器，禁止自行创建及一切集群/密钥操作
+#   - users: [alice]
+#     actions: [create_container, build, push, commit, load, save,
+#               prune, swarm, plugin, secret, config]
+#
+#   # 按组批量限制：devteam 组禁止集群管理
+#   - groups: [devteam]
+#     actions: [swarm]
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 操作别名展开说明

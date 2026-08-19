@@ -1,26 +1,50 @@
 # docker-authz-proxy 跨用户网络互通配置
 # 版本：1
 #
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ 默认模版：不配置任何共享网络。                                            │
+# │ 每个用户仅能访问自己创建的网络（名称前缀 <username>_u<uid>_）。           │
+# │ 需要跨用户互通时，取消下方 shared_networks 示例注释并按需修改。          │
+# └─────────────────────────────────────────────────────────────────────────┘
+#
 # 说明：
-#   默认情况下，每个用户只能访问自己创建的网络（名称前缀为 <username>_u<uid>_）。
-#   本配置文件允许 root 管理员设置共享网络，授权特定用户互通。
+#   默认情况下用户之间的网络完全隔离，互相看不到、连不上对方的网络。
+#   本文件用于由 root 管理员声明「共享网络」，授权特定用户/组互通。
 #
 # 共享网络的创建方式：
-#   root 执行 docker network create 时，网络名称不会加前缀（root 创建的网络无前缀）。
-#   然后通过本配置文件或管理工具将该网络设置为共享，并授权用户访问。
+#   1. root 执行 docker network create（root 创建的网络不加用户前缀）
+#   2. 通过本文件或管理工具将该网络标记为共享并授权用户：
+#      docker-authz-proxy-ctl allow-network-peer --user1 alice --user2 bob
+#   3. 或在代理数据库 network_access 表中直接操作
 #
-# 注意：本配置文件目前为文档说明用途。
-#       实际的网络共享授权通过以下方式实现：
-#       1. root 创建网络后，使用管理工具：
-#          docker-authz-proxy-ctl allow-network-peer --user1 alice --user2 bob
-#       2. 或在代理数据库中直接操作 network_access 表
+# 注意：本文件目前主要作为文档/声明用途；运行时授权以数据库 network_access
+#       表为准（由上述 ctl 工具写入）。
 
 version: 1
 
-# 共享网络配置示例
-# shared_networks:
-#   - name: "shared_lab"           # 共享网络名（由 root 预先创建）
-#     allowed_users: [alice, bob]  # 允许这些用户连接/使用该网络
+# ── 共享网络：默认为空 = 完全隔离 ─────────────────────────────────────────────
+shared_networks: []
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 配置示例（默认全部注释；按需取消注释并修改）
+# ══════════════════════════════════════════════════════════════════════════════
 #
+# 每条共享网络包含：
+#   name:           共享网络名（须由 root 预先 docker network create 创建）
+#   allowed_users:  允许连接/使用该网络的用户名列表
+#   allowed_groups: 允许连接/使用该网络的系统组（组内所有用户均可访问）
+# allowed_users 与 allowed_groups 可同时存在，取并集。
+#
+# shared_networks:
+#   # 指定用户互通：alice 与 bob 共用一个实验网络
+#   - name: "shared_lab"
+#     allowed_users: [alice, bob]
+#
+#   # 按组授权：devteam 组内所有用户共用团队网络
 #   - name: "team_net"
-#     allowed_groups: [devteam]    # 按组授权（组内所有用户均可访问）
+#     allowed_groups: [devteam]
+#
+#   # 用户 + 组混合授权
+#   - name: "ci_net"
+#     allowed_users: [ci-runner]
+#     allowed_groups: [devteam, ops]

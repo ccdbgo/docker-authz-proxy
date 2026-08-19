@@ -1,67 +1,85 @@
 # docker-authz-proxy 资源配额配置
 # 版本：1
 #
-# 配额说明：
-#   cpu_cores:       0 = 不限制，1.0 = 1核，4.0 = 400%
-#   mem_mb:          0 = 不限制，单位 MB
-#   tmpfs_size_mb:   单个 tmpfs 挂载最大内存（MB），0 = 不限制，默认 512MB
-#   allowed_devices: 允许挂载的设备 glob 模式列表（追加到内置白名单）
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ 默认模版：不施加任何资源限制。                                            │
+# │ 所有配额项默认 0（= 不限制）。需要限制时，取消下方示例注释并按需修改。    │
+# └─────────────────────────────────────────────────────────────────────────┘
+#
+# 配额字段说明：
+#   cpu_cores:       单容器 CPU 核数上限。0 = 不限制；1.0 = 1 核（100%）；4.0 = 4 核（400%）
+#   mem_mb:          单容器内存上限，单位 MB。0 = 不限制
+#   storage_gb:      单容器存储上限，单位 GB（注入 StorageOpt.size）。0 = 不限制
+#   max_containers:  用户最多同时存在的容器数（含已停止）。0 = 不限制
+#   tmpfs_size_mb:   单个 tmpfs 挂载的最大内存，单位 MB。0 = 不限制
+#   allowed_devices: 允许挂载的设备 glob 模式列表（追加到内置白名单之后）
 #                    内置白名单：/dev/null /dev/zero /dev/urandom /dev/random /dev/full /dev/tty
 #
-# 优先级：users > groups > defaults
-# 组配额取最宽松的组配额（避免因某个严格组限制了用户）
+# 生效优先级：users > groups > defaults
+#   - 先查该用户名是否在 users 中命中；命中则用用户配额
+#   - 否则查用户所属组是否在 groups 中命中；命中多个组时取「最宽松」的一份
+#     （避免某个严格组把用户限死）
+#   - 都未命中则用 defaults
+#
+# 注意：字段缺省即视为 0（不限制）。若只想限制内存，可只写 mem_mb 一项。
 
 version: 1
 
-# 默认配额（所有未单独配置的用户）
+# ── 默认配额：所有未单独配置的用户 ────────────────────────────────────────────
+# 干净模版 = 全部不限制。
 defaults:
-  cpu_cores: 2.0    # 默认 2 核
-  mem_mb: 2048      # 默认 2GB
-  tmpfs_size_mb: 512 # 默认 tmpfs 上限 512MB
+  cpu_cores: 0       # 不限制 CPU
+  mem_mb: 0          # 不限制内存
+  tmpfs_size_mb: 0   # 不限制 tmpfs
 
-# 按用户配置
-users:
-  # root：不限制资源
-  root:
-    cpu_cores: 0
-    mem_mb: 0
-    tmpfs_size_mb: 0  # root 不限制
+# ══════════════════════════════════════════════════════════════════════════════
+# 配置示例（默认全部注释；按需取消注释并修改）
+# ══════════════════════════════════════════════════════════════════════════════
 
-  # sudo_test：sudo 组成员，不限制 CPU（避免超过物理核数报错）
-  sudo_test:
-    cpu_cores: 0
-    mem_mb: 1024
-    tmpfs_size_mb: 1024
+# ── 按用户配置 ────────────────────────────────────────────────────────────────
+# users:
+#   # 管理员：显式声明不限制（等价于不配置）
+#   root:
+#     cpu_cores: 0
+#     mem_mb: 0
+#     tmpfs_size_mb: 0
+#
+#   # 普通开发者：2 核 / 2GB 内存 / 20GB 存储 / tmpfs 512MB
+#   alice:
+#     cpu_cores: 2.0
+#     mem_mb: 2048
+#     storage_gb: 20
+#     tmpfs_size_mb: 512
+#
+#   # 受限用户：1 核 / 1GB / tmpfs 256MB / 最多 5 个容器
+#   bob:
+#     cpu_cores: 1.0
+#     mem_mb: 1024
+#     tmpfs_size_mb: 256
+#     max_containers: 5
+#
+#   # 只限制内存、不限制 CPU（其余字段缺省即为 0）
+#   carol:
+#     mem_mb: 512
+#
+#   # 需要访问 GPU 的用户：放开设备白名单
+#   ml-user:
+#     cpu_cores: 8.0
+#     mem_mb: 16384
+#     allowed_devices:
+#       - /dev/dri/*
+#       - /dev/nvidia*
+#       - /dev/nvidiactl
 
-  # test-docker-g：docker 组成员，标准资源
-  test-docker-g:
-    cpu_cores: 2.0
-    mem_mb: 2048
-
-  # bob：普通开发者，标准资源
-  bob:
-    cpu_cores: 2.0
-    mem_mb: 2048
-
-  # alice：受限用户，较少资源
-  alice:
-    cpu_cores: 1.0
-    mem_mb: 1024
-    tmpfs_size_mb: 256
-
-# 按组配置
-groups:
-  # sudo 组：不限制 CPU（避免超过物理核数报错）
-  sudo:
-    cpu_cores: 0
-    mem_mb: 4096
-    tmpfs_size_mb: 1024
-    # sudo 组允许使用 GPU 设备（示例）
-    # allowed_devices:
-    #   - /dev/dri/*
-    #   - /dev/nvidia*
-
-  # docker 组：标准资源（test-docker-g 属于此组）
-  docker:
-    cpu_cores: 2.0
-    mem_mb: 2048
+# ── 按组配置 ──────────────────────────────────────────────────────────────────
+# groups:
+#   # sudo 组：不限 CPU（避免请求核数超过物理核数时报错），内存放宽到 4GB
+#   sudo:
+#     cpu_cores: 0
+#     mem_mb: 4096
+#     tmpfs_size_mb: 1024
+#
+#   # docker 组：标准资源
+#   docker:
+#     cpu_cores: 2.0
+#     mem_mb: 2048
