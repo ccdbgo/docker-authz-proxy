@@ -81,13 +81,20 @@ type CallerIdentity struct {
 
 	// 客户端连接地址（Unix socket 为空，TCP 为 IP:port）
 	ClientAddr string
+
+	// ConfigPrivileged 表示该调用方命中 policy.yaml 的 privileged_users 名单，
+	// 被授予「受治理的 root 等价」特权（读+写全路径按特权处理）。
+	// 该字段【不在此包内赋值】——由 forward 层按【当前】policy 每请求写入
+	// （见 ProxyServer.ServeHTTP），以保证撤销即时生效。默认 false。
+	ConfigPrivileged bool
 }
 
 // IsPrivileged 返回 true 表示该调用方拥有 root 级别权限：
-// 直接 root 用户，或通过 sudo/su 获得 root 的用户。
+// 直接 root 用户、通过 sudo/su 获得 root 的用户，或命中 policy.yaml
+// privileged_users 名单的受治理特权用户（ConfigPrivileged）。
 // 这类用户跳过资源隔离、配额检查和 ownership 过滤。
 func (id *CallerIdentity) IsPrivileged() bool {
-	return id.RealUID == 0 || id.UserType == UserTypeSudo
+	return id.RealUID == 0 || id.UserType == UserTypeSudo || id.ConfigPrivileged
 }
 
 // IsSudoCommand 返回 true 表示当前命令由 sudo 用户以特权模式执行（UserTypeSudo）。

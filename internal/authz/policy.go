@@ -11,10 +11,18 @@ import (
 
 // PolicyConfig 对应 policy.yaml 结构
 type PolicyConfig struct {
-	Version       int           `yaml:"version"`
-	DefaultAction string        `yaml:"default_action"`
-	DenyRules     []DenyRule    `yaml:"deny_rules"`
-	ActionMapping ActionMapping `yaml:"action_mapping"`
+	Version         int              `yaml:"version"`
+	DefaultAction   string           `yaml:"default_action"`
+	DenyRules       []DenyRule       `yaml:"deny_rules"`
+	PrivilegedUsers PrivilegedConfig `yaml:"privileged_users"`
+	ActionMapping   ActionMapping    `yaml:"action_mapping"`
+}
+
+// PrivilegedConfig 受治理特权名单：列进来的用户经 proxy 视为【完整 root 等价】
+// （读+写、全局），用于把历史管理员从 docker 组直连迁到受审计的 proxy 通道。
+// 仅支持逐人显式授权（users），不支持按组——避免"某人被加进某组即隐式提权"。
+type PrivilegedConfig struct {
+	Users []string `yaml:"users"`
 }
 
 // DenyRule 禁止规则：指定用户/组不能执行哪些操作
@@ -41,6 +49,9 @@ type Policy struct {
 	Config            PolicyConfig
 	ResolvedDenyRules []ResolvedDenyRule
 	UnresolvedNames   []string
+
+	// privUIDs 是 privileged_users 解析后的 uid 集合（启动/重载时构建）。
+	privUIDs map[int]bool
 }
 
 func LoadPolicy(path string) (*Policy, error) {
@@ -149,6 +160,27 @@ func (p *Policy) resolve() {
 			p.ResolvedDenyRules = append(p.ResolvedDenyRules, r)
 		}
 	}
+
+	// privileged_users → uid 集合。未解析名进 UnresolvedNames（与 deny 规则一致）。
+	p.privUIDs = make(map[int]bool, len(p.Config.PrivilegedUsers.Users))
+	for _, u := range p.Config.PrivilegedUsers.Users {
+		if uid := auth.LookupUID(u); uid >= 0 {
+			p.privUIDs[uid] = true
+		} else {
+			p.UnresolvedNames = append(p.UnresolvedNames, u)
+		}
+	}
+}
+
+// IsConfigPrivileged 返回 true 表示该调用方命中 privileged_users 名单，
+// 应被授予受治理的 root 等价特权。按 RealUID 精确匹配（root/伪造身份 RealUID<0 直接排除）。
+// 注意：调用方（forward 层）必须以【当前】policy 每请求调用本方法并写回
+// identity.ConfigPrivileged，才能保证撤销（改配置 + 重载）在下一请求即时生效。
+func (p *Policy) IsConfigPrivileged(id *auth.CallerIdentity) bool {
+	if p == nil || id == nil || id.RealUID < 0 {
+		return false
+	}
+	return p.privUIDs[id.RealUID]
 }
 
 // IsDenied 检查用户是否被禁止执行某操作（白名单模式：默认允许）

@@ -12,9 +12,9 @@ import (
 // AuthAuditEntry 身份认证专项审计记录（连接建立时写入）
 // 独立于操作审计，专注于"谁连接了代理"这一事件
 type AuthAuditEntry struct {
-	Time    string `json:"time"`
-	Event   string `json:"event"` // "auth_success" | "auth_failure" | "auth_forgery"
-	PID     int    `json:"pid"`
+	Time  string `json:"time"`
+	Event string `json:"event"` // "auth_success" | "auth_failure" | "auth_forgery"
+	PID   int    `json:"pid"`
 	// 客户端地址（Unix socket 为空，TCP 为 IP:port）
 	ClientAddr string `json:"client_addr,omitempty"`
 
@@ -31,13 +31,13 @@ type AuthAuditEntry struct {
 	RealUsername string `json:"real_username,omitempty"`
 
 	// 身份切换信息
-	SwitchedIdentity bool   `json:"switched_identity"`          // 是否发生了 sudo/su
-	SwitchType       string `json:"switch_type,omitempty"`      // "sudo" | "su" | ""
+	SwitchedIdentity bool   `json:"switched_identity"`     // 是否发生了 sudo/su
+	SwitchType       string `json:"switch_type,omitempty"` // "sudo" | "su" | ""
 
 	// 比对结果
-	PasswdVerified bool   `json:"passwd_verified"`            // /etc/passwd 比对是否通过
-	FailureReason  string `json:"failure_reason,omitempty"`   // 失败原因
-	ForgeryDetail  string `json:"forgery_detail,omitempty"`   // 伪造尝试详情
+	PasswdVerified bool   `json:"passwd_verified"`          // /etc/passwd 比对是否通过
+	FailureReason  string `json:"failure_reason,omitempty"` // 失败原因
+	ForgeryDetail  string `json:"forgery_detail,omitempty"` // 伪造尝试详情
 }
 
 // AuditEntry 单条操作审计记录
@@ -45,13 +45,14 @@ type AuditEntry struct {
 	Time          string            `json:"time"`
 	User          string            `json:"user"`
 	UID           int               `json:"uid"`
-	ClientIP      string            `json:"client_ip,omitempty"`      // 操作来源 IP（Unix socket 为空，TCP 为 IP:port）
+	ClientIP      string            `json:"client_ip,omitempty"` // 操作来源 IP（Unix socket 为空，TCP 为 IP:port）
 	AuthSource    string            `json:"auth_source"`
-	Method        string            `json:"method,omitempty"`         // HTTP 方法（GET/POST/DELETE 等）
+	Method        string            `json:"method,omitempty"` // HTTP 方法（GET/POST/DELETE 等）
 	Action        string            `json:"action"`
 	URI           string            `json:"uri"`
 	RewrittenPath string            `json:"rewritten_path,omitempty"` // 改写后的资源路径/名称
 	Result        string            `json:"result"`                   // "allow" | "deny"
+	PrivSource    string            `json:"priv_source,omitempty"`    // 特权来源，仅当经 config 名单授特权时为 "config"（区别于 root/sudo 内生特权）
 	DenyReason    string            `json:"deny_reason,omitempty"`
 	ContainerID   string            `json:"container_id,omitempty"`
 	StatusCode    int               `json:"status_code"`
@@ -245,5 +246,3 @@ func (a *AuditLogger) Close() {
 		_ = a.authLog.Close()
 	}
 }
-
-
