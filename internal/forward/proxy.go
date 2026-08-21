@@ -971,7 +971,12 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 			} else {
 				_, isPublic, _, found := p.db.GetImageOwner(resolvedID)
 				if !found {
-					if !id.IsPrivileged() {
+					// config 镜像 ID 未登记归属。按 digest 拉取时,pull 完成分支可能因 docker
+					// 索引短暂延迟(resolveImageIDByRef 返回空)而把归属兜底记在 ref 的 manifest
+					// digest 上,而 create 按 daemon 的 config 镜像 ID 查 → 两 ID 不一致 → 误判。
+					// 若用户确实拥有 imageRef 所带 digest 对应的镜像(曾亲自 pull),补登 config id
+					// 访问权并放行,避免误报 No such image。
+					if !id.IsPrivileged() && !p.bridgeImageAccessByRefDigest(id, imageRef, resolvedID) {
 						auditID := toAuditIdentity(id)
 						p.logger.Info("image_not_tracked_trigger_pull",
 							append(audit.LogIdentityFields(auditID),
@@ -983,7 +988,9 @@ func (p *ProxyServer) checkOwnershipPreRequest(w http.ResponseWriter, r *http.Re
 				} else if isPublic {
 					_ = p.db.EnsureImageAccess(resolvedID, id.RealUID)
 				} else {
-					if !p.db.CanUseImage(id.RealUID, resolvedID) {
+					// 同上:config id 归属他人时,再按 ref digest 别名兜底桥接(用户拥有该 digest 即放行)。
+					if !p.db.CanUseImage(id.RealUID, resolvedID) &&
+						!p.bridgeImageAccessByRefDigest(id, imageRef, resolvedID) {
 						auditID := toAuditIdentity(id)
 						p.logger.Info("image_not_accessible_trigger_pull",
 							append(audit.LogIdentityFields(auditID),
@@ -5349,6 +5356,60 @@ func (p *ProxyServer) resolveImageIDByRef(imageRef string) string {
 		return ""
 	}
 	return img.ID
+}
+
+// refImageDigest 从镜像引用中提取 digest 部分("repo@sha256:..." → "sha256:..."),无 "@" 返回空。
+func refImageDigest(imageRef string) string {
+	if i := strings.LastIndex(imageRef, "@"); i >= 0 && i+1 < len(imageRef) {
+		return imageRef[i+1:]
+	}
+	return ""
+}
+
+// bridgeImageAccessByRefDigest 弥合"按 digest 拉取"引起的归属 key 不一致:
+// pull 完成分支在 resolveImageIDByRef 因 docker 索引延迟返回空时,会用流中捕获的
+// manifest/repo digest(如 sha256:6a32…)兜底登记归属;而 create 用 resolveImageIDByRef
+// 得到的是 daemon 的 config 镜像 ID(如 sha256:3cb0…),二者不同 → 按 config id 查权限误判无权。
+// 若用户确实拥有 imageRef 所带 digest 对应的镜像(曾亲自 pull 该 digest),则把访问权补登到
+// config id 上并放行。仅当用户对该 digest 别名有合法访问权时才桥接,不会泄漏他人镜像
+// (repo@digest 内容寻址:拥有该 digest 即拥有 configID 所指的同一镜像)。
+func (p *ProxyServer) bridgeImageAccessByRefDigest(id *auth.CallerIdentity, imageRef, configID string) bool {
+	dg := refImageDigest(imageRef)
+	if dg == "" || configID == "" {
+		return false
+	}
+	if !p.db.CanUseImage(id.RealUID, dg) {
+		return false
+	}
+	// 用户确实拥有该 digest 别名 → 让 config id 也可用:
+	//  - config id 尚未被跟踪(images 表无此行)→ 按 pull 登记归属(用户确实拉过该镜像),
+	//    使后续 create/inspect 按 config id 查询一致(仅 EnsureImageAccess 不够:CanUseImage
+	//    经 resolveImageIDInDB 只认 images 表,无 images 行则判不了);
+	//  - config id 已被他人拥有 → 仅补访问权,不夺属主。
+	if _, _, _, found := p.db.GetImageOwner(configID); !found {
+		if err := p.db.SetImageOwner(configID, id, false, "pull"); err != nil {
+			p.logger.Error("bridge_set_image_owner_failed",
+				zap.String("config_id", truncID(configID)),
+				zap.String("ref_digest", dg),
+				zap.Int("real_uid", id.RealUID),
+				zap.Error(err))
+			return false
+		}
+	} else if err := p.db.EnsureImageAccess(configID, id.RealUID); err != nil {
+		p.logger.Error("bridge_ensure_image_access_failed",
+			zap.String("config_id", truncID(configID)),
+			zap.String("ref_digest", dg),
+			zap.Int("real_uid", id.RealUID),
+			zap.Error(err))
+		return false
+	}
+	p.logger.Info("image_access_bridged_by_digest",
+		append(audit.LogIdentityFields(toAuditIdentity(id)),
+			zap.String("image_ref", imageRef),
+			zap.String("config_id", truncID(configID)),
+			zap.String("ref_digest", dg),
+		)...)
+	return true
 }
 
 // isBuildKitImage 判断镜像引用是否为 BuildKit 镜像（docker-container driver 使用）
