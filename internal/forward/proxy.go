@@ -35,7 +35,7 @@ type contextKey string
 const (
 	identityContextKey  contextKey = "caller_identity"
 	resourceUsageCtxKey contextKey = "resource_usage"
-	portMappingsCtxKey  contextKey = "port_mappings" // []isolation.PortMapping，容器创建时传递
+	portMappingsCtxKey  contextKey = "port_mappings"  // []isolation.PortMapping，容器创建时传递
 	rewrittenNameCtxKey contextKey = "rewritten_name" // 容器名称改写后的值，供审计使用
 )
 
@@ -191,18 +191,18 @@ func NewProxyServer(socketDir, upstreamSock string, policy *authz.Policy, db *au
 	}
 
 	return &ProxyServer{
-		socketDir:      socketDir,
-		upstreamSock:   upstreamSock,
-		policy:         policy,
-		db:             db,
-		logger:         logger,
-		quota:          quota,
-		auditLog:       auditLog,
-		authenticators: authenticators,
-		bridge:         isolation.NewBridgeManager(upstreamSock),
-		storageBase:    storageBase,
-		storage:        isolation.NewStorageManager(storageBase, upstreamSock),
-		allowHomeBind:  opts.AllowHomeBind,
+		socketDir:       socketDir,
+		upstreamSock:    upstreamSock,
+		policy:          policy,
+		db:              db,
+		logger:          logger,
+		quota:           quota,
+		auditLog:        auditLog,
+		authenticators:  authenticators,
+		bridge:          isolation.NewBridgeManager(upstreamSock),
+		storageBase:     storageBase,
+		storage:         isolation.NewStorageManager(storageBase, upstreamSock),
+		allowHomeBind:   opts.AllowHomeBind,
 		requestTimeout:  opts.RequestTimeout,
 		semaphore:       sem,
 		streamSemaphore: streamSem,
@@ -356,7 +356,7 @@ func (p *ProxyServer) startUserListener(u systemUser) error {
 					RealUID:        -1,
 					PasswdVerified: false,
 					FailureReason:  err.Error(),
-					ForgeryDetail:  func() string {
+					ForgeryDetail: func() string {
 						if isForgery {
 							return err.Error()
 						}
@@ -592,6 +592,13 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeDockerError(w, http.StatusForbidden, "identity verification failed")
 		return
 	}
+
+	// config 受治理特权名单（privileged_users）：按【当前】policy 每请求赋值。
+	// 用 = 而非 if-set：同一 keep-alive 连接上，管理员被移出名单 + 重载后，
+	// 其下一个请求 ConfigPrivileged 立即回落 false → 撤销即时生效，不残留。
+	// 位置在 RealUID<0 拒绝之后 → 认证失败身份绝不会被误授特权。
+	// 此行之后所有 id.IsPrivileged()（含 URL 重写、列表过滤、写/删/force 判定）自动生效。
+	identity.ConfigPrivileged = p.getPolicy().IsConfigPrivileged(identity)
 
 	// 必须在 isHijackRequest 检测之前执行 URL 重写，
 	// 否则 attach/exec 等 hijack 请求会用原始容器名转发给 Docker，导致 404。
@@ -870,9 +877,20 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		audit.LogAuthzAllowed(p.logger, auditID, action, r.URL.RequestURI())
 		// 步骤8：非容器创建操作的通用 allow 审计（容器创建在 postprocessResponse 里单独记录）
 		if action != authz.ActionCreateContainer {
-			p.auditLog.LogFull(identity.RealUsername, identity.RealUID, string(identity.AuthSource),
-				action, r.URL.RequestURI(), rewrittenName, "allow", "", "", resp.StatusCode,
-				latencyMs, totalCount, filteredCount, nil)
+			p.auditLog.WriteEntry(audit.AuditEntry{
+				User:          identity.RealUsername,
+				UID:           identity.RealUID,
+				AuthSource:    string(identity.AuthSource),
+				Action:        action,
+				URI:           r.URL.RequestURI(),
+				RewrittenPath: rewrittenName,
+				Result:        "allow",
+				PrivSource:    privSource(identity),
+				StatusCode:    resp.StatusCode,
+				LatencyMs:     latencyMs,
+				TotalCount:    totalCount,
+				FilteredCount: filteredCount,
+			})
 		}
 	}
 }
@@ -2679,8 +2697,18 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 				}
 				// 步骤8：记录资源使用情况到审计日志
 				resUsage, _ := r.Context().Value(resourceUsageCtxKey).(map[string]string)
-				p.auditLog.LogWithResources(id.RealUsername, id.RealUID, string(id.AuthSource),
-					action, r.URL.RequestURI(), "allow", "", containerID, resp.StatusCode, resUsage)
+				p.auditLog.WriteEntry(audit.AuditEntry{
+					User:          id.RealUsername,
+					UID:           id.RealUID,
+					AuthSource:    string(id.AuthSource),
+					Action:        action,
+					URI:           r.URL.RequestURI(),
+					Result:        "allow",
+					PrivSource:    privSource(id),
+					ContainerID:   containerID,
+					StatusCode:    resp.StatusCode,
+					ResourceUsage: resUsage,
+				})
 			}
 		}
 		// 容器创建失败时，剥除错误信息中的内部资源名前缀，避免用户看到 sudo_test_u1005_xxx 等内部名称
@@ -2760,7 +2788,7 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 						zap.String("real_username", id.RealUsername),
 						zap.Int("real_uid", id.RealUID),
 						zap.Error(err))
-					} else {
+				} else {
 					_ = p.db.EnsureImageAccess(imageID, id.RealUID)
 					p.logger.Info("image_committed",
 						append(audit.LogIdentityFields(auditID),
@@ -3046,7 +3074,7 @@ func (p *ProxyServer) postprocessResponse(w http.ResponseWriter, resp *http.Resp
 				// completedPullOwner 延续 imageRef → ownerUID pullEventDeliveryGrace (30s)，
 				// 覆盖此投递延迟窗口。time.AfterFunc 确保条目自动清理，无内存泄漏。
 				// imageRef 此处必定非空（外层 if imageRef != "" 已守卫）。
-			ref := imageRef
+				ref := imageRef
 				pullOwner := pruneOwnerInfo{ownerUID: id.RealUID}
 				if id.IsSudoCommand() {
 					pullOwner.privCtx = 1
@@ -3845,10 +3873,21 @@ func makeAuditEntry(id *auth.CallerIdentity, r *http.Request, action, result, de
 		Action:      action,
 		URI:         uri,
 		Result:      result,
+		PrivSource:  privSource(id),
 		DenyReason:  denyReason,
 		ContainerID: containerID,
 		StatusCode:  statusCode,
 	}
+}
+
+// privSource 返回该调用方的特权来源审计标记。
+// 仅当特权由 config 名单（privileged_users）授予时返回 "config"；
+// root/sudo 的内生特权不在此标记（其 auth_source/user_type 已能体现）。
+func privSource(id *auth.CallerIdentity) string {
+	if id != nil && id.ConfigPrivileged {
+		return "config"
+	}
+	return ""
 }
 
 // toAuditIdentity 将 auth.CallerIdentity 转换为 audit.IdentityInfo
@@ -4019,8 +4058,8 @@ func isAuxiliaryCall(dockerCmd, action, method, path string) bool {
 		// ── builder 组（docker builder <subcommand>）──────────────────────────
 		"builder/build":      {authz.ActionBuild},
 		"builder/prune":      {authz.ActionPrune},
-		"builder/bake":       {authz.ActionBuild},                // 实际调用 POST /build，与 builder/build 等价
-		"builder/create":     {authz.ActionBuilderManage},        // buildx daemon，不经过 Docker daemon
+		"builder/bake":       {authz.ActionBuild},         // 实际调用 POST /build，与 builder/build 等价
+		"builder/create":     {authz.ActionBuilderManage}, // buildx daemon，不经过 Docker daemon
 		"builder/inspect":    {authz.ActionBuilderManage},
 		"builder/ls":         {authz.ActionBuilderManage},
 		"builder/rm":         {authz.ActionBuilderManage},
@@ -4072,16 +4111,16 @@ func isAuxiliaryCall(dockerCmd, action, method, path string) bool {
 		"node/promote": {authz.ActionNodeUpdate},
 
 		// ── service 组（docker service <subcommand>）──────────────────────────
-		"service/ls":      {authz.ActionServiceList},
-		"service/list":    {authz.ActionServiceList},
-		"service/create":  {authz.ActionServiceCreate},
-		"service/inspect": {authz.ActionServiceInspect},
-		"service/update":  {authz.ActionServiceUpdate},
-		"service/rm":      {authz.ActionServiceRemove},
-		"service/remove":  {authz.ActionServiceRemove},
-		"service/logs":    {authz.ActionServiceLogs},
-		"service/ps":      {authz.ActionTaskList},
-		"service/scale":   {authz.ActionServiceUpdate},
+		"service/ls":       {authz.ActionServiceList},
+		"service/list":     {authz.ActionServiceList},
+		"service/create":   {authz.ActionServiceCreate},
+		"service/inspect":  {authz.ActionServiceInspect},
+		"service/update":   {authz.ActionServiceUpdate},
+		"service/rm":       {authz.ActionServiceRemove},
+		"service/remove":   {authz.ActionServiceRemove},
+		"service/logs":     {authz.ActionServiceLogs},
+		"service/ps":       {authz.ActionTaskList},
+		"service/scale":    {authz.ActionServiceUpdate},
 		"service/rollback": {authz.ActionServiceUpdate},
 
 		// ── task 组（docker task <subcommand>）───────────────────────────────
@@ -4106,15 +4145,15 @@ func isAuxiliaryCall(dockerCmd, action, method, path string) bool {
 
 		// ── stack 组（docker stack <subcommand>）──────────────────────────────
 		// stack 操作会触发多个下游 API：service/create、network/create、secret/create 等
-		"stack/deploy":  {authz.ActionServiceCreate, authz.ActionServiceUpdate, authz.ActionNetworkCreate, authz.ActionSecretCreate, authz.ActionConfigCreate},
-		"stack/up":      {authz.ActionServiceCreate, authz.ActionServiceUpdate, authz.ActionNetworkCreate, authz.ActionSecretCreate, authz.ActionConfigCreate},
-		"stack/ls":      {authz.ActionServiceList},
-		"stack/list":    {authz.ActionServiceList},
-		"stack/ps":      {authz.ActionTaskList},
+		"stack/deploy":   {authz.ActionServiceCreate, authz.ActionServiceUpdate, authz.ActionNetworkCreate, authz.ActionSecretCreate, authz.ActionConfigCreate},
+		"stack/up":       {authz.ActionServiceCreate, authz.ActionServiceUpdate, authz.ActionNetworkCreate, authz.ActionSecretCreate, authz.ActionConfigCreate},
+		"stack/ls":       {authz.ActionServiceList},
+		"stack/list":     {authz.ActionServiceList},
+		"stack/ps":       {authz.ActionTaskList},
 		"stack/services": {authz.ActionServiceList},
-		"stack/rm":      {authz.ActionServiceRemove, authz.ActionNetworkRemove, authz.ActionSecretRemove, authz.ActionConfigRemove},
-		"stack/remove":  {authz.ActionServiceRemove, authz.ActionNetworkRemove, authz.ActionSecretRemove, authz.ActionConfigRemove},
-		"stack/config":  {authz.ActionServiceInspect},
+		"stack/rm":       {authz.ActionServiceRemove, authz.ActionNetworkRemove, authz.ActionSecretRemove, authz.ActionConfigRemove},
+		"stack/remove":   {authz.ActionServiceRemove, authz.ActionNetworkRemove, authz.ActionSecretRemove, authz.ActionConfigRemove},
+		"stack/config":   {authz.ActionServiceInspect},
 	}
 
 	targetActions, known := cmdTargetActions[dockerCmd]
@@ -4154,8 +4193,9 @@ func isHijackRequest(r *http.Request) bool {
 
 // isLongLivedRequest 判断请求是否为长连接流式响应（events / stats / logs?follow）。
 // 布尔参数解析与 Docker daemon httputils.BoolValue 对齐：
-//   false 等价值：对应参数的零值（""对 follow=缺省意味不跟随）、"0"、"false"、"no"
-//   true  等价值：其余所有值（"1"、"true"、"yes" 等）
+//
+//	false 等价值：对应参数的零值（""对 follow=缺省意味不跟随）、"0"、"false"、"no"
+//	true  等价值：其余所有值（"1"、"true"、"yes" 等）
 //
 // 仅在路径后缀匹配时才解析 Query，避免对所有请求分配 url.Values map。
 // 此函数在 URL 重写前调用：只检测路径后缀，URL 重写不改变后缀，调用时序安全。
@@ -4590,8 +4630,8 @@ func (p *ProxyServer) trackBuildKitImages(id *auth.CallerIdentity, pre *imageSna
 
 // imageSnapshot 构建前/后的镜像状态快照
 type imageSnapshot struct {
-	idSet    map[string]bool   // 所有镜像 ID（不含 sha256: 前缀）
-	tagToID  map[string]string // tag → imageID（不含 sha256: 前缀）
+	idSet   map[string]bool   // 所有镜像 ID（不含 sha256: 前缀）
+	tagToID map[string]string // tag → imageID（不含 sha256: 前缀）
 }
 
 // snapshotImageState 查询 Docker 获取当前镜像状态快照
@@ -6336,6 +6376,7 @@ func (p *ProxyServer) handleContainerPrune(w http.ResponseWriter, id *auth.Calle
 //   - DB 中无记录（无主镜像，代理部署前已存在或注册失败）→ 允许删除
 //   - DB 中有记录且 owner.UID == caller → 允许删除（自有镜像）
 //   - DB 中有记录且 owner.UID != caller → 跳过（他人镜像，隔离保留）
+//
 // 返回 true 表示已拦截处理，调用方应直接 return；返回 false 表示放行正常流程。
 func (p *ProxyServer) handleImagePrune(w http.ResponseWriter, id *auth.CallerIdentity) bool {
 	if id.IsPrivileged() {
@@ -6515,6 +6556,7 @@ func (p *ProxyServer) handleNetworkPrune(w http.ResponseWriter, r *http.Request,
 //   - DB 中无记录（无主镜像）→ 允许删除
 //   - DB 中有记录且 owner.UID == caller → 允许删除
 //   - DB 中有记录且 owner.UID != caller → 跳过（隔离保留）
+//
 // 返回 true 表示已拦截处理，调用方应直接 return；返回 false 表示放行正常流程。
 func (p *ProxyServer) handleSystemPrune(w http.ResponseWriter, r *http.Request, id *auth.CallerIdentity) bool {
 	if id.IsPrivileged() {
@@ -6685,4 +6727,3 @@ func (p *ProxyServer) handleSystemPrune(w http.ResponseWriter, r *http.Request, 
 	_, _ = w.Write(body)
 	return true
 }
-
